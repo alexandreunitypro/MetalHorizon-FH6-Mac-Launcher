@@ -1,0 +1,83 @@
+CrossOver 26.3 mmdevapi: put spatial audio static objects in WAVEFORMATEXTENSIBLE channel order.
+
+Against CrossOver 26.3's dlls/mmdevapi/spatialaudio.c (same code as wine-11.0). Pairs with
+winecoreaudio-crossover26.3-spatial-mixer.patch.
+
+static_mask_to_channels gave the static objects channels in the order of the AudioObjectType list
+(front, centre, LFE, side, back, top, back centre). A WAVEFORMATEXTENSIBLE stream's channels follow the
+speaker bits in ascending order instead, where back left/right (0x10, 0x20) and back centre (0x100) come
+before side left/right (0x200, 0x400). So in a 7.1 or 7.1.4 bed the side and back channels were swapped.
+It also wrote the channel map in list order while objects look it up by AudioObjectType_to_index, so back
+centre (index 16) was never found. Each static object's channel is now the number of mask bits below its
+speaker, stored at its own index; unused entries stay ~0.
+
+diff --git a/dlls/mmdevapi/spatialaudio.c b/dlls/mmdevapi/spatialaudio.c
+index 8ae37cb..b12adb3 100644
+--- a/dlls/mmdevapi/spatialaudio.c
++++ b/dlls/mmdevapi/spatialaudio.c
+@@ -673,31 +673,42 @@ static WAVEFORMATEX *clone_fmtex(const WAVEFORMATEX *src)
+ 
+ static void static_mask_to_channels(AudioObjectType static_mask, WORD *count, DWORD *mask, UINT32 *map)
+ {
+-    UINT32 out_chan = 0, map_idx = 0;
++    static const struct { AudioObjectType type; DWORD speaker; } table[] = {
++        { AudioObjectType_FrontLeft, SPEAKER_FRONT_LEFT },
++        { AudioObjectType_FrontRight, SPEAKER_FRONT_RIGHT },
++        { AudioObjectType_FrontCenter, SPEAKER_FRONT_CENTER },
++        { AudioObjectType_LowFrequency, SPEAKER_LOW_FREQUENCY },
++        { AudioObjectType_SideLeft, SPEAKER_SIDE_LEFT },
++        { AudioObjectType_SideRight, SPEAKER_SIDE_RIGHT },
++        { AudioObjectType_BackLeft, SPEAKER_BACK_LEFT },
++        { AudioObjectType_BackRight, SPEAKER_BACK_RIGHT },
++        { AudioObjectType_TopFrontLeft, SPEAKER_TOP_FRONT_LEFT },
++        { AudioObjectType_TopFrontRight, SPEAKER_TOP_FRONT_RIGHT },
++        { AudioObjectType_TopBackLeft, SPEAKER_TOP_BACK_LEFT },
++        { AudioObjectType_TopBackRight, SPEAKER_TOP_BACK_RIGHT },
++        { AudioObjectType_BackCenter, SPEAKER_BACK_CENTER },
++    };
++    UINT32 i;
++
+     *count = 0;
+     *mask = 0;
+-#define CONVERT_MASK(f, t) \
+-    if(static_mask & f){ \
+-        *count += 1; \
+-        *mask |= t; \
+-        map[map_idx++] = out_chan++; \
+-        TRACE("mapping 0x%x to %u\n", f, out_chan - 1); \
+-    }else{ \
+-        map[map_idx++] = ~0; \
+-    }
+-    CONVERT_MASK(AudioObjectType_FrontLeft, SPEAKER_FRONT_LEFT);
+-    CONVERT_MASK(AudioObjectType_FrontRight, SPEAKER_FRONT_RIGHT);
+-    CONVERT_MASK(AudioObjectType_FrontCenter, SPEAKER_FRONT_CENTER);
+-    CONVERT_MASK(AudioObjectType_LowFrequency, SPEAKER_LOW_FREQUENCY);
+-    CONVERT_MASK(AudioObjectType_SideLeft, SPEAKER_SIDE_LEFT);
+-    CONVERT_MASK(AudioObjectType_SideRight, SPEAKER_SIDE_RIGHT);
+-    CONVERT_MASK(AudioObjectType_BackLeft, SPEAKER_BACK_LEFT);
+-    CONVERT_MASK(AudioObjectType_BackRight, SPEAKER_BACK_RIGHT);
+-    CONVERT_MASK(AudioObjectType_TopFrontLeft, SPEAKER_TOP_FRONT_LEFT);
+-    CONVERT_MASK(AudioObjectType_TopFrontRight, SPEAKER_TOP_FRONT_RIGHT);
+-    CONVERT_MASK(AudioObjectType_TopBackLeft, SPEAKER_TOP_BACK_LEFT);
+-    CONVERT_MASK(AudioObjectType_TopBackRight, SPEAKER_TOP_BACK_RIGHT);
+-    CONVERT_MASK(AudioObjectType_BackCenter, SPEAKER_BACK_CENTER);
++    for (i = 0; i < ARRAY_SIZE(table); i++)
++        if (static_mask & table[i].type) {
++            *mask |= table[i].speaker;
++            *count += 1;
++        }
++    /* WAVEFORMATEXTENSIBLE channels follow the speaker bits in ascending order, so a static object's
++     * channel is the number of speakers in the mask below its own: back left/right (0x10, 0x20) and
++     * back centre (0x100) come before side left/right (0x200, 0x400). */
++    for (i = 0; i < 17; i++)
++        map[i] = ~0;
++    for (i = 0; i < ARRAY_SIZE(table); i++) {
++        if (static_mask & table[i].type) {
++            UINT32 idx = AudioObjectType_to_index(table[i].type);
++            map[idx] = __builtin_popcount(*mask & (table[i].speaker - 1));
++            TRACE("mapping 0x%x to %u\n", table[i].type, map[idx]);
++        }
++    }
+ }
+ 
+ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)

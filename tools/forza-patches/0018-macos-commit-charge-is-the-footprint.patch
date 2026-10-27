@@ -1,0 +1,49 @@
+macOS: a process's commit charge is its memory footprint, not its address space.
+
+fill_vm_counters() reports PagefileUsage, and through it PrivateUsage, from the Mach task's
+virtual_size. That is address space: a 64-bit process under Rosetta maps tens of gigabytes it never
+touches. The Linux branch reports RssAnon + VmSwap, memory the process is charged for; the macOS
+counterpart is the task's phys_footprint (dirty and compressed pages), which is also what Activity
+Monitor shows. Upstream Wine has the same line today.
+
+Measured on an M4 (macOS 27.0, x64-crossover26.3-r15): a console program with a 9 MB working set
+reads PagefileUsage = 41,987 MB, and still 41,987 MB after it commits and touches 512 MB. Forza
+Horizon 6 compares the figure with physical memory: in play it warned about low memory with
+"87 GB / 32 GB" on screen while the process's resident size was 5.8 GB and the machine had 59% of
+its memory free, and its crash report carries MEM_USED 87180247040 against MEM_LIMIT 34359734272
+(2026-10-05). A game that budgets textures from this number budgets from nonsense.
+
+The peak follows the current value, as in the Linux branch.
+
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1515,6 +1515,9 @@
+ #if defined(MACH_TASK_BASIC_INFO)
+     struct mach_task_basic_info info;
+     mach_msg_type_number_t infoCount;
++#ifdef TASK_VM_INFO
++    task_vm_info_data_t vm_info;
++#endif
+ 
+     if (unix_pid != -1) return; /* FIXME: Retrieve information for other processes. */
+ 
+@@ -1525,8 +1528,19 @@
+         pvmi->PagefileUsage = info.virtual_size;
+         pvmi->WorkingSetSize = info.resident_size;
+         pvmi->PeakWorkingSetSize = info.resident_size_max;
++    }
++#ifdef TASK_VM_INFO
++    /* The commit charge is memory the process is charged for, not address space. The footprint
++     * is what the kernel charges the task (dirty and compressed pages), the counterpart of the
++     * RssAnon + VmSwap sum used on Linux. */
++    infoCount = TASK_VM_INFO_COUNT;
++    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &infoCount ) == KERN_SUCCESS)
++    {
++        pvmi->PagefileUsage = vm_info.phys_footprint;
++        pvmi->PeakPagefileUsage = pvmi->PagefileUsage;
+     }
+ #endif
++#endif
+ }
+ 
+ #elif defined(linux)

@@ -1,0 +1,7 @@
+out/
+out-*.txt
+__pycache__/
+.DS_Store
+brouillons/
+app/.build/
+app/dist/

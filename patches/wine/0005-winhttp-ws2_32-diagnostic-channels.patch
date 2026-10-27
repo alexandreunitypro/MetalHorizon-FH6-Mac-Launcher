@@ -1,0 +1,140 @@
+Diagnostic channels: winhttp 'httpreq' (one line per request / status / WebSocket event) and ws2_32 'udpreq' (UDP bind, connect,
+sends, synchronous receives; rate-limited). Off unless WINEDEBUG names them.
+
+--- a/dlls/winhttp/session.c
++++ b/dlls/winhttp/session.c
+@@ -37,6 +37,9 @@
+ #include "winhttp_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
++/* httpreq: one line per request, status and WebSocket event, whoever the caller (libHttpClient, XCurl, ...);
++ * light enough to leave on while a game runs. */
++WINE_DECLARE_DEBUG_CHANNEL(httpreq);
+ 
+ #define DEFAULT_RESOLVE_TIMEOUT             0
+ #define DEFAULT_CONNECT_TIMEOUT             20000
+@@ -1334,6 +1337,8 @@
+     if ((hrequest = alloc_handle( &request->hdr )))
+     {
+         send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED, &hrequest, sizeof(hrequest) );
++        TRACE_(httpreq)( "%p open %s %s:%u%s\n", hrequest, debugstr_w( request->verb ), debugstr_w( connect->hostname ),
++                         connect->hostport, debugstr_w( request->path ) );
+     }
+ 
+ end:
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -40,6 +40,7 @@
+ #include "winhttp_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
++WINE_DECLARE_DEBUG_CHANNEL(httpreq);
+ 
+ #define DEFAULT_KEEP_ALIVE_TIMEOUT 30000
+ 
+@@ -3004,6 +3005,8 @@
+     if ((ret = query_headers( request, query, NULL, &status, &size, NULL ))) goto done;
+ 
+     set_content_length( request, status );
++    TRACE_(httpreq)( "%p status %lu %s%s\n", request->hdr.handle, status, debugstr_w( request->connect->hostname ),
++                     debugstr_w( request->path ) );
+ 
+     if (!(request->hdr.disable_flags & WINHTTP_DISABLE_COOKIES)) record_cookies( request );
+ 
+@@ -3562,6 +3565,7 @@
+     release_object( &socket->hdr );
+     release_object( &request->hdr );
+     TRACE("returning %p\n", hsocket);
++    TRACE_(httpreq)( "websocket %p open (request %p)\n", hsocket, hrequest );
+     if (hsocket) SetLastError( ERROR_SUCCESS );
+     return hsocket;
+ }
+@@ -4244,6 +4248,8 @@
+ 
+ static void socket_receive_complete( struct socket *socket, DWORD ret, WINHTTP_WEB_SOCKET_BUFFER_TYPE type, DWORD len )
+ {
++    if (ret) TRACE_(httpreq)( "websocket %p receive error %lu\n", socket->hdr.handle, ret );
++    else if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) TRACE_(httpreq)( "websocket %p closed by server\n", socket->hdr.handle );
+     if (!ret)
+     {
+         WINHTTP_WEB_SOCKET_STATUS status;
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -35,6 +35,9 @@
+ #endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
++/* udpreq: what a title does with its UDP sockets (bind, connect, sends, received datagrams), rate-limited so it can
++ * stay on while a game runs. Forza Horizon 6 opened UDP game sockets that never stayed open during matchmaking. */
++WINE_DECLARE_DEBUG_CHANNEL(udpreq);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ #define TIMEOUT_INFINITE _I64_MAX
+@@ -976,6 +979,17 @@
+ {
+     LPWSAOVERLAPPED_COMPLETION_ROUTINE func = apc_user;
+     func( NtStatusToWSAError( io->Status ), io->Information, (OVERLAPPED *)io, 0 );
++}
++
++static BOOL udpreq_wanted( SOCKET s, LONG *counter )
++{
++    int type = 0, len = sizeof(type);
++    LONG n;
++
++    if (!TRACE_ON(udpreq)) return FALSE;
++    if (getsockopt( s, SOL_SOCKET, SO_TYPE, (char *)&type, &len ) || type != SOCK_DGRAM) return FALSE;
++    n = InterlockedIncrement( counter );
++    return n <= 300 || !(n % 500);  /* the start of every exchange, then a sample */
+ }
+ 
+ static int WS2_recv_base( SOCKET s, WSABUF *buffers, DWORD buffer_count, DWORD *ret_size, DWORD *flags,
+@@ -1031,6 +1045,14 @@
+     if (!status && ret_size) *ret_size = piosb->Information;
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
++    if (status != STATUS_PENDING && status != STATUS_DEVICE_NOT_READY)
++    {
++        static LONG recv_count;
++        if (udpreq_wanted( s, &recv_count ))
++            TRACE_(udpreq)( "socket %#Ix recv %Iu bytes from %s, status %#lx\n", s, status ? 0 : piosb->Information,
++                            addr && !status ? debugstr_sockaddr( addr ) : "-", status );
++        SetLastError( NtStatusToWSAError( status ) );
++    }
+     return status ? -1 : 0;
+ }
+ 
+@@ -1098,6 +1120,12 @@
+     if (!status && ret_size) *ret_size = piosb->Information;
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
++    {
++        static LONG send_count;
++        if (udpreq_wanted( s, &send_count ))
++            TRACE_(udpreq)( "socket %#Ix send to %s, status %#lx\n", s, addr ? debugstr_sockaddr( addr ) : "(connected)", status );
++        SetLastError( NtStatusToWSAError( status ) );
++    }
+     return status ? -1 : 0;
+ }
+ 
+@@ -1156,6 +1184,10 @@
+     NTSTATUS status;
+ 
+     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
++    {
++        static LONG bind_count;
++        if (udpreq_wanted( s, &bind_count )) TRACE_(udpreq)( "socket %#Ix bind %s\n", s, debugstr_sockaddr( addr ) );
++    }
+ 
+     if (!addr)
+     {
+@@ -1278,6 +1310,10 @@
+     NTSTATUS status;
+ 
+     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
++    {
++        static LONG connect_count;
++        if (udpreq_wanted( s, &connect_count )) TRACE_(udpreq)( "socket %#Ix connect %s\n", s, debugstr_sockaddr( addr ) );
++    }
+ 
+     if (!(sync_event = get_sync_event())) return -1;
+ 

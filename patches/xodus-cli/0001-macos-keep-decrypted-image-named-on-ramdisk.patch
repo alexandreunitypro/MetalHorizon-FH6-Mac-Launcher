@@ -1,0 +1,70 @@
+From: FORZA-LAUNCHER-FOR-MAC-BLACKWELL-PROJECT
+Subject: [PATCH] run: On macOS keep the decrypted image's name on the RAM disk.
+
+Applies to xodus-gaming/xodus 3e75c9f (the commit Ferestre pins) after
+Ferestre's patches/xodus-cli 0002-0027 (0001 is skipped, as Ferestre's
+scripts/check-patches.sh does).
+
+On macOS the decrypted image went into tempfile_in(<RAM disk>), which deletes
+the name immediately. Wine needs a name to give each handle on the image its
+own file position (no /proc on macOS; see
+patches/wine/0001-ntdll-macos-reopen-mapped-image-by-path.patch). The file
+now keeps its name inside the private, nobrowse RAM disk, which is
+force-detached when the game exits, so the plaintext still never reaches a
+persistent disk. Linux (memfd) and other systems are unchanged.
+
+Not compiled for macOS here unless docs/ANALYSE-FH6-STORE-MACOS.md says so.
+---
+diff --git a/crates/xodus-cli/src/commands/run.rs b/crates/xodus-cli/src/commands/run.rs
+index 60286fa..59b84c9 100644
+--- a/crates/xodus-cli/src/commands/run.rs
++++ b/crates/xodus-cli/src/commands/run.rs
+@@ -10,8 +10,10 @@ use nix::unistd::Pid;
+ #[cfg(target_os = "linux")]
+ use rustix::fs::{MemfdFlags, memfd_create};
+ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+-#[cfg(not(target_os = "linux"))]
+-use tempfile::{tempdir, tempfile, tempfile_in};
++#[cfg(target_os = "macos")]
++use tempfile::{Builder, tempdir, tempfile};
++#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++use tempfile::{tempfile, tempfile_in};
+ use tokio::fs::{File, OpenOptions};
+ use tokio::process::Command;
+ use xodus::tokens::TokenManager;
+@@ -49,7 +51,34 @@ fn make_temp_file(_folder: &str, name: &str) -> std::io::Result<std::fs::File> {
+     Ok(std::fs::File::from(fd))
+ }
+ 
+-#[cfg(not(target_os = "linux"))]
++/// On macOS the decrypted image goes to a file on the private RAM disk that
++/// `prepare` mounts, and that file keeps its name until the disk is detached.
++///
++/// macOS has no memfd and no /proc. Wine gives every handle a title opens on
++/// its own image a file position of its own by reopening the descriptor, and
++/// without /proc the only way to do that is through the file's name
++/// (fcntl(F_GETPATH), see the Wine half of this change). An anonymous
++/// tempfile has no name to reopen, so every handle shared one position: a
++/// title that reads its own executable to the end and opens it again reads
++/// nothing the second time, and one that hashes it stops itself.
++///
++/// The plaintext still never reaches a persistent disk: the RAM disk is
++/// mounted nobrowse in a private temporary directory and force-detached when
++/// the game exits, which removes the file with it.
++#[cfg(target_os = "macos")]
++fn make_temp_file(folder: &str, _name: &str) -> std::io::Result<std::fs::File> {
++    if folder.is_empty() {
++        return tempfile();
++    }
++    let (file, _path) = Builder::new()
++        .prefix("xodus-image-")
++        .tempfile_in(folder)?
++        .keep()
++        .map_err(|e| e.error)?;
++    Ok(file)
++}
++
++#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+ fn make_temp_file(folder: &str, _name: &str) -> std::io::Result<std::fs::File> {
+     if folder.is_empty() {
+         tempfile()

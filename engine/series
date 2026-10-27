@@ -1,0 +1,16 @@
+# MetalHorizon engine: patch series, applied in this order with `patch -p1` to sources/wine of the
+# tarball pinned in engine/inputs.json. Paths are relative to engine/patches/. A line starting with # is
+# skipped. 0001-0009 are generated from the tree the working engine was built from
+# (engine/make-series.py) and reproduce it exactly (engine/verify-series.sh).
+0001-xgameruntime.patch
+0002-kernelbase-app-packages.patch
+0003-macos-teb-slots.patch
+0004-ntdll-msixvc-images-memory.patch
+0005-ntdll-exceptions.patch
+0006-network.patch
+0007-audio-surround.patch
+0008-misc.patch
+0009-diag-msgbox.patch
+# Highball 0025 (closing async I/O no longer crashes) is NOT in the engine that runs the game today: only
+# its test half reached the dev tree. Turn it on after an in-game test.
+# ../../tools/forza-patches/0025-ntdll-threadpool-io-release-once.patch

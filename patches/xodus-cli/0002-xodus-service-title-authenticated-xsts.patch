@@ -1,0 +1,377 @@
+xodus-service: mint XSTS tokens as the title (SISU device + title + user), with the title's own endpoint list.
+
+Forza Horizon 6 showed 'Fonctionnalite indisponible - Le serveur Forza Horizon 6 n'est pas disponible'.
+Its game server (gameservices.fh6.forzamotorsport.net) authenticates against the relying party
+http://xboxliveauth.forzamotorsport.net/, which only the title's NSAL (title.mgt.xboxlive.com/titles/2079757188/endpoints)
+names. xodus-service read only titles/default, fell back to http://xboxlive.com, and minted user-only tokens
+(no title claims: the title NSAL itself answered 403 to them, 200 to the new ones).
+Base: work/xodus-ferestre (no git). Build: PROTOC=<protoc> cargo build --release -p xodus-service; install as work/xodus/target/release/xodus-service.
+
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -35,6 +35,12 @@
+     pub method: String,
+     #[serde(default)]
+     pub body_base64: String,
++    /// The title's decimal TitleId and its MSAAppId, from MicrosoftGame.config. With both, the
++    /// service authenticates as the title (device + title + user), as Windows does.
++    #[serde(default)]
++    pub title_id: String,
++    #[serde(default)]
++    pub title_client_id: String,
+ }
+ 
+ /// The `XBL3.0 x=<uhs>;<token>` header a title puts on its request, plus the
+--- a/crates/xodus/src/models/xbox.rs
++++ b/crates/xodus/src/models/xbox.rs
+@@ -107,6 +107,8 @@
+ #[serde(rename_all = "PascalCase")]
+ pub struct TitleMgtResponse {
+     pub end_points: Vec<TitleMgtEndPoint>,
++    /// A title's own list carries none.
++    #[serde(default)]
+     pub signature_policies: Vec<TitleMgtSignaturePolicy>,
+ }
+ 
+--- a/crates/xodus/src/auth.rs
++++ b/crates/xodus/src/auth.rs
+@@ -181,8 +181,7 @@
+         .await?;
+     let resp = auth
+         .sisu_authorize_rps(&user_token, &data.token, None)
+-        .await
+-        .expect("ok");
++        .await?;
+     Ok((auth, resp, data))
+ }
+ 
+--- a/crates/xodus-service/Cargo.toml
++++ b/crates/xodus-service/Cargo.toml
+@@ -16,6 +16,8 @@
+ quick-xml = { version = "0.42.0", features = ["serialize", "overlapped-lists"] }
+ tokio-util = "0.7.19"
+ serde_json = "1.0.151"
++p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
++xal = { git = "https://github.com/xodus-gaming/xal-rs", rev = "6aa2420f8f0d5e6f7460ff13f399037583a942f4", version = "0.1.3" }
+ 
+ [features]
+ tokio_console = ["dep:console-subscriber"]
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -51,6 +51,188 @@
+     Some((policy.version as u32, policy.max_body_bytes as usize))
+ }
+ 
++/// What Windows' Xbox identity provider holds for a title: the SISU session of its own MSAAppId
++/// (device + title + user tokens, bound to the authenticator's signing key) and the title's own
++/// endpoint list. Tokens minted from it carry the title's claims, which title services check:
++/// Forza Horizon 6's game server sits on *.forzamotorsport.net, whose relying party
++/// (http://xboxliveauth.forzamotorsport.net/) only the title's list names -- the default list does
++/// not, so the game was handed an http://xboxlive.com token and reported its server unavailable.
++struct TitleSession {
++    auth: xal::XalAuthenticator,
++    /// The key the SISU tokens are bound to, in the form the service signs with.
++    signer: Option<xodus::api::xbox::RequestSigner>,
++    device: xal::response::DeviceToken,
++    sisu: xal::response::SisuRPSAuthorizationResponse,
++    endpoints: Option<xodus::models::xbox::TitleMgtResponse>,
++}
++
++static TITLE_SESSIONS: std::sync::LazyLock<
++    tokio::sync::Mutex<std::collections::HashMap<(String, i64), TitleSession>>,
++> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
++
++fn xbl_header(token: &xal::response::XSTSToken) -> String {
++    let uhs = token
++        .display_claims
++        .as_ref()
++        .and_then(|c| c.xui.first())
++        .and_then(|x| x.get("uhs").cloned())
++        .unwrap_or_default();
++    format!("XBL3.0 x={uhs};{}", token.token)
++}
++
++async fn new_title_session(
++    context: &SimpleContext,
++    client_id: &str,
++    title_id: i64,
++) -> Result<TitleSession, Box<dyn std::error::Error + Send + Sync>> {
++    let (auth, sisu, device) = xodus::auth::do_sisu(&context.client, context.tokens(), client_id, title_id)
++        .await
++        .map_err(|e| e.to_string())?;
++    // The title's list answers to its own token, without the ?type=1 the default list takes.
++    let endpoints = async {
++        let resp = context
++            .client
++            .get(format!("https://title.mgt.xboxlive.com/titles/{title_id}/endpoints"))
++            .header("Authorization", xbl_header(&sisu.authorization_token))
++            .header("x-xbl-contract-version", "1")
++            .send()
++            .await
++            .ok()?
++            .error_for_status()
++            .ok()?;
++        resp.json::<xodus::models::xbox::TitleMgtResponse>().await.ok()
++    }
++    .await;
++    tracing::info!(
++        "Title {title_id} signed in as {client_id}; its endpoint list has {} entries",
++        endpoints.as_ref().map_or(0, |e| e.end_points.len())
++    );
++    let signer = {
++        use p256::pkcs8::EncodePrivateKey;
++        auth.request_signer()
++            .keypair
++            .to_pkcs8_der()
++            .ok()
++            .and_then(|der| xodus::api::xbox::RequestSigner::from_pkcs8(der.as_bytes()))
++    };
++    Ok(TitleSession { auth, signer, device, sisu, endpoints })
++}
++
++/// The relying party a title's own list gives this URL, ignoring its catch-all "*" entries.
++fn title_relying_party(url: &str, endpoints: &Option<xodus::models::xbox::TitleMgtResponse>) -> Option<String> {
++    let list = endpoints.as_ref()?;
++    let endpoint = xodus::api::xbox::title::get_endpoint(url, list)?;
++    if endpoint.host == "*" {
++        return None;
++    }
++    endpoint.relying_party.clone()
++}
++
++/// A token minted as the title, or None when that is not possible (the caller falls back to the
++/// user-only token, which is what every request got before).
++async fn title_token(
++    context: &SimpleContext,
++    req: &XSTSTokenRequest,
++    default_relying_party: impl std::future::Future<Output = String>,
++) -> Option<XSTSTokenResponse> {
++    if req.title_client_id.is_empty() {
++        return None;
++    }
++    let title_id = req.title_id.trim().parse::<i64>().ok()?;
++    let key = (req.title_client_id.clone(), title_id);
++    let mut sessions = TITLE_SESSIONS.lock().await;
++    let now = chrono::Utc::now();
++    let stale = sessions.get(&key).is_none_or(|s| {
++        s.sisu.title_token.not_after < now + chrono::Duration::minutes(5)
++            || s.sisu.user_token.not_after < now + chrono::Duration::minutes(5)
++            || s.device.not_after < now + chrono::Duration::minutes(5)
++    });
++    if stale {
++        match new_title_session(context, &req.title_client_id, title_id).await {
++            Ok(session) => {
++                sessions.insert(key.clone(), session);
++            }
++            Err(err) => {
++                tracing::warn!("Title sign-in for {title_id} failed, using the user token: {err}");
++                sessions.remove(&key);
++                return None;
++            }
++        }
++    }
++    let session = sessions.get_mut(&key)?;
++
++    let relying_party = if !req.relying_party.is_empty() {
++        req.relying_party.clone()
++    } else if let Some(rp) = title_relying_party(&req.url, &session.endpoints) {
++        rp
++    } else {
++        default_relying_party.await
++    };
++    let cache_key = format!("{relying_party}|title={title_id}");
++    let now_ts = now.timestamp();
++    let cached = XSTS_CACHE
++        .lock()
++        .ok()
++        .and_then(|c| c.get(&cache_key).cloned())
++        .filter(|c| c.expiry > now_ts + 60);
++    let hit = match cached {
++        Some(hit) => hit,
++        None => {
++            let xsts = match session
++                .auth
++                .get_xsts_token(
++                    Some(&session.device),
++                    Some(&session.sisu.title_token),
++                    Some(&session.sisu.user_token),
++                    &relying_party,
++                )
++                .await
++            {
++                Ok(t) => t,
++                Err(err) => {
++                    tracing::warn!("Title XSTS for {relying_party} failed, using the user token: {err}");
++                    return None;
++                }
++            };
++            let xui = xsts.display_claims.as_ref().and_then(|c| c.xui.first());
++            let token = CachedToken {
++                token: xbl_header(&xsts),
++                xuid: xui.and_then(|x| x.get("xid").cloned()).unwrap_or_default(),
++                gamertag: xui.and_then(|x| x.get("gtg").cloned()).unwrap_or_default(),
++                expiry: xsts.not_after.timestamp(),
++            };
++            if let Ok(mut cache) = XSTS_CACHE.lock() {
++                cache.insert(cache_key, token.clone());
++            }
++            token
++        }
++    };
++    tracing::debug!("Title token for {} ({relying_party})", req.url);
++
++    // Signed with the key these tokens are bound to, under the same policies as before; endpoints
++    // without a policy need no signature.
++    let signature = match (&session.signer, signature_policy(&req.url, &endpoints_for(&context.client).await)) {
++        (Some(signer), Some((version, max_body))) => {
++            let body = if req.body_base64.is_empty() {
++                Vec::new()
++            } else {
++                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.body_base64)
++                    .unwrap_or_default()
++            };
++            let method = if req.method.is_empty() { "GET" } else { &req.method };
++            signer.sign(version, method, &xodus::api::xbox::path_and_query(&req.url), &hit.token, &body, max_body)
++        }
++        _ => String::new(),
++    };
++    Some(XSTSTokenResponse {
++        token: hit.token,
++        xuid: hit.xuid,
++        gamertag: hit.gamertag,
++        expiry: hit.expiry,
++        signature,
++    })
++}
++
+ #[derive(Clone)]
+ struct CachedToken {
+     token: String,
+@@ -218,6 +400,35 @@
+         XodusMessageType::XstsTokenRequest => {
+             let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
+             tracing::debug!("XSTS token request for {}", req.url);
++
++            // As the title first (what Windows does); the user-only token below stays the fallback.
++            let default_rp = async {
++                let endpoints = endpoints_for(&context.client).await;
++                let host = reqwest::Url::parse(&req.url)
++                    .ok()
++                    .and_then(|u| u.host_str().map(str::to_owned))
++                    .unwrap_or_default();
++                endpoints.as_ref().and_then(|list| {
++                    xodus::api::xbox::title::get_endpoint(&req.url, list)
++                        .and_then(|e| e.relying_party.clone())
++                        .or_else(|| {
++                            // per-title PlayFab hosts: the list only names the bare domain
++                            list.end_points
++                                .iter()
++                                .filter(|e| {
++                                    e.relying_party.is_some()
++                                        && !e.host.contains('*')
++                                        && host.ends_with(&format!(".{}", e.host))
++                                })
++                                .max_by_key(|e| e.host.len())
++                                .and_then(|e| e.relying_party.clone())
++                        })
++                })
++                .unwrap_or_else(|| "http://xboxlive.com".to_string())
++            };
++            if let Some(payload) = title_token(context, &req, default_rp).await {
++                return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
++            }
+ 
+             // Which relying party this URL authenticates against. The
+             // title-management endpoint list is authoritative; its PlayFab entry
+
+--- new file: crates/xodus/examples/fh6_sisu_probe.rs (feasibility probe, prints no token)
+//! Feasibility probe for Forza Horizon 6 online services (no game needed). Prints no token.
+//! 1. SISU as the game's own app (MSAAppId 000000004CE146F7, title 2079757188): device + title + user tokens
+//! 2. the title's own endpoint list (NSAL), read with that title-bearing token
+//! 3. an XSTS token with device + title + user for every non-Microsoft relying party in it
+use xal::RequestSigning;
+
+#[tokio::main]
+async fn main() {
+    let client = reqwest::Client::new();
+    xodus::secrets::init_secrets().expect("keychain");
+    let tokens = xodus::tokens::TokenManager::with_keychain_and_memory();
+    let (mut auth, sisu, device) =
+        match xodus::auth::do_sisu(&client, &tokens, "000000004CE146F7", 2079757188).await {
+            Ok(v) => v,
+            Err(e) => { println!("SISU FAILED: {e}"); return; }
+        };
+    let xui = sisu.authorization_token.display_claims.as_ref().and_then(|c| c.xui.first().cloned()).unwrap_or_default();
+    println!("SISU ok: title token {} chars, gamertag {:?}", sisu.title_token.token.len(), xui.get("gtg"));
+    let uhs = xui.get("uhs").cloned().unwrap_or_default();
+    let header = format!("XBL3.0 x={uhs};{}", sisu.authorization_token.token);
+
+    let mut signer = auth.request_signer();
+    let mut rps: Vec<(String, String)> = Vec::new();
+    let urls = ["https://title.mgt.xboxlive.com/titles/2079757188/endpoints",
+                "https://title.mgt.xboxlive.com/titles/2079757188/endpoints?type=2",
+                "https://title.mgt.xboxlive.com/titles/current/endpoints?type=1",
+                "https://title.mgt.xboxlive.com/titles/current/endpoints"];
+    for url in urls { for signed in [false] {
+        let mut req = client.get(url).header("Authorization", &header).header("x-xbl-contract-version", "1").build().unwrap();
+        if signed {
+            // sign with the key the SISU tokens are bound to (xal signs http::Request; copy its Signature header over)
+            let hreq = xal::oauth2::http::Request::builder().method("GET").uri(url)
+                .header("Authorization", &header).header("x-xbl-contract-version", "1").body(Vec::<u8>::new()).unwrap();
+            match signer.sign_request(hreq, None).await {
+                Ok(r) => match r.headers().get("Signature") {
+                    Some(sig) => { req.headers_mut().insert("Signature", sig.to_str().unwrap().parse().unwrap()); }
+                    None => { println!("(no signature policy for the NSAL url)"); continue; }
+                },
+                Err(e) => { println!("(signing NSAL request failed: {e})"); continue; }
+            }
+        }
+        let resp = client.execute(req).await.expect("NSAL request");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        println!("title NSAL {url}: HTTP {status}, {} bytes", text.len());
+        if !status.is_success() { continue; }
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        for e in v["EndPoints"].as_array().cloned().unwrap_or_default() {
+            let host = e["Host"].as_str().unwrap_or("");
+            if host.contains("xboxlive.com") || host.contains("microsoft.com") || host.contains("xboxservices.com") { continue; }
+            println!("  endpoint {e}");
+            if let Some(rp) = e["RelyingParty"].as_str() { rps.push((host.to_string(), rp.to_string())); }
+        }
+    } }
+    rps.sort(); rps.dedup();
+    for (host, rp) in rps {
+        let user_only = auth.get_xsts_token(None, None, Some(&sisu.user_token), &rp).await;
+        let full = auth.get_xsts_token(Some(&device), Some(&sisu.title_token), Some(&sisu.user_token), &rp).await;
+        println!("XSTS {host} -> {rp}: user-only {} | device+title+user {}",
+            user_only.as_ref().map(|_| "OK".to_string()).unwrap_or_else(|e| format!("FAIL {e}")),
+            full.as_ref().map(|_| "OK".to_string()).unwrap_or_else(|e| format!("FAIL {e}")));
+    }
+
+    // what the Forza server answers to each kind of token (status only)
+    let target = "https://gameservices.fh6.forzamotorsport.net/Services/o.xtsw";
+    let mut cases: Vec<(&str, Option<String>)> = vec![("no token", None)];
+    for (label, rp, full) in [("xboxlive.com RP (what xodus sends today)", "http://xboxlive.com", false),
+                              ("forza RP, user only", "http://xboxliveauth.forzamotorsport.net/", false),
+                              ("forza RP, device+title+user", "http://xboxliveauth.forzamotorsport.net/", true)] {
+        let t = if full { auth.get_xsts_token(Some(&device), Some(&sisu.title_token), Some(&sisu.user_token), rp).await }
+                else { auth.get_xsts_token(None, None, Some(&sisu.user_token), rp).await };
+        match t {
+            Ok(t) => { let uhs = t.display_claims.as_ref().and_then(|c| c.xui.first()).and_then(|x| x.get("uhs").cloned()).unwrap_or_default();
+                       cases.push((label, Some(format!("XBL3.0 x={uhs};{}", t.token)))); }
+            Err(e) => println!("{label}: no token ({e})"),
+        }
+    }
+    for (label, h) in cases {
+        for method in ["GET", "POST"] {
+            let mut rb = if method == "GET" { client.get(target) } else { client.post(target).body(Vec::<u8>::new()) };
+            if let Some(h) = &h { rb = rb.header("Authorization", h); }
+            match rb.send().await {
+                Ok(r) => { let st = r.status(); let hdr: Vec<String> = r.headers().iter().filter(|(k, _)| k.as_str().starts_with("www-auth") || k.as_str().starts_with("x-")).map(|(k, v)| format!("{k}={}", v.to_str().unwrap_or("?"))).collect();
+                           let body = r.text().await.unwrap_or_default();
+                           println!("forza {method} [{label}]: HTTP {st} {:?} body {:?}", hdr, body.chars().take(160).collect::<String>()); }
+                Err(e) => println!("forza {method} [{label}]: error {e}"),
+            }
+        }
+    }
+}

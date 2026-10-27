@@ -1,0 +1,306 @@
+CrossOver 26.3 winecoreaudio: render a multichannel stream through AUSpatialMixer when the device has fewer channels.
+
+Against CrossOver 26.3's dlls/winecoreaudio.drv with Highball's patches 0001-0021 applied (the tree engine
+r22 is built from). Pairs with mmdevapi-crossover26.3-static-object-order.patch.
+
+What happens without it, measured on an M5 Max with macOS 27.0.1:
+- A Core Audio output unit given a 12-channel stream with Wine's bitmap layout (0x2D63F, 7.1.4) accepts it,
+  but neither the unit nor an AudioConverter between a 7.1.4 layout and the stereo device mixes anything
+  down: a tone in any channel other than front left and right comes out silent. That is why Forza Horizon 6
+  lost Anna, dialogue and most of the engine on a Mac's speakers.
+- ca_setup_audiounit's "Couldn't set channel layout: -10851" only appears when the number of set bits in
+  the channel mask differs from the channel count (12 channels with a stereo mask, or the reverse).
+- Apple's own 7.1.4 -> stereo matrix (kAudioFormatProperty_MatrixMixMap) is a plain fold: centre, sides,
+  backs and heights at 0.707 to their side, LFE dropped.
+
+With it, a render stream whose format is 32-bit float WAVE_FORMAT_EXTENSIBLE with three or more channels,
+a mask whose bit count matches the channel count and anything beyond FL/FR/FC/LFE, on a device with fewer
+output channels, goes through AUSpatialMixer instead of straight into the device unit:
+- the mixer takes the stream as an ambience bed (kSpatialMixerSourceMode_AmbienceBed) with a channel
+  layout built from the mask (back pair as rear surround when side speakers are present, as surround
+  otherwise; top speakers as LeftTopFront and so on) and renders it with
+  kSpatializationAlgorithm_UseOutputType;
+- the output type follows the device: built-in speakers, headphones on the built-in jack, Bluetooth and
+  USB as headphones, anything else as external speakers; HB_SPATIAL=speakers|headphones|external
+  overrides the guess and HB_SPATIAL=0 turns the path off;
+- on built-in speakers the mixer leaves LFE out, so it is added to the front pair at -6 dB;
+- the device unit gets the mixer's stereo output, and the stream's own bookkeeping (padding, latency,
+  buffers) is unchanged.
+
+Tested with Forza Horizon 6 on engine r22, M5 Max built-in speakers: the log shows
+  winecoreaudio: 12-channel stream (mask 0x2d63f) rendered by AUSpatialMixer for built-in speakers on a 2-channel device
+  winecoreaudio: 8-channel stream (mask 0x63f) rendered by AUSpatialMixer for built-in speakers on a 2-channel device
+(the spatial audio bed and the game's XAudio2 mastering voice), dialogue and the engine play, and the mix
+sounds more detailed than the stereo fold. Built x86_64 from this tree and laid into the environment's
+.highball-dlss/wine as x86_64-windows/winecoreaudio.drv and x86_64-unix/winecoreaudio.so, with an
+x86_64-unix/ntdll.so link to the engine's (the .so finds ntdll.so through @loader_path).
+
+Still open, and not caused by this patch (it happened before it, and with FAudio 26.10 in xaudio2_9 too):
+in FH6 the engine sound sometimes stays silent after changing cars until the camera changes, the car
+brakes hard or crashes, or passes about 250 km/h.
+
+diff --git a/dlls/winecoreaudio.drv/coreaudio.c b/dlls/winecoreaudio.drv/coreaudio.c
+index 2d29999..2bca6c8 100644
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -102,6 +102,13 @@ struct coreaudio_stream
+     INT32 getbuf_last;
+     WAVEFORMATEX *fmt;
+     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
++
++    /* Multichannel output on a device with fewer channels: the stream goes through
++     * AUSpatialMixer, which renders the bed for the Mac's speakers or for headphones. */
++    AudioUnit spatial;
++    float *spatial_buf;
++    UInt32 spatial_frames;
++    int spatial_lfe;       /* channel index of LFE, folded into the front pair on speakers, or -1 */
+ };
+ 
+ static const REFERENCE_TIME def_period = 100000;
+@@ -721,6 +728,217 @@ static AudioDeviceID dev_id_from_device(const char *device)
+     return id;
+ }
+ 
++#define SPATIAL_MAX_FRAMES 4096
++
++static AudioChannelLabel speaker_to_label(DWORD speaker, DWORD mask)
++{
++    BOOL side = (mask & (SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT)) != 0;
++    switch(speaker){
++    case SPEAKER_FRONT_LEFT: return kAudioChannelLabel_Left;
++    case SPEAKER_FRONT_RIGHT: return kAudioChannelLabel_Right;
++    case SPEAKER_FRONT_CENTER: return kAudioChannelLabel_Center;
++    case SPEAKER_LOW_FREQUENCY: return kAudioChannelLabel_LFEScreen;
++    case SPEAKER_BACK_LEFT: return side ? kAudioChannelLabel_RearSurroundLeft : kAudioChannelLabel_LeftSurround;
++    case SPEAKER_BACK_RIGHT: return side ? kAudioChannelLabel_RearSurroundRight : kAudioChannelLabel_RightSurround;
++    case SPEAKER_FRONT_LEFT_OF_CENTER: return kAudioChannelLabel_LeftCenter;
++    case SPEAKER_FRONT_RIGHT_OF_CENTER: return kAudioChannelLabel_RightCenter;
++    case SPEAKER_BACK_CENTER: return kAudioChannelLabel_CenterSurround;
++    case SPEAKER_SIDE_LEFT: return kAudioChannelLabel_LeftSurround;
++    case SPEAKER_SIDE_RIGHT: return kAudioChannelLabel_RightSurround;
++    case SPEAKER_TOP_CENTER: return kAudioChannelLabel_TopCenterSurround;
++    case SPEAKER_TOP_FRONT_LEFT: return kAudioChannelLabel_LeftTopFront;
++    case SPEAKER_TOP_FRONT_CENTER: return kAudioChannelLabel_CenterTopFront;
++    case SPEAKER_TOP_FRONT_RIGHT: return kAudioChannelLabel_RightTopFront;
++    case SPEAKER_TOP_BACK_LEFT: return kAudioChannelLabel_LeftTopRear;
++    case SPEAKER_TOP_BACK_CENTER: return kAudioChannelLabel_CenterTopRear;
++    case SPEAKER_TOP_BACK_RIGHT: return kAudioChannelLabel_RightTopRear;
++    }
++    return kAudioChannelLabel_Unused;
++}
++
++static UInt32 device_output_channels(AudioDeviceID dev)
++{
++    AudioObjectPropertyAddress addr = { kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput,
++                                        kAudioObjectPropertyElementMain };
++    AudioBufferList *buffers;
++    UInt32 size = 0, i, channels = 0;
++
++    if(AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &size) != noErr || !(buffers = malloc(size)))
++        return 0;
++    if(AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, buffers) == noErr)
++        for(i = 0; i < buffers->mNumberBuffers; i++)
++            channels += buffers->mBuffers[i].mNumberChannels;
++    free(buffers);
++    return channels;
++}
++
++/* Speakers in the Mac itself, headphones (built-in jack, Bluetooth, USB headsets), or anything
++ * else as external speakers. HB_SPATIAL=speakers|headphones|external overrides the guess. */
++static UInt32 spatial_output_type(AudioDeviceID dev)
++{
++    AudioObjectPropertyAddress addr = { kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal,
++                                        kAudioObjectPropertyElementMain };
++    const char *env = getenv("HB_SPATIAL");
++    UInt32 transport = 0, source = 0, size = sizeof(transport);
++
++    if(env && !strcmp(env, "speakers")) return kSpatialMixerOutputType_BuiltInSpeakers;
++    if(env && !strcmp(env, "headphones")) return kSpatialMixerOutputType_Headphones;
++    if(env && !strcmp(env, "external")) return kSpatialMixerOutputType_ExternalSpeakers;
++
++    AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &transport);
++    switch(transport){
++    case kAudioDeviceTransportTypeBuiltIn:
++        addr.mSelector = kAudioDevicePropertyDataSource;
++        addr.mScope = kAudioObjectPropertyScopeOutput;
++        size = sizeof(source);
++        if(AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &source) == noErr && source == 'hdpn')
++            return kSpatialMixerOutputType_Headphones;
++        return kSpatialMixerOutputType_BuiltInSpeakers;
++    case kAudioDeviceTransportTypeBluetooth:
++    case kAudioDeviceTransportTypeBluetoothLE:
++    case kAudioDeviceTransportTypeUSB:
++        return kSpatialMixerOutputType_Headphones;
++    default:
++        return kSpatialMixerOutputType_ExternalSpeakers;
++    }
++}
++
++static OSStatus spatial_source_cb(void *user, AudioUnitRenderActionFlags *flags,
++        const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes, AudioBufferList *data)
++{
++    struct coreaudio_stream *stream = user;
++    UInt32 nch = stream->fmt->nChannels, i, c;
++    AudioBufferList interleaved;
++    float *src = stream->spatial_buf;
++
++    if(nframes > stream->spatial_frames) nframes = stream->spatial_frames;
++    interleaved.mNumberBuffers = 1;
++    interleaved.mBuffers[0].mNumberChannels = nch;
++    interleaved.mBuffers[0].mDataByteSize = nframes * stream->fmt->nBlockAlign;
++    interleaved.mBuffers[0].mData = src;
++    ca_render_cb(stream, flags, ts, 0, nframes, &interleaved);
++
++    for(c = 0; c < nch && c < data->mNumberBuffers; c++){
++        float *dst = data->mBuffers[c].mData;
++        for(i = 0; i < nframes; i++) dst[i] = src[i * nch + c];
++    }
++    if(stream->spatial_lfe >= 0 && data->mNumberBuffers >= 2){
++        float *l = data->mBuffers[0].mData, *r = data->mBuffers[1].mData, *lfe = data->mBuffers[stream->spatial_lfe].mData;
++        for(i = 0; i < nframes; i++){ l[i] += 0.5f * lfe[i]; r[i] += 0.5f * lfe[i]; lfe[i] = 0.0f; }
++    }
++    return noErr;
++}
++
++static OSStatus spatial_pull_cb(void *user, AudioUnitRenderActionFlags *flags,
++        const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes, AudioBufferList *data)
++{
++    struct coreaudio_stream *stream = user;
++    return AudioUnitRender(stream->spatial, flags, ts, 0, nframes, data);
++}
++
++/* Puts AUSpatialMixer between the stream and the device when the stream is a float bed with more
++ * channels than the device. Returns FALSE (and leaves the unit as it was) when it does not apply. */
++static BOOL spatial_setup(struct coreaudio_stream *stream)
++{
++    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)stream->fmt;
++    AudioComponentDescription desc = { kAudioUnitType_Mixer, kAudioUnitSubType_SpatialMixer, kAudioUnitManufacturer_Apple };
++    AudioStreamBasicDescription in, out;
++    AudioChannelLayout *layout;
++    AURenderCallbackStruct cb;
++    UInt32 nch = stream->fmt->nChannels, one = 1, algo, mode, type, frames = SPATIAL_MAX_FRAMES, i, bit, dev_ch;
++    DWORD mask;
++    size_t layout_size;
++    AudioComponent comp;
++    const char *env = getenv("HB_SPATIAL");
++    OSStatus sc;
++
++    if(env && !strcmp(env, "0")) return FALSE;
++    if(stream->fmt->wFormatTag != WAVE_FORMAT_EXTENSIBLE || !IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ||
++       stream->fmt->wBitsPerSample != 32 || nch < 3)
++        return FALSE;
++    mask = fmtex->dwChannelMask;
++    if((UInt32)__builtin_popcount(mask) != nch || !(mask & ~(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY)))
++        return FALSE;
++    dev_ch = device_output_channels(stream->dev_id);
++    if(!dev_ch || dev_ch >= nch) return FALSE;
++    if(!(comp = AudioComponentFindNext(NULL, &desc)) || AudioComponentInstanceNew(comp, &stream->spatial) != noErr){
++        stream->spatial = NULL;
++        return FALSE;
++    }
++
++    memset(&in, 0, sizeof(in));
++    in.mSampleRate = stream->fmt->nSamplesPerSec;
++    in.mFormatID = kAudioFormatLinearPCM;
++    in.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
++    in.mBytesPerPacket = in.mBytesPerFrame = 4;
++    in.mFramesPerPacket = 1;
++    in.mChannelsPerFrame = nch;
++    in.mBitsPerChannel = 32;
++    out = in;
++    out.mChannelsPerFrame = 2;
++
++    layout_size = offsetof(AudioChannelLayout, mChannelDescriptions) + nch * sizeof(AudioChannelDescription);
++    layout = calloc(1, layout_size);
++    layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
++    layout->mNumberChannelDescriptions = nch;
++    stream->spatial_lfe = -1;
++    for(i = 0, bit = 1; bit && i < nch; bit <<= 1){
++        if(!(mask & bit)) continue;
++        if(bit == SPEAKER_LOW_FREQUENCY) stream->spatial_lfe = i;
++        layout->mChannelDescriptions[i++].mChannelLabel = speaker_to_label(bit, mask);
++    }
++
++    type = spatial_output_type(stream->dev_id);
++    algo = kSpatializationAlgorithm_UseOutputType;
++    mode = kSpatialMixerSourceMode_AmbienceBed;
++    if(type != kSpatialMixerOutputType_BuiltInSpeakers) stream->spatial_lfe = -1;
++
++    if((sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &one, sizeof(one))) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &frames, sizeof(frames))) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &in, sizeof(in))) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0, layout, layout_size)) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &out, sizeof(out))) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_SpatializationAlgorithm, kAudioUnitScope_Input, 0, &algo, sizeof(algo))) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_SpatialMixerSourceMode, kAudioUnitScope_Input, 0, &mode, sizeof(mode))) ||
++       (sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_SpatialMixerOutputType, kAudioUnitScope_Global, 0, &type, sizeof(type)))){
++        WARN("spatial mixer setup failed: %d\n", (int)sc);
++        goto fail;
++    }
++    free(layout);
++    layout = NULL;
++
++    cb.inputProc = spatial_source_cb;
++    cb.inputProcRefCon = stream;
++    if((sc = AudioUnitSetProperty(stream->spatial, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof(cb))) ||
++       (sc = AudioUnitInitialize(stream->spatial))){
++        WARN("spatial mixer start failed: %d\n", (int)sc);
++        goto fail;
++    }
++
++    if((sc = AudioUnitSetProperty(stream->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &out, sizeof(out)))){
++        WARN("couldn't give the device a stereo stream: %d\n", (int)sc);
++        goto fail;
++    }
++
++    stream->spatial_frames = SPATIAL_MAX_FRAMES;
++    stream->spatial_buf = malloc(SPATIAL_MAX_FRAMES * stream->fmt->nBlockAlign);
++    if(!stream->spatial_buf) goto fail;
++
++    MESSAGE("winecoreaudio: %u-channel stream (mask %#x) rendered by AUSpatialMixer for %s on a %u-channel device\n",
++            (unsigned)nch, (unsigned)mask,
++            type == kSpatialMixerOutputType_BuiltInSpeakers ? "built-in speakers" :
++            type == kSpatialMixerOutputType_Headphones ? "headphones" : "external speakers", (unsigned)dev_ch);
++    return TRUE;
++
++fail:
++    free(layout);
++    AudioComponentInstanceDispose(stream->spatial);
++    stream->spatial = NULL;
++    /* put the device unit back on the stream's own format */
++    AudioUnitSetProperty(stream->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &stream->dev_desc, sizeof(stream->dev_desc));
++    return FALSE;
++}
++
+ static NTSTATUS unix_create_stream(void *args)
+ {
+     struct create_stream_params *params = args;
+@@ -767,7 +985,7 @@ static NTSTATUS unix_create_stream(void *args)
+         sc = AudioUnitSetProperty(stream->unit, kAudioOutputUnitProperty_SetInputCallback,
+                                   kAudioUnitScope_Output, 1, &input, sizeof(input));
+     }else{
+-        input.inputProc = ca_render_cb;
++        input.inputProc = spatial_setup(stream) ? spatial_pull_cb : ca_render_cb;
+         sc = AudioUnitSetProperty(stream->unit, kAudioUnitProperty_SetRenderCallback,
+                                   kAudioUnitScope_Input, 0, &input, sizeof(input));
+     }
+@@ -853,6 +1071,8 @@ end:
+     if(FAILED(params->result)){
+         if(stream->converter) AudioConverterDispose(stream->converter);
+         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
++        if(stream->spatial) AudioComponentInstanceDispose(stream->spatial);
++        free(stream->spatial_buf);
+         free(stream->fmt);
+         free(stream);
+     } else {
+@@ -879,6 +1099,10 @@ static NTSTATUS unix_release_stream( void *args )
+         AudioOutputUnitStop(stream->unit);
+         AudioComponentInstanceDispose(stream->unit);
+     }
++    if(stream->spatial){
++        AudioComponentInstanceDispose(stream->spatial);
++        free(stream->spatial_buf);
++    }
+ 
+     if(stream->converter) AudioConverterDispose(stream->converter);
+     free(stream->resamp_buffer);

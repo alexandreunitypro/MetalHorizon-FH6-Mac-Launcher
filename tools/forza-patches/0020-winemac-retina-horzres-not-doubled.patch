@@ -1,0 +1,32 @@
+winemac: HORZRES and VERTRES are not doubled in retina mode.
+
+From athei/wine fa43d6db2 ("winemac: Don't double HORZRES and VERTRES in retina mode",
+LGPL like Wine). macdrv_GetDeviceCaps doubled both caps whenever retina mode was on, on top of
+the fallback that already reports monitors in pixels, so a retina process saw the screen twice as
+large there as through GetSystemMetrics and EnumDisplaySettings.
+
+Measured on an M4 (1920x1080 display, macOS 27.0, 2026-10-06) with a probe on x64-crossover26.3-r17,
+the same on the default Wine 10 engine: Retina resolution off, every call says 1920x1080. Retina on,
+GetSystemMetrics, EnumDisplaySettings and DESKTOPHORZRES say 3840x2160 and HORZRES/VERTRES say
+7680x4320. Team Fortress 2 centres its window from HORZRES (athei), and Red Dead Redemption 2 at
+1920x1080 fullscreen comes out cropped for a player with Retina on (highball#261).
+
+--- a/dlls/winemac.drv/gdi.c
++++ b/dlls/winemac.drv/gdi.c
+@@ -213,15 +213,10 @@ static INT macdrv_GetDeviceCaps(PHYSDEV dev, INT cap)
+     case VERTSIZE:
+         ret = vert_size;
+         break;
+-    case HORZRES:
+-    case VERTRES:
+     default:
+         pthread_mutex_unlock(&device_data_mutex);
+         dev = GET_NEXT_PHYSDEV( dev, pGetDeviceCaps );
+-        ret = dev->funcs->pGetDeviceCaps( dev, cap );
+-        if ((cap == HORZRES || cap == VERTRES) && retina_on)
+-            ret *= 2;
+-        return ret;
++        return dev->funcs->pGetDeviceCaps( dev, cap );
+     }
+ 
+     TRACE("cap %d -> %d\n", cap, ret);

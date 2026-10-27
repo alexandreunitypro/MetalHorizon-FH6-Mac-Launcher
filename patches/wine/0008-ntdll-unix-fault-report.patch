@@ -1,0 +1,143 @@
+ntdll: unix-side fault report for access violations (channel fh6fault, ERR level).
+
+Forza Horizon 6 catches its own faults and stops itself with a deliberate second one, so Wine's box never shows the
+cause, and a first-chance trace in the PE ntdll made its copy protection stop the game. This report sits in the unix
+segv_handler, after virtual_handle_fault and handle_syscall_fault, for access violations about to be raised to the
+Windows side only: faulting address, registers, code around rip, 32 stack slots, what each register points to (with
+a text view), and for each stack slot inside the game's image the code before it with the call targets found there
+(E8 rel32, FF 15 through the pointer read). Memory is read with mach_vm_read_overwrite. At most 60 reports a run.
+Applied by tools/mac_trace_faults.sh.
+
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -30,6 +30,10 @@
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdlib.h>
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#endif
+ #include <dlfcn.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -2504,9 +2508,111 @@
+     /* leave_handler() will set GSBASE to the TEB */
+ #endif
+     return TRUE;
++}
++
++
++/* fh6: fault report (channel fh6fault, ERR level), see tools/mac_trace_faults.py */
++WINE_DECLARE_DEBUG_CHANNEL(fh6fault);
++
++static BOOL fh6_read( ULONG_PTR addr, void *buf, size_t size )
++{
++    mach_vm_size_t got = 0;
++    return mach_vm_read_overwrite( mach_task_self(), addr, size, (mach_vm_address_t)buf, &got ) == KERN_SUCCESS && got == size;
+ }
+ 
++static void fh6_fault_report( ucontext_t *ucontext, const EXCEPTION_RECORD *rec )
++{
++    static LONG reports;
++    unsigned char code[96];
++    ULONG_PTR stack[32], rip = (ULONG_PTR)RIP_sig(ucontext);
++    char line[1200];
++    size_t pos = 0;
++    unsigned int i;
++    int len;
+ 
++    if (!ERR_ON(fh6fault) || InterlockedIncrement( &reports ) > 60) return;
++#define FH6_ADD(...) do { len = snprintf( line + pos, sizeof(line) - pos, __VA_ARGS__ ); \
++        if (len > 0) pos = pos + len < sizeof(line) ? pos + len : sizeof(line) - 1; } while (0)
++    ERR_(fh6fault)( "code %08x at %p, %s %p\n", (int)rec->ExceptionCode, (void *)rip,
++                    rec->ExceptionInformation[0] == 8 ? "executing" : rec->ExceptionInformation[0] == 1 ? "writing" : "reading",
++                    (void *)rec->ExceptionInformation[1] );
++    ERR_(fh6fault)( "regs rax %lx rbx %lx rcx %lx rdx %lx rsi %lx rdi %lx rbp %lx rsp %lx r8 %lx r9 %lx r10 %lx r11 %lx r12 %lx r13 %lx r14 %lx r15 %lx\n",
++                    (unsigned long)RAX_sig(ucontext), (unsigned long)RBX_sig(ucontext), (unsigned long)RCX_sig(ucontext),
++                    (unsigned long)RDX_sig(ucontext), (unsigned long)RSI_sig(ucontext), (unsigned long)RDI_sig(ucontext),
++                    (unsigned long)RBP_sig(ucontext), (unsigned long)RSP_sig(ucontext), (unsigned long)R8_sig(ucontext),
++                    (unsigned long)R9_sig(ucontext), (unsigned long)R10_sig(ucontext), (unsigned long)R11_sig(ucontext),
++                    (unsigned long)R12_sig(ucontext), (unsigned long)R13_sig(ucontext), (unsigned long)R14_sig(ucontext),
++                    (unsigned long)R15_sig(ucontext) );
++    if (fh6_read( rip - 64, code, sizeof(code) ))
++    {
++        FH6_ADD( "code from %p:", (void *)(rip - 64) );
++        for (i = 0; i < sizeof(code); i++) FH6_ADD( "%s%02x", i == 64 ? " >" : " ", code[i] );
++        ERR_(fh6fault)( "%s\n", line );
++    }
++    else if (fh6_read( rip, code, 32 ))
++    {
++        FH6_ADD( "code from %p: >", (void *)rip );
++        for (i = 0; i < 32; i++) FH6_ADD( " %02x", code[i] );
++        ERR_(fh6fault)( "%s\n", line );
++    }
++    else ERR_(fh6fault)( "code at %p not readable\n", (void *)rip );
++    pos = 0;
++    if (fh6_read( (ULONG_PTR)RSP_sig(ucontext), stack, sizeof(stack) ))
++    {
++        FH6_ADD( "stack:" );
++        for (i = 0; i < 32; i++) FH6_ADD( " %lx", (unsigned long)stack[i] );
++        ERR_(fh6fault)( "%s\n", line );
++    }
++    /* fh6: fault report v2: what the registers point to, and the calls before the return addresses into the game */
++    {
++        static const char *const reg_names[11] = { "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r12", "r13", "r14", "r15" };
++        ULONG_PTR regs[11] = { (ULONG_PTR)RBX_sig(ucontext), (ULONG_PTR)RCX_sig(ucontext), (ULONG_PTR)RDX_sig(ucontext),
++                               (ULONG_PTR)RSI_sig(ucontext), (ULONG_PTR)RDI_sig(ucontext), (ULONG_PTR)R8_sig(ucontext),
++                               (ULONG_PTR)R9_sig(ucontext), (ULONG_PTR)R12_sig(ucontext), (ULONG_PTR)R13_sig(ucontext),
++                               (ULONG_PTR)R14_sig(ucontext), (ULONG_PTR)R15_sig(ucontext) };
++        unsigned char text[64], before[48];
++        unsigned int k;
++        if (!fh6_read( (ULONG_PTR)RSP_sig(ucontext), stack, sizeof(stack) )) memset( stack, 0, sizeof(stack) );
++        for (i = 0; i < 11; i++)
++        {
++            if (regs[i] < 0x10000 || !fh6_read( regs[i], text, sizeof(text) )) continue;
++            pos = 0;
++            FH6_ADD( "%s -> %p:", reg_names[i], (void *)regs[i] );
++            for (k = 0; k < sizeof(text); k++) FH6_ADD( " %02x", text[k] );
++            FH6_ADD( "  \"" );
++            for (k = 0; k < sizeof(text); k++) FH6_ADD( "%c", text[k] >= 32 && text[k] < 127 && text[k] != '"' ? text[k] : text[k] ? '?' : '.' );
++            FH6_ADD( "\"" );
++            ERR_(fh6fault)( "%s\n", line );
++        }
++        for (i = 0; i < 32; i++)
++        {
++            ULONG_PTR ret = stack[i];
++            if (ret < 0x140000000 || ret >= 0x150000000 || !fh6_read( ret - sizeof(before), before, sizeof(before) )) continue;
++            pos = 0;
++            FH6_ADD( "slot %u before %p:", i, (void *)ret );
++            for (k = 0; k < sizeof(before); k++) FH6_ADD( " %02x", before[k] );
++            for (k = 0; k + 5 <= sizeof(before); k++)
++            {
++                ULONG_PTR next, target, ptr;
++                INT32 rel;
++                if (before[k] == 0xe8)
++                {
++                    memcpy( &rel, before + k + 1, 4 ); next = ret - sizeof(before) + k + 5;
++                    if (next == ret) FH6_ADD( " | call %p", (void *)(next + rel) );
++                }
++                else if (k + 6 <= sizeof(before) && before[k] == 0xff && before[k + 1] == 0x15)
++                {
++                    memcpy( &rel, before + k + 2, 4 ); next = ret - sizeof(before) + k + 6; target = next + rel;
++                    if (next == ret && fh6_read( target, &ptr, sizeof(ptr) )) FH6_ADD( " | call [%p] = %p", (void *)target, (void *)ptr );
++                }
++            }
++            ERR_(fh6fault)( "%s\n", line );
++        }
++    }
++#undef FH6_ADD
++}
++
++
+ /**********************************************************************
+  *		segv_handler
+  *
+@@ -2621,6 +2727,7 @@
+                     ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7] );
+     }
+     if (handle_syscall_fault( ucontext, &rec, &context.c )) return;
++    if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) fh6_fault_report( ucontext, &rec );
+     setup_raise_exception( ucontext, &rec, &context );
+ }
+ 

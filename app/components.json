@@ -1,0 +1,25 @@
+{
+  "components": [
+    {
+      "id": "engine",
+      "name": "Blackwell Engine",
+      "version": "1.0",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.0/blackwell-engine-1.0.tar.xz",
+      "sha256": "06c4dcc159c3a537853415166da5e9f132338fdb6bc03cb28db776a6c3a7fbc9",
+      "size": 103452056,
+      "folder": "Blackwell Engine",
+      "root": "Blackwell Engine"
+    },
+    {
+      "id": "d3dmetal",
+      "name": "D3DMetal (Apple)",
+      "version": "4.0b3",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.0/d3dmetal-4.0b3-redist.tar.xz",
+      "sha256": "e98de5a3b8fc3b146cfeb1365d7690c99bfcc1dccad88d93bf0418227de9d4f7",
+      "size": 16554100,
+      "folder": "D3DMetal",
+      "root": "D3DMetal",
+      "license": "License.rtf"
+    }
+  ]
+}

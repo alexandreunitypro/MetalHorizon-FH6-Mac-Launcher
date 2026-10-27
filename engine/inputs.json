@@ -1,0 +1,67 @@
+{
+  "wine": {
+    "name": "CrossOver 26.3.0 sources (LGPL)",
+    "url": "https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.3.0.tar.gz",
+    "size": 149054023,
+    "sha256": "ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872",
+    "subdir": "sources/wine",
+    "note": "Same tarball as highball-engine's inputs.json, and the one the working engine was built from."
+  },
+  "llvm-mingw": {
+    "name": "llvm-mingw 20260908 (UCRT, macOS universal)",
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/llvm-mingw-20260908-ucrt-macos-universal.tar.xz",
+    "size": 124244100,
+    "sha256": "d1dc5d1ecf3a3ced5ed5544c72f1acd0c8e84eb3024d520ecc6b143eec62a149",
+    "note": "Compiler of the PE half of the working engine. Highball uses mingw-w64 gcc (llvm-mingw broke Steam's login); not shown to matter for the Store edition."
+  },
+  "deps": {
+    "note": "x86_64 run-time libraries built by engine/build-deps.sh, replacing the copies from CrossOver.app's lib64.",
+    "gmp": {
+      "url": "https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz",
+      "sha256": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
+    },
+    "nettle": {
+      "url": "https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz",
+      "sha256": "fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5"
+    },
+    "gnutls": {
+      "url": "https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.13.tar.xz",
+      "sha256": "ffed8ec1bf09c2426d4f14aae377de4753b53e537d685e604e99a8b16ca9c97e"
+    },
+    "freetype": {
+      "url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz",
+      "sha256": "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289"
+    },
+    "moltenvk": {
+      "url": "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar",
+      "sha256": "f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e"
+    }
+  },
+  "configure": [
+    "--enable-archs=x86_64",
+    "--enable-tools",
+    "--with-mingw",
+    "--with-coreaudio",
+    "--without-alsa",
+    "--without-capi",
+    "--without-cups",
+    "--without-dbus",
+    "--without-fontconfig",
+    "--without-freetype",
+    "--without-gnutls",
+    "--without-gphoto",
+    "--without-gstreamer",
+    "--without-krb5",
+    "--without-netapi",
+    "--without-oss",
+    "--without-pulse",
+    "--without-sane",
+    "--without-sdl",
+    "--without-udev",
+    "--without-usb",
+    "--without-v4l2",
+    "--without-x",
+    "--disable-tests"
+  ],
+  "configureNote": "The working engine's flags. FreeType and GnuTLS are off for configure and turned on afterwards in config.h with bare library names (as tools/mac_enable_freetype.sh and tools/mac_enable_gnutls.sh did), so Wine dlopens the x86_64 copies engine/build-deps.sh puts in the engine's lib/."
+}

@@ -1,0 +1,43 @@
+advapi32: CredEnumerate() no longer fails when the macOS Keychain has no match for the filter.
+
+CredEnumerateW() collects credentials from the registry, then from the host's store through
+mountmgr. On macOS that store is the Keychain, and mountmgr's search_credentials() returns
+STATUS_NOT_FOUND when no Keychain item matches the filter. CredEnumerateW() only forgave
+ERROR_NOT_SUPPORTED (the answer on Linux, where there is no host store), so on macOS a filter that
+matched registry credentials but no Keychain item failed the whole call with ERROR_NOT_FOUND and the
+registry matches were thrown away. Upstream Wine has the same two lines today.
+
+A program that keeps its own generic credentials and looks them up by prefix never finds them.
+The Xbox Live sign-in library does exactly that: it reads its device key with
+CredEnumerateW(L"Xbl|DeviceKey*") and its tokens with CredEnumerateW(L"Xbl|<title>|...*"). Measured
+on an M4 (macOS 27.0, x64-crossover26.3 r17 + 0017 + 0018) with Forza Horizon 6: the bottle held
+thirteen "Xbl..." generic credentials (an unfiltered CredEnumerateW listed them), every filtered
+call returned ERROR_NOT_FOUND (1168), and on each launch the game generated a new device key
+(BCryptGenerateKeyPair straight after the failed lookups, then CredWriteW of "Xbl|DeviceKey") and
+asked the player to sign in to Xbox again with a device code, six times in one evening
+(2026-10-05).
+
+An empty answer from the host is now treated like an unsupported host: the count from the
+registry decides, and ERROR_NOT_FOUND is still returned when nothing matched anywhere.
+
+--- a/dlls/advapi32/cred.c
++++ b/dlls/advapi32/cred.c
+@@ -1059,7 +1059,8 @@
+     if (ret == ERROR_SUCCESS)
+     {
+         ret = host_enumerate_credentials(Filter, NULL, NULL, &len, Count);
+-        if (ret == ERROR_NOT_SUPPORTED) ret = ERROR_SUCCESS;
++        /* nothing matching in the host's store is not a failure, the registry may hold the matches */
++        if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_NOT_FOUND) ret = ERROR_SUCCESS;
+     }
+     if (ret == ERROR_SUCCESS && *Count == 0)
+         ret = ERROR_NOT_FOUND;
+@@ -1085,7 +1086,7 @@
+             if (ret == ERROR_SUCCESS)
+             {
+                 ret = host_enumerate_credentials(Filter, *Credentials, buffer, &len, Count);
+-                if (ret == ERROR_NOT_SUPPORTED) ret = ERROR_SUCCESS;
++                if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_NOT_FOUND) ret = ERROR_SUCCESS;
+             }
+         }
+         else ret = ERROR_OUTOFMEMORY;

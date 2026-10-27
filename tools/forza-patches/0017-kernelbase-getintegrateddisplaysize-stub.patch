@@ -1,0 +1,37 @@
+kernelbase: GetIntegratedDisplaySize() exists, as the stub upstream Wine has.
+
+Upstream Wine c68ed23672 (Paul Gofman, 2025-11-20, "kernelbase: Add stub for
+GetIntegratedDisplaySize()"), which the CrossOver 26.3 tree does not carry: its kernelbase.spec still
+has the entry commented out. With no export at all the loader binds a program's import to the
+"unimplemented function" thunk, and calling it raises.
+
+Forza Horizon 6 imports the function from api-ms-win-core-sysinfo-l1-2-3 and calls it once its
+window is up, to learn whether it runs on a handheld. On x64-crossover26.3-r17 with D3DMetal 4.0b2
+(M4, macOS 27.0, 2026-10-05) the game opened its 1920x1080 window, compiled pipelines and then
+stopped with "Call from 00006FFFFFF9EC2A to unimplemented function
+api-ms-win-core-sysinfo-l1-2-3.dll.GetIntegratedDisplaySize, aborting" and its own crash dialog.
+The game returns the HRESULT to its caller, so a failure is an answer it accepts.
+
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -569,7 +569,7 @@
+ @ stdcall GetGeoInfoEx(ptr long ptr long)
+ @ stdcall GetHandleInformation(long ptr)
+ # @ stub GetHivePath
+-# @ stub GetIntegratedDisplaySize
++@ stdcall GetIntegratedDisplaySize(ptr)
+ # @ stub GetIsEdpEnabled
+ @ stdcall GetKernelObjectSecurity(long long ptr long ptr)
+ @ stdcall GetLargePageMinimum()
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -635,3 +635,9 @@ HRESULT WINAPI GetAcceptLanguagesW(WCHAR *langbuf, DWORD *buflen)
+     *buflen = 0;
+     return E_NOT_SUFFICIENT_BUFFER;
+ }
++
++HRESULT WINAPI GetIntegratedDisplaySize( double *sz_inches )
++{
++    FIXME( "%p stub.\n", sz_inches );
++    return E_NOTIMPL;
++}

@@ -1,0 +1,419 @@
+CloseThreadpoolIo and the I/O completion thread must not both free a threadpool
+I/O object.
+
+TpReleaseIoCompletion() set shutting_down and, when pending_count and
+skipped_count were both zero, called tp_ioqueue_unlock(). The completion
+thread does the same drop when it dequeues a packet, sees shutting_down, and
+finds both counts already zero. CancelThreadpoolIo() reaches that state: it
+decrements pending_count while the completion is still queued, and it used to
+wrap the count if the packet had already been taken. The second side aborted
+in assert(ioqueue.objcount) at threadpool.c:2102, or freed the object twice.
+
+Scam With Your Friends (Unity 6000.3, Mono) hits this on every Kolkata OS
+recording teardown. The recorder disposes its audio named pipe from
+KolkataRecordingAudioSession.WriteAudio, Mono calls CloseThreadpoolIo, and
+ntdll aborts. Three crashes on 2026-10-18 (13:04, 13:12, 13:26 UTC) on engine
+x64-crossover26.3-r4, macOS 27, Apple Silicon. The faulting instruction is
+RtlRaiseStatus from _assert. A later crash the same day was in d3d11 and is
+not this bug.
+
+Destruction is now claimed once, with ioqueue.cs taken before pool->cs, the
+same order the completion thread already uses. The winner unlists the object
+before freeing it, so a packet that is still queued afterwards does not
+touch the memory. A completion that is still expected keeps the object alive
+and still runs its callback; TpWaitForIoCompletion(..., TRUE) still only
+counts those completions as skipped. TpCancelAsyncIoOperation() does not
+decrement pending_count below zero.
+
+Verified 2026-10-18 on an Apple Silicon Mac, macOS 27, against this ntdll
+running under a copy of engine x64-crossover26.3-r4-recording. A small
+program created a named pipe, associated a threadpool I/O object, and
+checked four cases: release with nothing pending frees the object
+immediately; release while a cancelled wait still expects a completion
+keeps it until that packet arrives and does not run the callback; release
+while a start is outstanding runs the callback once and then frees the
+object; forty cancels with the completion still queued, and forty more
+where cancel races a queued completion, do not abort. The previous
+marker-only build of this patch failed the immediate-free check. Not yet
+run inside the game. Upstream still has the racing path in Wine 11 and in
+master; not sent.
+
+diff -ruN a/dlls/ntdll/tests/threadpool.c b/dlls/ntdll/tests/threadpool.c
+--- a/dlls/ntdll/tests/threadpool.c	2026-10-18 20:54:44
++++ b/dlls/ntdll/tests/threadpool.c	2026-10-18 20:57:17
+@@ -2045,6 +2045,7 @@
+     char in[1], in2[1];
+     NTSTATUS status;
+     DWORD ret_size;
++    unsigned int i;
+     TP_POOL *pool;
+     TP_IO *io;
+     BOOL ret;
+@@ -2222,25 +2223,103 @@
+     ret = HeapValidate(GetProcessHeap(), 0, io);
+     ok(ret, "Got unexpected ret %#x.\n", ret);
+ 
+-    if (0)
++    /* TpWaitForIoCompletion(..., TRUE) moved the start into skipped_count.
++     * The object stays allocated across TpReleaseIoCompletion() and is freed
++     * when that completion arrives. The callback is not run. */
++    userdata.count = 0;
++    ret = ReadFile(server, in, sizeof(in), NULL, &ovl);
++    ok(!ret, "wrong ret %d\n", ret);
++    ret = WriteFile(client, out, sizeof(out), &ret_size, NULL);
++    ok(ret, "WriteFile() failed, error %lu\n", GetLastError());
++    for (i = 0; i < 100 && HeapValidate(GetProcessHeap(), 0, io); ++i)
++        Sleep(10);
++    ok(!HeapValidate(GetProcessHeap(), 0, io), "object was not freed after the skipped completion\n");
++    ok(!userdata.count, "callback ran %u times\n", userdata.count);
++    CloseHandle(server);
++    CloseHandle(client);
++
++    /* A start that is still outstanding keeps the object alive across
++     * release, and the callback runs once that completion arrives. */
++    server = CreateNamedPipeA("\\\\.\\pipe\\wine_tp_test",
++            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, 0, 1, 1024, 1024, 0, NULL);
++    ok(server != INVALID_HANDLE_VALUE, "Failed to create server pipe, error %lu.\n", GetLastError());
++    client = CreateFileA("\\\\.\\pipe\\wine_tp_test", GENERIC_READ | GENERIC_WRITE,
++            0, NULL, OPEN_EXISTING, 0, 0);
++    ok(client != INVALID_HANDLE_VALUE, "Failed to create client pipe, error %lu.\n", GetLastError());
++    io = NULL;
++    status = pTpAllocIoCompletion(&io, server, io_cb, &userdata, &environment);
++    ok(!status, "got %#lx\n", status);
++    userdata.count = 0;
++    pTpStartAsyncIoOperation(io);
++    pTpReleaseIoCompletion(io);
++    ok(HeapValidate(GetProcessHeap(), 0, io), "object freed while a completion is still expected\n");
++    ret = ReadFile(server, in, sizeof(in), NULL, &ovl);
++    ok(!ret, "wrong ret %d\n", ret);
++    ret = WriteFile(client, out, sizeof(out), &ret_size, NULL);
++    ok(ret, "WriteFile() failed, error %lu\n", GetLastError());
++    /* The callback drops the last reference, so do not call
++     * TpWaitForIoCompletion() — it can wake up on the freed object. */
++    for (i = 0; i < 100 && !userdata.count; ++i)
++        Sleep(10);
++    ok(userdata.count == 1, "callback ran %u times\n", userdata.count);
++    for (i = 0; i < 100 && HeapValidate(GetProcessHeap(), 0, io); ++i)
++        Sleep(10);
++    ok(!HeapValidate(GetProcessHeap(), 0, io), "object was not freed after the last completion\n");
++    CloseHandle(server);
++    CloseHandle(client);
++
++    /* Cancel drops the expectation. Release may free the object while the
++     * pipe completion is still queued; that packet must not crash. */
++    userdata.count = 0;
++    for (i = 0; i < 40; ++i)
+     {
+-        /* Object destruction will wait until one completion arrives (which was started but not cancelled).
+-         * Commented out to save test time. */
+-        Sleep(1000);
+-        ret = HeapValidate(GetProcessHeap(), 0, io);
+-        ok(ret, "Got unexpected ret %#x.\n", ret);
++        server = CreateNamedPipeA("\\\\.\\pipe\\wine_tp_test",
++                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, 0, 1, 1024, 1024, 0, NULL);
++        ok(server != INVALID_HANDLE_VALUE, "Failed to create server pipe, error %lu.\n", GetLastError());
++        client = CreateFileA("\\\\.\\pipe\\wine_tp_test", GENERIC_READ | GENERIC_WRITE,
++                0, NULL, OPEN_EXISTING, 0, 0);
++        ok(client != INVALID_HANDLE_VALUE, "Failed to create client pipe, error %lu.\n", GetLastError());
++        io = NULL;
++        status = pTpAllocIoCompletion(&io, server, io_cb, &userdata, &environment);
++        ok(!status, "got %#lx\n", status);
++        pTpStartAsyncIoOperation(io);
++        pTpCancelAsyncIoOperation(io);
+         ret = ReadFile(server, in, sizeof(in), NULL, &ovl);
+         ok(!ret, "wrong ret %d\n", ret);
+         ret = WriteFile(client, out, sizeof(out), &ret_size, NULL);
+         ok(ret, "WriteFile() failed, error %lu\n", GetLastError());
+-        Sleep(2000);
+-        ret = HeapValidate(GetProcessHeap(), 0, io);
+-        ok(!ret, "Got unexpected ret %#x.\n", ret);
++        pTpReleaseIoCompletion(io);
++        CloseHandle(server);
++        CloseHandle(client);
+     }
++    Sleep(200);
++    ok(!userdata.count, "callback ran %u times\n", userdata.count);
+ 
+-    CloseHandle(server);
++    /* The completion may already be queued when Cancel and Release run. */
++    for (i = 0; i < 20; ++i)
++    {
++        server = CreateNamedPipeA("\\\\.\\pipe\\wine_tp_test",
++                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, 0, 1, 1024, 1024, 0, NULL);
++        ok(server != INVALID_HANDLE_VALUE, "Failed to create server pipe, error %lu.\n", GetLastError());
++        client = CreateFileA("\\\\.\\pipe\\wine_tp_test", GENERIC_READ | GENERIC_WRITE,
++                0, NULL, OPEN_EXISTING, 0, 0);
++        ok(client != INVALID_HANDLE_VALUE, "Failed to create client pipe, error %lu.\n", GetLastError());
++        io = NULL;
++        status = pTpAllocIoCompletion(&io, server, io_cb, &userdata, &environment);
++        ok(!status, "got %#lx\n", status);
++        pTpStartAsyncIoOperation(io);
++        ret = ReadFile(server, in, sizeof(in), NULL, &ovl);
++        ok(!ret, "wrong ret %d\n", ret);
++        ret = WriteFile(client, out, sizeof(out), &ret_size, NULL);
++        ok(ret, "WriteFile() failed, error %lu\n", GetLastError());
++        pTpCancelAsyncIoOperation(io);
++        pTpReleaseIoCompletion(io);
++        CloseHandle(server);
++        CloseHandle(client);
++    }
++    Sleep(200);
++
+     CloseHandle(ovl.hEvent);
+-    CloseHandle(client);
+     pTpReleasePool(pool);
+ }
+ 
+diff -ruN a/dlls/ntdll/threadpool.c b/dlls/ntdll/threadpool.c
+--- a/dlls/ntdll/threadpool.c	2026-10-18 20:54:44
++++ b/dlls/ntdll/threadpool.c	2026-10-18 20:57:17
+@@ -204,6 +204,9 @@
+             /* locked via .pool->cs */
+             unsigned int    pending_count, skipped_count, completion_count, completion_max;
+             BOOL            shutting_down;
++            BOOL            on_queue;
++            BOOL            detached;
++            struct list     ioqueue_entry;
+             struct io_completion *completions;
+         } io;
+     } u;
+@@ -306,11 +309,13 @@
+     LONG                    objcount;
+     BOOL                    thread_running;
+     HANDLE                  port;
++    struct list             objs;
+     RTL_CONDITION_VARIABLE  update_event;
+ }
+ ioqueue =
+ {
+     .cs = { &ioqueue_debug, -1, 0, 0, 0, 0 },
++    .objs = LIST_INIT( ioqueue.objs ),
+ };
+ 
+ static RTL_CRITICAL_SECTION_DEBUG ioqueue_debug =
+@@ -1526,13 +1531,65 @@
+     RtlLeaveCriticalSection( &waitqueue.cs );
+ }
+ 
++
++/* ioqueue.cs must be taken before pool->cs. The completion thread and
++ * TpReleaseIoCompletion() both observe a finished object and would otherwise
++ * each drop it. */
++
++static struct threadpool_object *tp_ioqueue_find( ULONG_PTR key )
++{
++    struct list *ptr;
++
++    LIST_FOR_EACH( ptr, &ioqueue.objs )
++    {
++        struct threadpool_object *io = LIST_ENTRY( ptr, struct threadpool_object, u.io.ioqueue_entry );
++
++        if ((ULONG_PTR)io == key)
++            return io;
++    }
++    return NULL;
++}
++
++static void tp_ioqueue_unlist( struct threadpool_object *io )
++{
++    if (!io->u.io.on_queue)
++        return;
++    list_remove( &io->u.io.ioqueue_entry );
++    io->u.io.on_queue = FALSE;
++}
++
++static void tp_ioqueue_drop_count( struct threadpool_object *io )
++{
++    if (io->u.io.detached)
++        return;
++    io->u.io.detached = TRUE;
++    assert( ioqueue.objcount );
++    if (!--ioqueue.objcount)
++        NtSetIoCompletion( ioqueue.port, 0, 0, STATUS_SUCCESS, 0 );
++}
++
++/* Caller holds ioqueue.cs and pool->cs. Returns TRUE when this caller owns
++ * the object's initial reference and must release it. */
++static BOOL tp_io_claim_release( struct threadpool_object *io )
++{
++    if (io->shutdown || !io->u.io.shutting_down)
++        return FALSE;
++    if (io->u.io.pending_count || io->u.io.skipped_count)
++        return FALSE;
++
++    io->shutdown = TRUE;
++    tp_ioqueue_unlist( io );
++    tp_ioqueue_drop_count( io );
++    return TRUE;
++}
++
+ static void CALLBACK ioqueue_thread_proc( void *param )
+ {
+     struct io_completion *completion;
+     struct threadpool_object *io;
+     IO_STATUS_BLOCK iosb;
+     ULONG_PTR key, value;
+-    BOOL destroy, skip;
++    BOOL release;
+     NTSTATUS status;
+ 
+     TRACE( "starting I/O completion thread\n" );
+@@ -1547,42 +1604,25 @@
+             ERR("NtRemoveIoCompletion failed, status %#lx.\n", status);
+         RtlEnterCriticalSection( &ioqueue.cs );
+ 
+-        destroy = skip = FALSE;
+-        io = (struct threadpool_object *)key;
++        release = FALSE;
++        io = key ? tp_ioqueue_find( key ) : NULL;
+ 
+         TRACE( "io %p, iosb.Status %#lx.\n", io, iosb.Status );
+ 
+-        if (io && (io->shutdown || io->u.io.shutting_down))
++        if (io)
+         {
+             RtlEnterCriticalSection( &io->pool->cs );
+-            if (!io->u.io.pending_count)
++
++            TRACE( "pending_count %u.\n", io->u.io.pending_count );
++
++            if (io->u.io.shutting_down && !io->u.io.pending_count)
+             {
++                /* A cancelled wait still expects this many completions and
++                 * must not run the callback for them. */
+                 if (io->u.io.skipped_count)
+                     --io->u.io.skipped_count;
+-
+-                if (io->u.io.skipped_count)
+-                    skip = TRUE;
+-                else
+-                    destroy = TRUE;
+             }
+-            RtlLeaveCriticalSection( &io->pool->cs );
+-            if (skip) continue;
+-        }
+-
+-        if (destroy)
+-        {
+-            --ioqueue.objcount;
+-            TRACE( "Releasing io %p.\n", io );
+-            io->shutdown = TRUE;
+-            tp_object_release( io );
+-        }
+-        else if (io)
+-        {
+-            RtlEnterCriticalSection( &io->pool->cs );
+-
+-            TRACE( "pending_count %u.\n", io->u.io.pending_count );
+-
+-            if (io->u.io.pending_count)
++            else if (io->u.io.pending_count)
+             {
+                 --io->u.io.pending_count;
+                 if (!array_reserve((void **)&io->u.io.completions, &io->u.io.completion_max,
+@@ -1599,7 +1639,21 @@
+ 
+                 tp_object_submit( io, FALSE );
+             }
++
++            /* The completion that finishes the last expected operation has
++             * to release the object. TpReleaseIoCompletion() did not, because
++             * the counts were not zero yet. */
++            if (io->u.io.shutting_down && !io->shutdown && !io->u.io.pending_count && !io->u.io.skipped_count)
++                release = tp_io_claim_release( io );
++
+             RtlLeaveCriticalSection( &io->pool->cs );
++
++            if (release)
++            {
++                RtlLeaveCriticalSection( &ioqueue.cs );
++                tp_object_release( io );
++                RtlEnterCriticalSection( &ioqueue.cs );
++            }
+         }
+ 
+         if (!ioqueue.objcount)
+@@ -1662,6 +1716,8 @@
+ 
+     if (status == STATUS_SUCCESS)
+     {
++        list_add_tail( &ioqueue.objs, &io->u.io.ioqueue_entry );
++        io->u.io.on_queue = TRUE;
+         if (!ioqueue.objcount++)
+             RtlWakeConditionVariable( &ioqueue.update_event );
+     }
+@@ -2098,12 +2154,7 @@
+     assert( io->type == TP_OBJECT_TYPE_IO );
+ 
+     RtlEnterCriticalSection( &ioqueue.cs );
+-
+-    assert(ioqueue.objcount);
+-
+-    if (!io->shutdown && !--ioqueue.objcount)
+-        NtSetIoCompletion( ioqueue.port, 0, 0, STATUS_SUCCESS, 0 );
+-
++    tp_ioqueue_drop_count( io );
+     RtlLeaveCriticalSection( &ioqueue.cs );
+ }
+ 
+@@ -2608,7 +2659,12 @@
+ 
+     TRACE("pending_count %u.\n", this->u.io.pending_count);
+ 
+-    this->u.io.pending_count--;
++    /* The completion may already have been dequeued. Decrementing again
++     * wraps the count, and TpReleaseIoCompletion() then never frees the
++     * object. A packet that is still queued sees a zero count and is not
++     * delivered. */
++    if (this->u.io.pending_count)
++        this->u.io.pending_count--;
+     if (object_is_finished( this, TRUE ))
+         RtlWakeAllConditionVariable( &this->group_finished_event );
+     if (object_is_finished( this, FALSE ))
+@@ -2863,6 +2919,16 @@
+                 tp_object_release( object );
+         }
+ 
++        if (object->type == TP_OBJECT_TYPE_IO)
++        {
++            /* Wait returned, so no callback is running. A completion packet
++             * still sitting on the port must not touch the object after the
++             * final reference is dropped. */
++            RtlEnterCriticalSection( &ioqueue.cs );
++            tp_ioqueue_unlist( object );
++            RtlLeaveCriticalSection( &ioqueue.cs );
++        }
++
+         object->shutdown = TRUE;
+         tp_object_release( object );
+     }
+@@ -2874,21 +2940,22 @@
+ void WINAPI TpReleaseIoCompletion( TP_IO *io )
+ {
+     struct threadpool_object *this = impl_from_TP_IO( io );
+-    BOOL can_destroy;
++    BOOL release;
+ 
+     TRACE( "%p\n", io );
+ 
++    /* Same lock order as ioqueue_thread_proc(). */
++    RtlEnterCriticalSection( &ioqueue.cs );
+     RtlEnterCriticalSection( &this->pool->cs );
++
+     this->u.io.shutting_down = TRUE;
+-    can_destroy = !this->u.io.pending_count && !this->u.io.skipped_count;
++    release = tp_io_claim_release( this );
++
+     RtlLeaveCriticalSection( &this->pool->cs );
++    RtlLeaveCriticalSection( &ioqueue.cs );
+ 
+-    if (can_destroy)
+-    {
+-        tp_object_prepare_shutdown( this );
+-        this->shutdown = TRUE;
++    if (release)
+         tp_object_release( this );
+-    }
+ }
+ 
+ /***********************************************************************

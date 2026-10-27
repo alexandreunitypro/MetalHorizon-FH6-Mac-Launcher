@@ -1,0 +1,100 @@
+From: FORZA-LAUNCHER-FOR-MAC-BLACKWELL-PROJECT
+Subject: [PATCH] ntdll: Give each handle on a mapped image its own file position on macOS.
+
+Applies on top of Ferestre's Wine series (icex/ferestre patches/wine 0001-0018,
+in particular 0009 which introduced mapped_fd_to_handle()), checked against
+xodus-gaming/wine bleeding-edge eab6973.
+
+Ferestre 0009 serves NtCreateFile() on a WINE_DLL_FILE_MAP image from the
+decrypted descriptor, and reopens that descriptor through /proc/self/fd so the
+new handle gets an open file description -- and so a file position -- of its
+own. macOS has no /proc: the open fails and the code falls back to the shared
+descriptor. Every handle on the image then shares one position, with the loader
+and with each other.
+
+Forza Horizon 5 (Ferestre 0013) opens its own executable three times through
+\\?\GLOBALROOT\??\Z:\..., hashes what it reads and stops the process when the
+hash is wrong. With a shared position the first pass leaves it at end of file
+and the second pass reads 0 bytes.
+
+On macOS, reopen through the name fcntl(F_GETPATH) gives instead. That only
+works while the file has a name; Xodus deletes it at once on macOS
+(tempfile_in()), see patches/xodus-cli/0001 in this repository for the other
+half. The reopened file must be the same device and inode as the descriptor.
+When nothing works, the old fallback is kept and an ERR line says so once.
+
+Tested: built in a Linux Wine tree (bleeding-edge + Ferestre 0001-0018 + this),
+tools/mapfd_run.py + tools/selfread probe, see docs/ANALYSE-FH6-STORE-MACOS.md.
+Not yet built or run on macOS.
+---
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index a539cc5..0249c6e 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1630,19 +1630,60 @@ static NTSTATUS open_mapped_dll_file( const UNICODE_STRING *nt_name, HANDLE *map
+  * through /proc/self/fd gives a new open file description on the same object,
+  * so each caller starts at zero.
+  *
+- * If /proc is not there, fall back to the descriptor itself rather than fail:
+- * a shared offset is still better than no image at all, and that is what this
+- * did before.
++ * macOS has no /proc. There the name F_GETPATH reports for the descriptor is
++ * opened instead, which gives a new open file description too -- but only
++ * while the file still has a name. Xodus on macOS writes the decrypted image
++ * to a temporary file on its RAM disk and deletes the name at once
++ * (tempfile_in()), so it has to keep the name for this to work; the Xodus half
++ * of this change does that.
++ *
++ * Either way the reopened file is checked to be the same object as the
++ * descriptor (device and inode): a name can be reused, and handing a title some
++ * other file under its own image's name would be worse than a shared offset.
++ *
++ * If no reopen works, fall back to the descriptor itself rather than fail: a
++ * shared offset is still better than no image at all, and that is what this
++ * did before. It is said once, because a title that hashes its own image three
++ * times then reads from the end of file on the second pass and stops itself,
++ * with nothing else in the log to say why.
+  */
+-static NTSTATUS mapped_fd_to_handle( int fd, HANDLE *handle )
++static int reopen_mapped_fd( int fd )
+ {
++    struct stat st_fd, st_own;
++    int own_fd = -1;
++#ifdef F_GETPATH
++    char path[PATH_MAX];
++
++    if (fcntl( fd, F_GETPATH, path ) != -1) own_fd = open( path, O_RDONLY | O_CLOEXEC );
++#else
+     char path[32];
++
++    snprintf( path, sizeof(path), "/proc/self/fd/%d", fd );
++    own_fd = open( path, O_RDONLY | O_CLOEXEC );
++#endif
++    if (own_fd == -1) return -1;
++    if (fstat( fd, &st_fd ) == -1 || fstat( own_fd, &st_own ) == -1 ||
++        st_fd.st_dev != st_own.st_dev || st_fd.st_ino != st_own.st_ino)
++    {
++        close( own_fd );
++        return -1;
++    }
++    return own_fd;
++}
++
++static NTSTATUS mapped_fd_to_handle( int fd, HANDLE *handle )
++{
++    static int warned;
+     NTSTATUS status;
+     int own_fd;
+ 
+-    snprintf( path, sizeof(path), "/proc/self/fd/%d", fd );
+-    if ((own_fd = open( path, O_RDONLY )) == -1)
++    if ((own_fd = reopen_mapped_fd( fd )) == -1)
++    {
++        if (!warned++)
++            ERR( "mapped image fd %d cannot be reopened (errno %d); every handle on it shares one "
++                 "file position\n", fd, errno );
+         return wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, handle );
++    }
+ 
+     status = wine_server_fd_to_handle( own_fd, GENERIC_READ | SYNCHRONIZE, 0, handle );
+     close( own_fd );

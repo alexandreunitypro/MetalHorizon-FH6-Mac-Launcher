@@ -1,0 +1,36 @@
+ws2_32: accept SIO_UDP_NETRESET like SIO_UDP_CONNRESET (Windows does).
+
+Forza Horizon 6 sets both on its UDP game sockets right before matchmaking; Wine answered WSAEOPNOTSUPP (10045) to
+NETRESET and the game never opened a session (matchmaking searched for ever, no UDP socket stayed open).
+Checked with tools/udpprobe-style probe: before -1/10045, after 0.
+
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -29,6 +29,10 @@
+ #include "ws2_32_private.h"
+ 
+ #define FILE_USE_FILE_POINTER_POSITION ((LONGLONG)-2)
++
++#ifndef SIO_UDP_NETRESET
++#define SIO_UDP_NETRESET _WSAIOW(IOC_VENDOR, 15)
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+@@ -2677,12 +2681,15 @@
+         return ret ? -1 : 0;
+     }
+ 
++    /* Windows accepts SIO_UDP_NETRESET (TTL-expired ICMP reporting on UDP) like SIO_UDP_CONNRESET. Forza Horizon 6
++     * sets both on its game sockets right before matchmaking; answered WSAEOPNOTSUPP, it opened no session. */
++    case SIO_UDP_NETRESET:
+     case SIO_UDP_CONNRESET:
+     {
+         NTSTATUS status = STATUS_SUCCESS;
+         DWORD ret;
+ 
+-        FIXME( "SIO_UDP_CONNRESET stub\n" );
++        FIXME( "%s stub\n", debugstr_wsaioctl( code ) );
+         ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
+                                  NULL, 0, ret_size, overlapped, completion );
+         SetLastError( ret );

@@ -1,0 +1,144 @@
+winhttp: keep a WebSocket's connection out of the keep-alive pool, and make blocking receives block.
+
+Forza Horizon 6 (online services: PlayFab lobby, Xbox RTA WebSockets): six threads spun on 'recv error 10035'
+(~15000 calls/s each) from the moment the WebSockets opened, until the server reset them.
+Base: CrossOver wine sources in work/crossover-source/sources/wine (after patch 0001 and the qh/winhttp header fix).
+Apply: cd <wine sources> && patch -p1 < this file; rebuild dlls/winhttp; install in engine + prefix system32.
+
+--- a/dlls/winhttp/winhttp_private.h
++++ b/dlls/winhttp/winhttp_private.h
+@@ -121,6 +121,7 @@
+     char *peek_msg_mem;
+     size_t peek_len;
+     HANDLE port;
++    BOOL nonblocking; /* set only while netconn_create or netconn_is_alive poll the socket on purpose */
+ };
+ 
+ struct header
+--- a/dlls/winhttp/net.c
++++ b/dlls/winhttp/net.c
+@@ -70,15 +70,38 @@
+     return TRUE;
+ }
+ 
+-static int sock_recv(int fd, void *msg, size_t len, int flags)
++/* Every receive outside netconn_create and netconn_is_alive is meant to block, as on Windows. If the socket
++ * answers WSAEWOULDBLOCK anyway, wait for data instead of failing: callers treat a failed read as a dead
++ * connection (a WebSocket receive then errors out) or, when the error code is lost, as a zero-byte read they
++ * retry at once -- Forza Horizon 6 spun on six WebSockets that way, ~15000 recv calls a second each, starving
++ * its online services. The wait honours SO_RCVTIMEO, so the WebSocket keepalive still sees WSAETIMEDOUT.
++ * The error code is set again after the WARN, which must not be the one to decide it. */
++static int sock_recv( struct netconn *conn, void *msg, size_t len, int flags )
+ {
+-    int ret;
+-    do
++    int ret, err;
++
++    for (;;)
+     {
+-        if ((ret = recv(fd, msg, len, flags)) == -1) WARN( "recv error %d\n", WSAGetLastError() );
++        if ((ret = recv( conn->socket, msg, len, flags )) != -1) return ret;
++        err = WSAGetLastError();
++        if (err == WSAEINTR) continue;
++        if (err == WSAEWOULDBLOCK && !conn->nonblocking)
++        {
++            WSAPOLLFD pfd;
++            DWORD timeout = 0;
++            int optlen = sizeof(timeout), res;
++
++            if (getsockopt( conn->socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, &optlen )) timeout = 0;
++            pfd.fd = conn->socket;
++            pfd.events = POLLRDNORM;
++            pfd.revents = 0;
++            if ((res = WSAPoll( &pfd, 1, timeout ? (int)timeout : -1 )) > 0) continue;
++            err = res ? WSAGetLastError() : WSAETIMEDOUT;
++        }
++        WARN( "recv error %d\n", err );
++        WSASetLastError( err );
++        return -1;
+     }
+-    while(ret == -1 && WSAGetLastError() == WSAEINTR);
+-    return ret;
+ }
+ 
+ static DWORD netconn_verify_cert( PCCERT_CONTEXT cert, WCHAR *server, DWORD security_flags, BOOL check_revocation )
+@@ -203,6 +226,7 @@
+ {
+     ULONG state = !blocking;
+     ioctlsocket( conn->socket, FIONBIO, &state );
++    conn->nonblocking = !blocking;
+ }
+ 
+ DWORD netconn_create( struct hostdata *host, const struct sockaddr_storage *sockaddr, int timeout,
+@@ -374,7 +398,7 @@
+             read_buf_size += 1024;
+         }
+ 
+-        size = sock_recv(conn->socket, read_buf+in_bufs[0].cbBuffer, read_buf_size-in_bufs[0].cbBuffer, 0);
++        size = sock_recv(conn, read_buf+in_bufs[0].cbBuffer, read_buf_size-in_bufs[0].cbBuffer, 0);
+         if(size < 1) {
+             status = ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
+             break;
+@@ -530,7 +554,7 @@
+         free(conn->extra_buf);
+         conn->extra_buf = NULL;
+     }else {
+-        if ((buf_len = sock_recv( conn->socket, conn->ssl_read_buf + conn->extra_len, ssl_buf_size - conn->extra_len, 0)) < 0)
++        if ((buf_len = sock_recv( conn, conn->ssl_read_buf + conn->extra_len, ssl_buf_size - conn->extra_len, 0)) < 0)
+             return WSAGetLastError();
+ 
+         if (!buf_len)
+@@ -566,8 +590,18 @@
+         case SEC_E_INCOMPLETE_MESSAGE:
+             assert(buf_len < ssl_buf_size);
+ 
+-            if ((size = sock_recv( conn->socket, conn->ssl_read_buf + buf_len, ssl_buf_size - buf_len, 0 )) < 1)
++            if ((size = sock_recv( conn, conn->ssl_read_buf + buf_len, ssl_buf_size - buf_len, 0 )) < 1)
++            {
++                /* netconn_is_alive polls without blocking: keep the partial record for the next read
++                 * instead of dropping it, which would desynchronise the TLS stream of a reused connection */
++                if (size < 0 && WSAGetLastError() == WSAEWOULDBLOCK && (conn->extra_buf = malloc( buf_len )))
++                {
++                    memcpy( conn->extra_buf, conn->ssl_read_buf, buf_len );
++                    conn->extra_len = buf_len;
++                    return WSAEWOULDBLOCK;
++                }
+                 return SEC_E_INCOMPLETE_MESSAGE;
++            }
+ 
+             buf_len += size;
+             continue;
+@@ -661,7 +695,7 @@
+         return ERROR_SUCCESS;
+     }
+ 
+-    if ((*recvd = sock_recv( conn->socket, buf, len, flags )) < 0) return WSAGetLastError();
++    if ((*recvd = sock_recv( conn, buf, len, flags )) < 0) return WSAGetLastError();
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -716,7 +750,7 @@
+             return FALSE;
+         }
+     }
+-    len = sock_recv( netconn->socket, &b, 1, MSG_PEEK );
++    len = sock_recv( netconn, &b, 1, MSG_PEEK );
+     err = WSAGetLastError();
+     set_blocking( netconn, TRUE );
+ 
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -3545,8 +3545,12 @@
+     InitializeSRWLock( &socket->send_lock );
+     init_queue( &socket->send_q );
+     init_queue( &socket->recv_q );
+-    netconn_addref( request->netconn );
++    /* The connection now belongs to the WebSocket alone. Left on the request, a later read of the (empty) 101
++     * response reaches finished_reading, which puts it back in the keep-alive pool: the next request to that
++     * host then reuses it while the WebSocket is still reading from it (netconn_is_alive makes it non-blocking
++     * and consumes its TLS records). */
+     socket->netconn = request->netconn;
++    request->netconn = NULL;
+ 
+     netconn_set_timeout( socket->netconn, FALSE, socket->keepalive_interval );
+ 

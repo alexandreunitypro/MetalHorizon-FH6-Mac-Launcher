@@ -1,0 +1,159 @@
+xgameruntime: complete runtime calls after they return, as the GDK does, and never call a completion routine that is not code.
+
+Forza Horizon 6 crashed during its online session (network_session/coordinator) with two threads on one freed object:
+the main thread copying a std::function out of it (exe+3217541, manager read as 1) and a thread-pool thread calling
+a completion routine at address 1 from invoke_async_completion. xgr_async_complete_ex answered calls such as
+XNetworkingQuerySecurityInformationForUrlAsync (asked before every libHttpClient request) inside the call itself;
+libHttpClient is written for the Windows order (the block reads pending when the call returns). The answer is now
+published and the completion delivered from the thread pool after the call returns (XGR_INLINE_COMPLETIONS=1 brings
+back the old behaviour), and a routine that is neither in a mapped image nor in executable memory is refused with
+an ERR naming the block and who began or completed it. Applied by tools/mac_fix_xasync_inline.sh.
+
+--- a/dlls/xgameruntime/xthreading.c
++++ b/dlls/xgameruntime/xthreading.c
+@@ -96,6 +96,7 @@
+     struct x_queue_port *port;
+     XTaskQueueHandle origin;
+     XTaskQueueDispatchMode mode;
++    void *source;                       /* who began or completed it, for diagnostics */
+ };
+ 
+ static void capture_completion_route( const XAsyncBlock *async, struct x_completion_route *route );
+@@ -610,6 +611,7 @@
+      * complete the operation -- and free it -- on another thread. */
+     op->ref = 2;
+     capture_completion_route( asyncBlock, &op->route );
++    op->route.source = __builtin_return_address( 0 );
+     memset( asyncBlock->internal, 0, sizeof(asyncBlock->internal) );
+ 
+     EnterCriticalSection( &async_ops_cs );
+@@ -665,6 +667,7 @@
+ 
+     op->begin_running = TRUE;
+     capture_completion_route( asyncBlock, &op->route );
++    op->route.source = __builtin_return_address( 0 );
+     memset( asyncBlock->internal, 0, sizeof(asyncBlock->internal) );
+ 
+     EnterCriticalSection( &async_ops_cs );
+@@ -1190,6 +1193,7 @@
+     struct x_queue_port *port;
+     XTaskQueueHandle origin;
+     struct x_task_queue *owner;     /* the queue the block named, which waits for this */
++    void *source;
+ };
+ 
+ /* Set once a title actually pumps a queue. Until then a Manual completion has
+@@ -1240,11 +1244,32 @@
+     route->mode = completion_mode_for( async );
+ }
+ 
++/* fh6: deferred runtime completions, and no jump to a completion routine that is not code
++ * (tools/mac_fix_xasync_inline.py). A routine lives in a mapped image, or in executable memory a title generated;
++ * address 1, or a heap address, is the remains of a block its owner has freed and reused. */
++static BOOL completion_routine_is_code( const void *routine )
++{
++    MEMORY_BASIC_INFORMATION mbi;
++
++    if ((ULONG_PTR)routine < 0x10000 || !VirtualQuery( routine, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT) return FALSE;
++    if (mbi.Type == MEM_IMAGE) return TRUE;
++    return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
++}
++
+ static void invoke_async_completion( struct x_pending_completion *item )
+ {
+     struct x_task_queue *owner = item->owner;
+     struct x_running_frame frame;
+ 
++    if (!completion_routine_is_code( item->callback ))
++    {
++        ERR( "not calling completion routine %p for block %p: not code (block begun or completed from %p).\n",
++             item->callback, item->async, item->source );
++        release_async_op( item->keep_alive );
++        free( item );
++        if (owner) queue_finish( owner );
++        return;
++    }
+     enter_frame( &frame, owner );
+     item->callback( item->async );
+     leave_frame( &frame );
+@@ -1304,6 +1329,7 @@
+     item->keep_alive = keep_alive;
+     item->port = route->port;
+     item->origin = route->origin;
++    item->source = route->source;
+     if (keep_alive) InterlockedIncrement( &keep_alive->ref );
+     if ((item->owner = (struct x_task_queue *)route->queue)) queue_hold( item->owner );
+ 
+@@ -1347,14 +1373,72 @@
+     LeaveCriticalSection( &pending_cs );
+     /* XAsyncGetStatus(wait) delivers these while it blocks. */
+     wake_waiters();
++}
++
++/* A runtime call that has its answer at once still finishes the GDK's way: the block reads as pending when the call
++ * returns, and the answer is published and the completion delivered from the thread pool afterwards, as it would come
++ * from the queue's work port on Windows. Completing inside the call let the title's completion routine run while the
++ * title was still inside the call, and libHttpClient -- every Xbox Live HTTP and WebSocket request asks
++ * XNetworkingQuerySecurityInformationForUrlAsync first -- is written for the Windows order: Forza Horizon 6's online
++ * session ended with two threads on one freed object, one of them calling a completion routine at address 1. */
++struct x_deferred_completion
++{
++    struct x_completion_route route;
++    HRESULT hr;
++    void *payload;
++    SIZE_T result_size;
++};
++
++static BOOL WINAPI init_inline_completions( INIT_ONCE *once, void *param, void **context )
++{
++    char value[8];
++    *(BOOL *)param = GetEnvironmentVariableA( "XGR_INLINE_COMPLETIONS", value, sizeof(value) ) && value[0] == '1';
++    return TRUE;
+ }
+ 
++static BOOL inline_completions( void )
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    static BOOL inline_wanted;
++    InitOnceExecuteOnce( &once, init_inline_completions, &inline_wanted, NULL );
++    return inline_wanted;
++}
++
++static void CALLBACK deferred_completion_work( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    struct x_deferred_completion *d = context;
++    struct x_task_queue *owner = (struct x_task_queue *)d->route.queue;
++
++    TRACE( "publishing the answer for block %p (from %p).\n", d->route.async, d->route.source );
++    store_async_result( d->route.async, d->hr, d->payload, d->result_size );
++    deliver_completion( &d->route, NULL );
++    if (owner) queue_finish( owner );
++    free( d );
++}
++
+ void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size )
+ {
++    struct x_deferred_completion *d;
+     struct x_completion_route route;
+ 
+     if (!async) return;
+     capture_completion_route( async, &route );
++    route.source = __builtin_return_address( 0 );
++    if (!inline_completions() && (d = calloc( 1, sizeof(*d) )))
++    {
++        d->route = route;
++        d->hr = hr;
++        d->payload = payload;
++        d->result_size = result_size;
++        /* Pending until the work runs. A reused block may still carry its previous answer. */
++        memset( async->internal, 0, sizeof(async->internal) );
++        if (route.queue) queue_hold( (struct x_task_queue *)route.queue );
++        if (TrySubmitThreadpoolCallback( deferred_completion_work, d, NULL )) return;
++        if (SUCCEEDED(run_off_pool( deferred_completion_work, d ))) return;
++        if (route.queue) queue_finish( (struct x_task_queue *)route.queue );
++        free( d );
++        WARN( "no thread to defer the answer for block %p; completing it in the call.\n", async );
++    }
+     store_async_result( async, hr, payload, result_size );
+     deliver_completion( &route, NULL );
+ }
