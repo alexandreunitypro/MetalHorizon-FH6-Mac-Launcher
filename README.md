@@ -144,8 +144,8 @@ code during online play.
 ## Support the project
 
 Every build is free and public, the same day, for everyone. Sponsors fund the work, not access.
-Goal: **$100/month**, for an Apple Developer account (notarized launcher) and a used 8–16 GB Mac to test
-low-memory configurations. Support it on Buy Me a Coffee (Sponsor button at the top of this page); details in
+Your support pays for an Apple Developer account (so macOS opens the app without warnings) and support its development, 
+plus the time spent so I can try fixing stutter and graphics bugs. Thank you! Support it on Buy Me a Coffee 
 (https://buymeacoffee.com/zaidalexandre)
 
 ## Docs
