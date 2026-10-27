@@ -13,8 +13,7 @@ and Apple's D3DMetal (after you accept Apple's licence), you sign in with your M
 page, click **Download from Xbox**, then **Play**. No CrossOver, nothing to download by hand.
 
 > **Prototype.** Tested on one Mac so far (M5 Pro, macOS 27). Known: stutter, black near foliage. This is for the
-> **Xbox / Microsoft Store** edition (MSIXVC). If you own the **Steam** edition, use
-> [Highball](https://github.com/gauthierpiarrette/highball).
+> **Xbox / Microsoft Store** edition (MSIXVC). If you own the **Steam** edition, The steam version will release before next week
 
 Unofficial. Not affiliated with or endorsed by Microsoft, Xbox, Playground Games, Apple, CodeWeavers or NVIDIA.
 Forza Horizon and Xbox are trademarks of Microsoft. You need your own copy of the game on your Microsoft account.
