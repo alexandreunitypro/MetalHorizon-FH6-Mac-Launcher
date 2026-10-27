@@ -5,6 +5,7 @@ import Foundation
 
 let appBundleID = "io.github.alexandreunitypro.metalhorizon"
 let storeProductID = "9nr1r1xwlcnb"   // Forza Horizon 6, Xbox / Microsoft Store edition
+let supportURL = URL(string: "https://buymeacoffee.com/zaidalexandre")!
 
 enum SettingKey {
     static let gameDirectory = "metalhorizon.gameDirectory"
@@ -12,6 +13,7 @@ enum SettingKey {
     static let d3dmetalDirectory = "metalhorizon.d3dmetalDirectory"
     static let metalHUD = "metalhorizon.metalHUD"
     static let appleLicenseAccepted = "metalhorizon.appleLicenseAccepted"   // the D3DMetal version accepted
+    static let welcomeShown = "metalhorizon.welcomeShown"
 }
 
 /// The app's settings. Run from a development build (no bundle identifier), the same domain is used by name.

@@ -5,7 +5,7 @@ Blackwell Engine (Wine) + xodus + Apple's D3DMetal, open source, no CrossOver, n
 
 ## Download
 
-**[MetalHorizon 0.3.0 (prototype)](../../releases/latest)**: unzip, move **MetalHorizon** to Applications, then
+**[MetalHorizon (latest prototype)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
 right-click it → **Open** the first time (it is not notarized yet).
 
 The app does the rest by itself: it installs [Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine)
@@ -145,8 +145,9 @@ code during online play.
 
 Every build is free and public, the same day, for everyone. Sponsors fund the work, not access.
 Your support pays for an Apple Developer account (so macOS opens the app without warnings) and support its development, 
-plus the time spent so I can try fixing stutter and graphics bugs. Thank you! Support it on Buy Me a Coffee 
-(https://buymeacoffee.com/zaidalexandre)
+plus the time spent fixing stutter and graphics bugs. Thank you!
+**[☕ Support it on Buy Me a Coffee](https://buymeacoffee.com/zaidalexandre)** (also the app's Support Me button); details in
+[SPONSORS.md](SPONSORS.md).
 
 ## Docs
 

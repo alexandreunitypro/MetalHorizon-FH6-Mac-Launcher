@@ -51,6 +51,45 @@ struct MetalHorizonApp: App {
             LauncherView()
                 .frame(minWidth: 640, minHeight: 600)
         }
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About MetalHorizon") { showAbout() }
+            }
+            // The projects MetalHorizon is built on; each item opens its GitHub page.
+            CommandMenu("Thanks") {
+                ForEach(thanks, id: \.url) { item in
+                    Button(item.name) { NSWorkspace.shared.open(URL(string: item.url)!) }
+                }
+                Divider()
+                Button("☕ Support MetalHorizon…") { NSWorkspace.shared.open(supportURL) }
+            }
+        }
+    }
+
+    private var thanks: [(name: String, url: String)] {
+        [
+            ("Highball, by Gauthier Piarrette", "https://github.com/gauthierpiarrette/highball"),
+            ("highball-engine", "https://github.com/gauthierpiarrette/highball-engine"),
+            ("highball-db", "https://github.com/gauthierpiarrette/highball-db"),
+            ("Ferestre, by icex", "https://github.com/icex/ferestre"),
+            ("xodus", "https://github.com/xodus-gaming/xodus"),
+            ("xodus Wine", "https://github.com/xodus-gaming/wine"),
+            ("DXMT, by 3Shain", "https://github.com/3Shain/dxmt"),
+            ("Mullion", "https://github.com/dttdrv/mullion"),
+            ("Wine", "https://github.com/wine-mirror/wine"),
+            ("llvm-mingw", "https://github.com/mstorsjo/llvm-mingw"),
+            ("MoltenVK", "https://github.com/KhronosGroup/MoltenVK"),
+            ("Blackwell Engine", "https://github.com/alexandreunitypro/blackwell-engine")
+        ]
+    }
+
+    private func showAbout() {
+        let credits = NSAttributedString(string: """
+            Prototype. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Playground Games, Apple or CodeWeavers. \
+            Built on Highball, Ferestre, xodus, Wine and Apple's D3DMetal: see the Thanks menu.
+            """, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -75,6 +114,12 @@ final class LauncherModel: ObservableObject {
     @Published var output = ""
     @Published var accountSaved = false
     @Published var installFraction: Double?
+    /// The first-launch guide; the components install once it is closed, so Apple's licence comes after it.
+    @Published var showWelcome: Bool = {
+        if let sheet = ProcessInfo.processInfo.environment["MH_SNAPSHOT_SHEET"] { return sheet == "welcome" }
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] != nil { return false }
+        return !settingsStore().bool(forKey: SettingKey.welcomeShown)
+    }()
     @Published var licenseText: String?
     private var licenseAnswer: CheckedContinuation<Bool, Never>?
 
@@ -121,10 +166,19 @@ final class LauncherModel: ObservableObject {
         }
         refreshSavedAccountStatus()
         // Blackwell Engine and D3DMetal install by themselves (D3DMetal after Apple's licence is accepted).
-        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil {
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil && !showWelcome {
             Task { await self.installComponents() }
         }
     }
+
+    func finishWelcome() {
+        guard showWelcome else { return }
+        showWelcome = false
+        settingsStore().set(true, forKey: SettingKey.welcomeShown)
+        Task { await installComponents() }
+    }
+
+    func openSupportPage() { NSWorkspace.shared.open(supportURL) }
 
     // MARK: - What is set up
 
@@ -391,7 +445,6 @@ private func statusLight(_ check: Check) -> some View {
 
 struct LauncherView: View {
     @StateObject private var model: LauncherModel
-    @State private var showAssistant = ProcessInfo.processInfo.environment["MH_SNAPSHOT_SHEET"] != nil
     private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
 
     @MainActor init(model: LauncherModel? = nil) {
@@ -467,15 +520,15 @@ struct LauncherView: View {
 
             HStack {
                 Button("Show Logs in Finder") { model.revealLogs() }
-                Button("AI Assistant…") { showAssistant = true }
+                Button("☕ Support Me") { model.openSupportPage() }
+                    .help("MetalHorizon is free. Support it on Buy Me a Coffee.")
                 Spacer()
-                Text("MetalHorizon \(version) · prototype · not affiliated with Microsoft or Apple")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
         }
         .padding(20)
-        .sheet(isPresented: $showAssistant) { AssistantSheet() }
+        .sheet(isPresented: Binding(get: { model.showWelcome }, set: { if !$0 { model.finishWelcome() } })) {
+            WelcomeSheet(start: model.finishWelcome, support: model.openSupportPage)
+        }
         .sheet(isPresented: Binding(get: { model.licenseText != nil }, set: { if !$0 { model.answerLicense(false) } })) {
             LicenseSheet(text: model.licenseText ?? "", answer: model.answerLicense)
         }
@@ -498,6 +551,60 @@ struct LauncherView: View {
                     .disabled(model.isBusy)
             }
         }
+    }
+}
+
+/// The first-launch guide: what MetalHorizon does by itself, the few steps that are the user's, and how to support it.
+struct WelcomeSheet: View {
+    var start: () -> Void
+    var support: () -> Void
+
+    private let steps: [(String, String)] = [
+        ("1", "MetalHorizon installs Blackwell Engine and Apple's D3DMetal by itself. Accept Apple's licence when it asks."),
+        ("2", "Sign In with Microsoft. You sign in on Microsoft's own page; your password never goes through MetalHorizon."),
+        ("3", "Choose a game folder with a short path, such as ~/FH6, not in iCloud Drive. Then click Download from Xbox (about 160 GB)."),
+        ("4", "Click Play. Quit the game from its own menu and wait about 30 seconds: the cloud save uploads as it closes."),
+        ("5", "If macOS asks to let xodus-service use the \"Xodus Service\" Keychain item, choose Always Allow.")
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Welcome to MetalHorizon")
+                .font(.title2.weight(.semibold))
+            Text("Play your own Xbox / Microsoft Store copy of Forza Horizon 6 on this Mac. No CrossOver, nothing to download by hand.")
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(steps, id: \.0) { number, text in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(number)
+                            .font(.headline)
+                            .frame(width: 18, alignment: .trailing)
+                        Text(text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+            GroupBox {
+                HStack(spacing: 10) {
+                    Text("MetalHorizon is free and open source. If it helps you, a coffee keeps it going.")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("☕ Support Me…", action: support)
+                }
+                .padding(6)
+            }
+            Text("Prototype: tested on one Mac so far. Unofficial; not affiliated with Microsoft or Apple.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            HStack {
+                Spacer()
+                Button("Get Started", action: start)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
     }
 }
 

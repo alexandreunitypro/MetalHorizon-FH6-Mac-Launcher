@@ -30,7 +30,8 @@ A short public note each month says what came in and where it went.
 | **$5, Pit crew** | Supporter, plus the monthly members' update: what was tried, what failed, the numbers. It ends with a short poll on the next priority. |
 | **$15, Test bench** | Pit crew, plus compatibility reports for your Mac model looked at first. |
 
-One-time support: buy a coffee on the same page. The button is at the top of the repository.
+**[buymeacoffee.com/zaidalexandre](https://buymeacoffee.com/zaidalexandre)**: a one-time coffee or a monthly membership.
+The app's **☕ Support Me** button opens the same page.
 
 ## Sponsors
 
