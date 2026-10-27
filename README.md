@@ -1,4 +1,4 @@
-# MetalHorizon
+# MetalHorizon – FH6 Mac Launcher
 
 **Run your own Xbox / Microsoft Store copy of Forza Horizon 6 on an Apple Silicon Mac.**
 Blackwell Engine (Wine) + xodus + Apple's D3DMetal, open source, no CrossOver, no DRM bypass.
