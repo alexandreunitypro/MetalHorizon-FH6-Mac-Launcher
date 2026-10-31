@@ -6,6 +6,8 @@ import Foundation
 let appBundleID = "io.github.alexandreunitypro.metalhorizon"
 let storeProductID = "9nr1r1xwlcnb"   // Forza Horizon 6, Xbox / Microsoft Store edition
 let supportURL = URL(string: "https://buymeacoffee.com/zaidalexandre")!
+/// Steam's own installer, downloaded straight from Valve's CDN (no account needed to fetch it).
+let steamSetupURL = URL(string: "https://cdn.steampowered.com/download/SteamSetup.exe")!
 
 enum SettingKey {
     static let gameDirectory = "metalhorizon.gameDirectory"
@@ -40,6 +42,10 @@ let supportDirectory: URL = {
     return dir
 }()
 let installedEngineDirectory = supportDirectory.appendingPathComponent("Blackwell Engine").path
+/// The Steam variant: Blackwell Engine plus two of Highball's own patches (engine/series-steam), for a
+/// launcher's own window — Steam's included — to draw instead of staying black. Experimental: this project has
+/// no Steam copy of Forza Horizon 6 to test with.
+let installedSteamEngineDirectory = supportDirectory.appendingPathComponent("Blackwell Engine Steam").path
 let installedD3DMetalDirectory = supportDirectory.appendingPathComponent("D3DMetal").path
 /// Highball's shim in front of Apple's d3d12: d3d12.dll (the shim), apd12.dll (Apple's d3d12.dll, export renamed on
 /// this Mac) and apd12.so (a link to Apple's d3d12.so, so it is the same image as dxgi.so and d3d12core.so).
@@ -68,7 +74,11 @@ struct Setup {
         return setup
     }
 
-    var engine: String { engineDirectory.isEmpty ? installedEngineDirectory : engineDirectory }
+    /// The Steam edition needs the Steam-variant engine; a manual override (engineDirectory) still wins for either.
+    var engine: String {
+        if !engineDirectory.isEmpty { return engineDirectory }
+        return isSteamEdition ? installedSteamEngineDirectory : installedEngineDirectory
+    }
     var d3dmetal: String { d3dmetalDirectory.isEmpty ? installedD3DMetalDirectory : d3dmetalDirectory }
 
     /// The engine folder from whatever was picked: the folder itself, its bin/ or bin/wine.
@@ -96,9 +106,44 @@ struct Setup {
             return Check(ok: false, text: "This folder is a link; choose the real folder (\(resolved))",
                          fix: "xodus resolves links, so the game folder itself must have the short name: pick \(resolved) or rename it.")
         }
+        if isSteamEdition {
+            if fileExists(gameDirectory + "/forzahorizon6.exe") {
+                return Check(ok: true, text: gameDirectory + " · Steam edition (experimental)")
+            }
+            return Check(ok: false, text: gameDirectory + " · no forzahorizon6.exe here",
+                         fix: "Pick the folder Steam installed the game into (steamapps/common/Forza Horizon 6).")
+        }
         if fileExists(gameDirectory + "/forzahorizon6.exe") { return Check(ok: true, text: gameDirectory) }
         return Check(ok: false, text: gameDirectory + " · not downloaded yet",
                      fix: "Sign in with Microsoft, then press Download from Xbox (about 160 GB).")
+    }
+
+    /// Steam installs ship steam_api64.dll (or steam_appid.txt) and live under steamapps/common; the Xbox edition has neither.
+    var isSteamEdition: Bool {
+        guard !gameDirectory.isEmpty else { return false }
+        return fileExists(gameDirectory + "/steam_api64.dll") || fileExists(gameDirectory + "/steam_appid.txt")
+            || gameDirectory.lowercased().contains("/steamapps/common/")
+    }
+
+    /// The Steam AppID (steam_appid.txt), used to launch through Steam itself (`steam.exe -applaunch <id>`):
+    /// Steam resolves the install path on its own and starts, bootstrapping its own client if needed.
+    var steamAppID: String? {
+        guard let data = FileManager.default.contents(atPath: gameDirectory + "/steam_appid.txt"),
+              let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        return text
+    }
+
+    /// A separate prefix from the Xbox edition's, since Steam's own client lives inside it (Highball: without
+    /// Steam running in the same prefix, FH6 on Steam closes itself after about 12 seconds).
+    var steamPrefix: String { gameDirectory + "/.blackwell-wine-steam" }
+    var steamClientExecutable: String { steamPrefix + "/drive_c/Program Files (x86)/Steam/Steam.exe" }
+    var steamClientCheck: Check {
+        guard fileExists(steamClientExecutable) else {
+            return Check(ok: false, text: "Not installed in this prefix yet",
+                         fix: "Click Install Steam: MetalHorizon downloads Valve's own installer and runs it in the game's Wine prefix. Sign in once it opens.")
+        }
+        return Check(ok: true, text: "Installed")
     }
 
     var engineVersion: String {
@@ -145,11 +190,15 @@ struct Setup {
         ["/x86_64-windows/d3d12.dll", "/x86_64-windows/apd12.dll", "/x86_64-unix/apd12.so"].allSatisfy { fileExists(shimDirectory + $0) }
     }
 
-    var readyToPlay: Bool { gameCheck.ok && engineCheck.ok && d3dmetalCheck.ok && shimReady }
+    var readyToPlay: Bool {
+        gameCheck.ok && engineCheck.ok && d3dmetalCheck.ok && shimReady && (!isSteamEdition || steamClientCheck.ok)
+    }
 
-    /// The prefix the working setup already has, else MetalHorizon's own (as in metalhorizon-play.sh).
+    /// The prefix the working setup already has, else MetalHorizon's own (as in metalhorizon-play.sh). The Steam
+    /// edition always uses its own separate prefix (steamPrefix): Steam's client lives inside it.
     var prefix: String {
-        fileExists(gameDirectory + "/.blackwell-wine") ? gameDirectory + "/.blackwell-wine" : gameDirectory + "/.metalhorizon-wine"
+        if isSteamEdition { return steamPrefix }
+        return fileExists(gameDirectory + "/.blackwell-wine") ? gameDirectory + "/.blackwell-wine" : gameDirectory + "/.metalhorizon-wine"
     }
 
     /// What metalhorizon-play.sh reads (the MCP server's show_play_environment passes the same).
@@ -161,6 +210,21 @@ struct Setup {
             "MH_GAME": gameDirectory,
             "MH_XODUS_CLI": resources.appendingPathComponent("xodus-cli").path,
             "MH_XODUS_SERVICE": resources.appendingPathComponent("xodus-service").path,
+            "MH_HUD": metalHUD ? "1" : "0",
+            "MH_LOGS": logDirectory.path
+        ]
+    }
+
+    /// What metalhorizon-play-steam.sh and metalhorizon-install-steam.sh read: no xodus (Steam handles its own
+    /// sign-in and downloads), the Steam-only prefix, and the AppID for `steam.exe -applaunch`.
+    func steamEnvironment() -> [String: String] {
+        [
+            "MH_ENGINE": engine,
+            "MH_D3DMETAL": d3dmetal,
+            "MH_SHIM": shimDirectory,
+            "MH_GAME": gameDirectory,
+            "MH_PREFIX": steamPrefix,
+            "MH_STEAM_APPID": steamAppID ?? "",
             "MH_HUD": metalHUD ? "1" : "0",
             "MH_LOGS": logDirectory.path
         ]

@@ -1,0 +1,67 @@
+diff -ruN a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+--- a/dlls/kernelbase/process.c	2026-09-04 15:52:59
++++ b/dlls/kernelbase/process.c	2026-09-04 15:53:00
+@@ -28,6 +28,7 @@
+ #include "winnls.h"
+ #include "wincontypes.h"
+ #include "winternl.h"
++#include "winreg.h"
+ 
+ #include "kernelbase.h"
+ #include "wine/debug.h"
+@@ -500,6 +501,41 @@
+     return ret;
+ }
+ 
++
++/* Highball: HKCU\Software\Wine\AppDefaults\<exe>\CommandLineAppend (REG_SZ) is appended to
++ * that executable's command line when it is created. Some programs never forward switches to
++ * the subprocesses they spawn (a launcher's CEF browser reads its own --log-severity and GPU
++ * switches only from its own command line), and Proton solves the same problem with a
++ * hard-coded table in this function; the registry keeps it per-app data the bottle can carry. */
++static WCHAR *highball_append_command_line( const WCHAR *app_name, const WCHAR *cmdline )
++{
++    const WCHAR *base = app_name, *p;
++    WCHAR key[MAX_PATH + 40], value[1024], *ret;
++    DWORD type, size = sizeof(value);
++    HKEY hkey;
++    size_t len;
++
++    if (!app_name || !cmdline) return NULL;
++    for (p = app_name; *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
++    if (!*base || lstrlenW( base ) >= MAX_PATH) return NULL;
++    swprintf( key, ARRAY_SIZE(key), L"Software\\Wine\\AppDefaults\\%s", base );
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, key, 0, KEY_QUERY_VALUE, &hkey )) return NULL;
++    if (RegQueryValueExW( hkey, L"CommandLineAppend", NULL, &type, (BYTE *)value, &size ) ||
++        type != REG_SZ || size < sizeof(WCHAR))
++    {
++        RegCloseKey( hkey );
++        return NULL;
++    }
++    RegCloseKey( hkey );
++    value[ARRAY_SIZE(value) - 1] = 0;
++    if (!value[0]) return NULL;
++    len = lstrlenW( cmdline ) + 1 + lstrlenW( value ) + 1;
++    if (!(ret = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) ))) return NULL;
++    swprintf( ret, len, L"%s %s", cmdline, value );
++    FIXME( "HIGHBALL: appended %s to the command line of %s\n", debugstr_w(value), debugstr_w(base) );
++    return ret;
++}
++
+ /**********************************************************************
+  *           CreateProcessInternalW   (kernelbase.@)
+  */
+@@ -543,6 +579,13 @@
+     {
+         if (!(tidy_cmdline = get_file_name( cmd_line, name, ARRAY_SIZE(name) ))) return FALSE;
+         app_name = name;
++    }
++
++    /* Highball: per-executable command-line append (see highball_append_command_line) */
++    if ((p = highball_append_command_line( app_name, tidy_cmdline )))
++    {
++        if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
++        tidy_cmdline = p;
+     }
+ 
+     /* CW Hack 24938 */

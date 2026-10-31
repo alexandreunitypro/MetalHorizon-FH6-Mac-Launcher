@@ -216,8 +216,14 @@ final class LauncherModel: ObservableObject {
     /// Installs what is missing (Blackwell Engine, then D3DMetal once Apple's licence is accepted) and the shim.
     func installComponents() async {
         guard !isBusy else { return }
+        let steam = setup.isSteamEdition
         let missing = Component.all().filter { component in
-            !component.isInstalled && (component.id == "engine" ? engineDirectory.isEmpty : d3dmetalDirectory.isEmpty)
+            guard !component.isInstalled else { return false }
+            switch component.id {
+            case "engine": return !steam && engineDirectory.isEmpty
+            case "engine-steam": return steam && engineDirectory.isEmpty
+            default: return d3dmetalDirectory.isEmpty
+            }
         }
         if missing.isEmpty && setup.shimReady { return }
         activity = .install
@@ -332,6 +338,7 @@ final class LauncherModel: ObservableObject {
         if !setup.readyToPlay {
             Task {
                 await installComponents()
+                if setup.isSteamEdition, !setup.steamClientCheck.ok { installSteamClient(); return }
                 if setup.readyToPlay { startGame() }
             }
             return
@@ -341,12 +348,36 @@ final class LauncherModel: ObservableObject {
 
     private func startGame() {
         guard let resources = Bundle.main.resourceURL else { return }
+        if setup.isSteamEdition {
+            run(executable: URL(fileURLWithPath: "/bin/bash"),
+                arguments: [resources.appendingPathComponent("metalhorizon-play-steam.sh").path],
+                environment: setup.steamEnvironment(),
+                activity: .game, statusText: "Playing through Steam (experimental). Quit from the game's own menu.",
+                logName: "play-steam") { code in
+                code == 0 ? "Game closed." : "The game stopped (error \(code)). See the activity log."
+            }
+            return
+        }
         run(executable: URL(fileURLWithPath: "/bin/bash"),
             arguments: [resources.appendingPathComponent("metalhorizon-play.sh").path],
             environment: setup.playEnvironment(resources: resources),
             activity: .game, statusText: "Playing. Quit from the game's menu; the cloud save uploads as it closes.",
             logName: "play") { code in
             code == 0 ? "Game closed." : "The game stopped (error \(code)). See the activity log."
+        }
+    }
+
+    /// Downloads Steam's own installer and runs it in the game's Steam-only prefix (metalhorizon-install-steam.sh).
+    /// The user clicks through Steam's installer and signs in, same as Microsoft sign-in is their own step.
+    func installSteamClient() {
+        guard !isBusy, let resources = Bundle.main.resourceURL else { return }
+        let current = setup
+        run(executable: URL(fileURLWithPath: "/bin/bash"),
+            arguments: [resources.appendingPathComponent("metalhorizon-install-steam.sh").path],
+            environment: ["MH_ENGINE": current.engine, "MH_PREFIX": current.steamPrefix],
+            activity: .install, statusText: "Downloading Steam's installer…",
+            logName: "install-steam") { code in
+            code == 0 ? "Steam installed. Sign in, then Play." : "Steam's installer stopped (error \(code)). See the activity log."
         }
     }
 
@@ -474,6 +505,10 @@ struct LauncherView: View {
                                action: model.setup.engineCheck.ok ? nil : { Task { await model.installComponents() } })
                     settingRow("D3DMetal 4:", model.setup.d3dmetalCheck, title: "Install…",
                                action: model.setup.d3dmetalCheck.ok ? nil : { Task { await model.installComponents() } })
+                    if model.setup.isSteamEdition {
+                        settingRow("Steam client:", model.setup.steamClientCheck, title: "Install Steam…",
+                                   action: model.setup.steamClientCheck.ok ? nil : { model.installSteamClient() })
+                    }
                     HStack {
                         Spacer().frame(width: labelWidth + 8)
                         Toggle("Show the Metal performance HUD in the game", isOn: $model.metalHUD)
@@ -497,8 +532,10 @@ struct LauncherView: View {
                     Button(model.activity == .game ? "Force Quit" : "Stop") { model.stop() }
                         .help(model.activity == .game ? "Quit from the game's menu when you can: force-quitting skips the cloud save upload." : "")
                 }
-                Button("Download from Xbox") { model.download() }
-                    .disabled(!model.canDownload)
+                if !model.setup.isSteamEdition {
+                    Button("Download from Xbox") { model.download() }
+                        .disabled(!model.canDownload)
+                }
                 Button("Play") { model.play() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!model.canPlay)
@@ -594,6 +631,10 @@ struct WelcomeSheet: View {
                 }
                 .padding(6)
             }
+            Text("Steam edition: point the game folder at your Steam install and MetalHorizon plays it too — experimental, not yet tested in game (no Steam copy to test with).")
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text("Prototype: tested on one Mac so far. Unofficial; not affiliated with Microsoft or Apple.")
                 .font(.caption)
                 .foregroundColor(.secondary)

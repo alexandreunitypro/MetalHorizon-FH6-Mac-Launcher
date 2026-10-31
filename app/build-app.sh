@@ -24,10 +24,13 @@ DIST="$PWD/dist"; APP="$DIST/MetalHorizon.app"; RES="$APP/Contents/Resources"
 rm -rf "$DIST"; mkdir -p "$APP/Contents/MacOS" "$RES"
 cp "$BIN" "$APP/Contents/MacOS/MetalHorizon"
 cp Resources/metalhorizon-play.sh "$RES/"
+cp Resources/metalhorizon-play-steam.sh "$RES/"
+cp Resources/metalhorizon-install-steam.sh "$RES/"
 [ -f components.json ] || { echo "STOP: no app/components.json (bash app/update-components.sh)"; exit 1; }
 cp components.json "$RES/components.json"
 cp "$XODUS_CLI" "$RES/xodus-cli"; cp "$XODUS_SERVICE" "$RES/xodus-service"
-chmod 755 "$RES/xodus-cli" "$RES/xodus-service" "$RES/metalhorizon-play.sh"
+chmod 755 "$RES/xodus-cli" "$RES/xodus-service" "$RES/metalhorizon-play.sh" \
+    "$RES/metalhorizon-play-steam.sh" "$RES/metalhorizon-install-steam.sh"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

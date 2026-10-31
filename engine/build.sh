@@ -3,19 +3,22 @@
 # (engine/series) and its own x86_64 run-time libraries (engine/build-deps.sh) into <work>/out/engine. Nothing from
 # CrossOver.app is used. engine/package.sh then adds the DirectX 12 shim and makes the tarball the app installs.
 # Everything happens inside the work folder: the engine the game runs on today is not touched.
-#   bash engine/build.sh [--source-only] [--tarball <crossover-sources-26.3.0.tar.gz>] [work folder]
+#   bash engine/build.sh [--source-only] [--tarball <crossover-sources-26.3.0.tar.gz>] [--series <file>] [work folder]
 # Work folder: ~/BlackwellEngine-build by default. --source-only stops once the patches are applied
 # (engine/verify-series.sh uses it). Files already in <work>/downloads are reused when their SHA-256 matches.
+# --series <file>: a series file in engine/ other than the default `series` (e.g. `series-steam`), to build a
+# variant engine. Use a different work folder for each variant: they do not share $W/out.
 # Needs: an Apple silicon Mac with Rosetta (the engine is x86_64), Xcode Command Line Tools, Python 3, bison 3
 # and pkg-config (brew install bison pkgconf).
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ENG="$REPO/engine"
-SOURCE_ONLY=0; TARBALL=""
+SOURCE_ONLY=0; TARBALL=""; SERIES_FILE="series"
 while [ $# -gt 0 ]; do
     case "$1" in
         --source-only) SOURCE_ONLY=1 ;;
         --tarball) TARBALL="$2"; shift ;;
+        --series) SERIES_FILE="$2"; shift ;;
         -*) echo "unknown option $1"; exit 2 ;;
         *) break ;;
     esac
@@ -47,15 +50,15 @@ rm -rf "$W/src"; mkdir -p "$W/src"
 tar -xzf "$SRC_TGZ" -C "$W/src" "$(json wine.subdir)"
 SRC="$W/src/$(json wine.subdir)"
 
-echo "== 2. patch series"
+echo "== 2. patch series ($SERIES_FILE)"
 while IFS= read -r p; do
     case "$p" in ''|'#'*) continue ;; esac
     echo "  $p"
     patch -p1 -d "$SRC" --forward --batch --quiet < "$ENG/patches/$p" \
         || { echo "STOP: $p does not apply"; exit 1; }
-done < "$ENG/series"
+done < "$ENG/$SERIES_FILE"
 find "$SRC" -name '*.orig' -delete
-SERIES_SHA="$(cd "$ENG" && cat series patches/*.patch | shasum -a 256 | cut -d' ' -f1)"
+SERIES_SHA="$(cd "$ENG" && cat "$SERIES_FILE" patches/*.patch | shasum -a 256 | cut -d' ' -f1)"
 echo "  series fingerprint $SERIES_SHA"
 if [ "$SOURCE_ONLY" = 1 ]; then echo "patched sources: $SRC"; exit 0; fi
 

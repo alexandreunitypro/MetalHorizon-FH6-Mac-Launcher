@@ -1,0 +1,20 @@
+# The Steam variant of Blackwell Engine: the same 9 patches as `series`, plus two of Highball's own patches
+# (copied verbatim from https://github.com/gauthierpiarrette/highball-engine/tree/main/patches,
+# Gauthier Piarrette, LGPL-2.1-or-later — see patches/ORIGIN-steam.md), needed for a launcher's own window
+# (here, the Steam client) to draw instead of staying black:
+#   0010 (their 0006) lets a per-exe command line be appended from the registry (launcher browser switches).
+#   0011 (their 0007) fixes a Steam/Rockstar/Ubisoft launcher's sign-in browser window and its own main window
+#        drawing black (Wine bug 60263: a child window whose swap chain belongs to another process).
+# Verified 2026-10-31 to apply with no conflict on top of 0001-0009 (patch -p1 --dry-run, clean).
+# Built with --series series-steam into a separate work folder (engine/build.sh --series series-steam <work>).
+0001-xgameruntime.patch
+0002-kernelbase-app-packages.patch
+0003-macos-teb-slots.patch
+0004-ntdll-msixvc-images-memory.patch
+0005-ntdll-exceptions.patch
+0006-network.patch
+0007-audio-surround.patch
+0008-misc.patch
+0009-diag-msgbox.patch
+0010-kernelbase-per-exe-command-line-append.patch
+0011-winemac-cross-process-child-swapchains.patch

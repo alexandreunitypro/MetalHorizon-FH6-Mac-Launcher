@@ -1,0 +1,1433 @@
+Highball: winemac.drv presents a Metal swapchain for a window whose root another process owns.
+
+Wine bug 60263. A CEF GPU process (Rockstar's SocialClubHelper, Steam's steamwebhelper, Ubisoft
+Connect) asks D3DMetal/DXMT for a swapchain on a child window whose root window belongs to the
+CEF browser process. The driver's win data is per process, so get_win_data() cannot see the
+root, the macdrv_functions shim handed DXMT no view, the swapchain failed and Chromium restarted
+the GPU process until it gave up: a black launcher window. Launch switches do not help.
+
+The rendering process now draws into a CAMetalLayer exported through a CAContext, and the
+process that owns the root window hosts that layer in its content view through a CALayerHost,
+positioned on the child's rect, clipped to it, stacked in Win32 paint order and kept in place
+as the child and the root move. This is upstream Wine's CAContext/CALayerHost route (11.11+,
+reached there only from vulkan.c) backported to this wine-11.0 base, plus the child window
+geometry, z-order, 0x0 and lifetime handling from the bug's reference patch, wired into the
+macdrv_functions shim that D3DMetal and DXMT use, so DXMT needs no change. Messages:
+WM_MACDRV_CREATE_REMOTE_LAYER / RELEASE / UPDATE, posted to the root window's owner. vulkan.c
+takes the same route through macdrv_client_surface_acquire_metal_swapchain().
+
+Applies on top of 0001-0003, 0005 and 0006 with 0004 (the overlay-window attempt at the same
+problem) dropped; none of those touch dlls/winemac.drv. Compile-checked with clang -fsyntax-only
+against the CrossOver 26.3 include tree and link-checked for the private CoreAnimation symbols;
+not yet run. Upstream status: bug open, reference implementation attached to the bug by its
+author, not submitted.
+
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -100,6 +100,12 @@
+ {
+     WM_MACDRV_SET_WIN_REGION = WM_WINE_FIRST_DRIVER_MSG,
+     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
++    /* Highball: cross-process Metal swapchains (Wine bug 60263). Posted to the window that owns
++     * the NSWindow; wParam is the child hwnd the layer belongs to (0 for the window itself),
++     * lParam the CAContext id. */
++    WM_MACDRV_CREATE_REMOTE_LAYER,
++    WM_MACDRV_RELEASE_REMOTE_LAYER,
++    WM_MACDRV_UPDATE_REMOTE_LAYER,
+ };
+ 
+ struct macdrv_thread_data
+@@ -194,17 +200,21 @@
+     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
+     unsigned int        minimized : 1;          /* is window minimized? */
+     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
++    unsigned int        remote_swapchain : 1;   /* Highball: renders into a layer hosted by the root's owner (another process) */
+ 
+     /* CW HACK 22435 */
+     CFMutableArrayRef   d3dmetal_client_surfaces;
++
++    /* Highball: CAContextID -> child HWND for the cross-process layers hosted on this window,
++     * so they can be repositioned and restacked as the children move (Wine bug 60263). */
++    CFMutableDictionaryRef remote_layer_children;
+ };
+ 
+ struct macdrv_client_surface
+ {
+     struct client_surface client;
+     macdrv_view           cocoa_view;
+-    macdrv_metal_device   metal_device;
+-    macdrv_metal_view     metal_view;
++    macdrv_metal_swapchain metal_swapchain;
+ };
+ 
+ static inline struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)
+@@ -213,6 +223,9 @@
+ }
+ 
+ extern struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd);
++extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface,
++                                                          macdrv_metal_device device);
++extern BOOL macdrv_window_has_foreign_root(HWND hwnd, HWND *root);
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -122,6 +122,7 @@
+ typedef struct macdrv_opaque_metal_device* macdrv_metal_device;
+ typedef struct macdrv_opaque_metal_view* macdrv_metal_view;
+ typedef struct macdrv_opaque_metal_layer* macdrv_metal_layer;
++typedef struct macdrv_opaque_metal_swapchain* macdrv_metal_swapchain;
+ typedef struct macdrv_opaque_status_item* macdrv_status_item;
+ struct macdrv_event;
+ struct macdrv_query;
+@@ -559,6 +560,19 @@
+ extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);
+ extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
+ extern void macdrv_view_release_metal_view(macdrv_metal_view v);
++/* Highball: Metal swapchains that can live in a window another process owns (Wine bug 60263) */
++extern macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v, macdrv_metal_device device);
++extern macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* hwnd, void* child, CGRect bounds,
++                                                                 macdrv_metal_device device);
++extern macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain);
++extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
++extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id,
++                                                    CGRect frame, double zpos, int zpos_valid);
++extern void macdrv_window_update_ca_layer_host_frame(macdrv_window w, unsigned int context_id,
++                                                     CGRect frame, double zpos, int zpos_valid);
++extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
++extern void macdrv_create_remote_layer(void* hwnd, void* child, unsigned int context_id);
++extern void macdrv_release_remote_layer(void* hwnd, unsigned int context_id);
+ extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
+ extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
+ extern uint32_t macdrv_window_background_color(void);
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -43,10 +43,31 @@
+  * NSWindowStyleMaskNonactivatingPanel.
+  * Available since at least macOS 10.6. */
+ - (void)_setPreventsActivation:(BOOL)flag;
++
++@end
++
++/* Highball: private CoreAnimation API used to host a layer rendered by another process
++ * (Wine bug 60263). Backported from upstream Wine 11.11+ (dlls/winemac.drv/cocoa_window.m). */
++typedef uint32_t CGSConnectionID;
++extern CGSConnectionID CGSMainConnectionID(void);
++
++typedef uint32_t CAContextID;
++
++@interface CAContext : NSObject
++
+++ (id) contextWithCGSConnection:(CGSConnectionID)connection options:(NSDictionary*)options;
++@property(readonly) CAContextID contextId;
++@property(retain) CALayer* layer;
+ 
+ @end
+ 
++@interface CALayerHost : CALayer
+ 
++- (void) setContextId:(CAContextID)contextId;
++
++@end
++
++
+ static NSUInteger style_mask_for_features(const struct macdrv_window_features* wf)
+ {
+     NSUInteger style_mask;
+@@ -375,6 +396,7 @@
+     int backingSize[2];
+ 
+     WineMetalView *_metalView;
++    NSMutableDictionary<NSNumber*, CALayerHost*>* _caLayerHosts;   /* Highball: Wine bug 60263 */
+ 
+ @public void *d3dmetal_client_surface;   /* CW HACK 22435 */
+ }
+@@ -389,6 +411,10 @@
+     - (void) wine_setBackingSize:(const int*)newBackingSize;
+ 
+     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
++    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
++    - (void) updateCALayerHostFrame:(CAContextID)contextId frame:(CGRect)frame;
++    - (void) setCALayerHostZPosition:(CAContextID)contextId zPosition:(double)zpos;
++    - (void) removeCALayerHostView:(CAContextID)contextId;
+ 
+ @end
+ 
+@@ -477,6 +503,35 @@
+ @end
+ 
+ 
++/* Highball: Win32 speaks raw pixels and Cocoa points (two to one on Retina), so an odd pixel
++ * dimension is a half point, and a hosted layer that Win32 says reaches the window edge stops one
++ * device pixel short of it, showing the window beneath as a hairline. Snapped only at the edges so
++ * an interior sibling keeps its exact geometry. */
++static CGRect snap_host_frame_to_view_edges(CGRect frame, CGRect view)
++{
++    /* one device pixel in points; a fixed 1.0 would also close a gap the app asked for */
++    const CGFloat px = retina_on ? 0.5 : 1.0;
++
++    if (CGRectIsNull(frame) || CGRectIsEmpty(frame) || CGRectIsEmpty(view)) return frame;
++
++    if (frame.origin.x > 0.0 && frame.origin.x <= px)
++    {
++        frame.size.width += frame.origin.x;
++        frame.origin.x = 0.0;
++    }
++    if (frame.origin.y > 0.0 && frame.origin.y <= px)
++    {
++        frame.size.height += frame.origin.y;
++        frame.origin.y = 0.0;
++    }
++    if (CGRectGetMaxX(frame) >= view.size.width - px)
++        frame.size.width = view.size.width - frame.origin.x;
++    if (CGRectGetMaxY(frame) >= view.size.height - px)
++        frame.size.height = view.size.height - frame.origin.y;
++    return frame;
++}
++
++
+ @implementation WineContentView
+ 
+ @synthesize everHadGLContext = _everHadGLContext;
+@@ -499,6 +554,7 @@
+         [markedText release];
+         [glContexts release];
+         [pendingGlContexts release];
++        [_caLayerHosts release];
+         CGImageRelease(colorImage);
+         CGImageRelease(shapeImage);
+         [super dealloc];
+@@ -702,6 +758,97 @@
+         return _metalView;
+     }
+ 
++    /* Highball: host a layer another process renders into, keyed by its CAContext id
++     * (Wine bug 60263). frame is in points, in this view's coordinate space; CGRectNull means
++     * "no child rect supplied" and fills the view, which is the top-level window case. */
++    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
++    {
++        if (!_caLayerHosts)
++            _caLayerHosts = [[NSMutableDictionary alloc] init];
++
++        [self removeCALayerHostView:contextId];
++
++        CALayerHost* host = [CALayerHost layer];
++        [host setContextId:contextId];
++        host.magnificationFilter = kCAFilterNearest;
++        host.contentsScale = retina_on ? 2.0 : 1.0;
++        frame = snap_host_frame_to_view_edges(frame, self.layer.bounds);
++        /* A host given a real child rect is positioned and clipped to it, so siblings on one
++         * window stop occluding one another. Three cases: CGRectIsEmpty cannot tell "no rect
++         * supplied" from "really 0x0", and a 0x0 layer stretched over the content view with
++         * nothing drawn in it blacks out everything below; a window with no area is hidden. */
++        if (CGRectIsNull(frame))
++        {
++            host.frame = self.layer.bounds;
++            host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++        }
++        else if (CGRectIsEmpty(frame))
++        {
++            host.frame = CGRectZero;
++            host.masksToBounds = YES;
++            host.hidden = YES;
++        }
++        else
++        {
++            host.frame = frame;
++            host.masksToBounds = YES;
++        }
++
++        [self.layer addSublayer:host];
++        [_caLayerHosts setObject:host forKey:@(contextId)];
++
++        [(WineWindow*)self.window windowDidDrawContent];
++    }
++
++    - (void) updateCALayerHostFrame:(CAContextID)contextId frame:(CGRect)frame
++    {
++        CALayerHost* host = [_caLayerHosts objectForKey:@(contextId)];
++
++        if (!host || CGRectIsNull(frame)) return;
++        frame = snap_host_frame_to_view_edges(frame, self.layer.bounds);
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        if (CGRectIsEmpty(frame))
++        {
++            /* Became 0x0 while hosted: left alone, the layer keeps its last size and still
++             * covers live content. */
++            host.hidden = YES;
++            host.frame = CGRectZero;
++        }
++        else
++        {
++            /* The child it mirrors can move or resize in the other process. Visibility and
++             * geometry are independent: a window that reports 0x0 and returns to its old size
++             * must come back. */
++            if (!CGRectEqualToRect(host.frame, frame)) host.frame = frame;
++            if (host.hidden) host.hidden = NO;
++        }
++        [CATransaction commit];
++    }
++
++    /* Stack the hosted layers the way the windows they mirror stack: insertion order is not that
++     * order, since a client that recreates a swapchain on every resize puts the last-recreated
++     * layer on top of live content. */
++    - (void) setCALayerHostZPosition:(CAContextID)contextId zPosition:(double)zpos
++    {
++        CALayerHost* host = [_caLayerHosts objectForKey:@(contextId)];
++
++        if (host && host.zPosition != zpos)
++        {
++            [CATransaction begin];
++            [CATransaction setDisableActions:YES];
++            host.zPosition = zpos;
++            [CATransaction commit];
++        }
++    }
++
++    - (void) removeCALayerHostView:(CAContextID)contextId
++    {
++        NSNumber* key = @(contextId);
++        [[_caLayerHosts objectForKey:key] removeFromSuperlayer];
++        [_caLayerHosts removeObjectForKey:key];
++    }
++
+     - (void) setLayerRetinaProperties:(BOOL)mode
+     {
+         [self layer].contentsScale = mode ? 2.0 : 1.0;
+@@ -741,6 +888,9 @@
+         [self updateGLContexts];
+         [self setLayerRetinaProperties:mode];
+ 
++        for (CALayerHost* host in [_caLayerHosts allValues])
++            host.contentsScale = mode ? 2.0 : 1.0;
++
+         [super setRetinaMode:mode];
+     }
+ 
+@@ -4064,9 +4214,249 @@
+     OnMainThread(^{
+         [view removeFromSuperview];
+         [view release];
++    });
++}
++
++/* Highball: Metal swapchains (Wine bug 60263). Backported from upstream Wine 11.11+, with the
++ * child-window geometry and z-order from the bug's reference patch. A MetalViewSwapChain is the
++ * in-process case, a WineMetalView in one of our views. A CAContextSwapChain is the cross-process
++ * case: the CAMetalLayer is exported through a CAContext and the process owning the target
++ * window hosts it in its content view through a CALayerHost. */
++
++@protocol WineMetalSwapChain <NSObject>
++
++- (CAMetalLayer*) layer;
++
++@end
++
++@interface MetalViewSwapChain : NSObject <WineMetalSwapChain>
++{
++    macdrv_metal_device device;
++    macdrv_metal_view metal_view;
++}
++
++- (instancetype) initWithView:(macdrv_view)view device:(macdrv_metal_device)dev;
++
++@end
++
++@implementation MetalViewSwapChain
++
++- (instancetype) initWithView:(macdrv_view)view device:(macdrv_metal_device)dev
++{
++    self = [super init];
++    if (!self) return nil;
++
++    /* The renderer's own device when it hands one over (D3DMetal, DXMT), the system default
++     * otherwise (Vulkan). Either way one reference is ours to release. */
++    if (dev)
++        device = (macdrv_metal_device)[(id<MTLDevice>)dev retain];
++    else if (!(device = macdrv_create_metal_device()))
++    {
++        [self release];
++        return nil;
++    }
++    if (!(metal_view = macdrv_view_create_metal_view(view, device)))
++    {
++        macdrv_release_metal_device(device);
++        device = NULL;
++        [self release];
++        return nil;
++    }
++    return self;
++}
++
++- (CAMetalLayer*) layer
++{
++    return (CAMetalLayer*)macdrv_view_get_metal_layer(metal_view);
++}
++
++- (void) dealloc
++{
++    if (metal_view) macdrv_view_release_metal_view(metal_view);
++    if (device) macdrv_release_metal_device(device);
++    [super dealloc];
++}
++
++@end
++
++@interface CAContextSwapChain : NSObject <WineMetalSwapChain>
++{
++    void* hwnd;                /* the window whose owner hosts the layer */
++    void* child_hwnd;          /* the cross-process child this layer belongs to (may be NULL) */
++    macdrv_metal_device device;
++    CAMetalLayer* offscreen_layer;
++    CAContext* remote_context;
++    CAContextID context_id;
++}
++
++- (instancetype) initWithHwnd:(void*)hwnd child:(void*)child bounds:(CGRect)bounds
++                       device:(macdrv_metal_device)dev;
++
++@end
++
++@implementation CAContextSwapChain
++
++- (instancetype) initWithHwnd:(void*)newHwnd child:(void*)newChild bounds:(CGRect)bounds
++                       device:(macdrv_metal_device)dev
++{
++    self = [super init];
++    if (!self) return nil;
++
++    hwnd = newHwnd;
++    child_hwnd = newChild;
++    if (dev)
++        device = (macdrv_metal_device)[(id<MTLDevice>)dev retain];
++    else if (!(device = macdrv_create_metal_device()))
++    {
++        [self release];
++        return nil;
++    }
++
++    offscreen_layer = [[CAMetalLayer alloc] init];
++    if (!offscreen_layer)
++    {
++        macdrv_release_metal_device(device);
++        device = NULL;
++        [self release];
++        return nil;
++    }
++
++    offscreen_layer.device = (id<MTLDevice>)device;
++    offscreen_layer.framebufferOnly = YES;
++    offscreen_layer.magnificationFilter = kCAFilterNearest;
++    offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
++    offscreen_layer.contentsScale = retina_on ? 2.0 : 1.0;
++    [offscreen_layer setBounds:cgrect_mac_from_win(bounds)];
++    [offscreen_layer setAnchorPoint:CGPointMake(0, 0)];
++
++    /* Export the CAMetalLayer from the rendering process, then have the
++     * target HWND's owner host it using CALayerHost. */
++    OnMainThread(^{
++        remote_context = [[CAContext contextWithCGSConnection:CGSMainConnectionID()
++                                                      options:[NSDictionary dictionary]] retain];
++        [remote_context setLayer:offscreen_layer];
++        context_id = [remote_context contextId];
+     });
++
++    if (!remote_context || !context_id)
++    {
++        [self release];
++        return nil;
++    }
++
++    macdrv_create_remote_layer(hwnd, child_hwnd, context_id);
++    return self;
+ }
+ 
++- (CAMetalLayer*) layer
++{
++    return offscreen_layer;
++}
++
++- (void) dealloc
++{
++    if (context_id) macdrv_release_remote_layer(hwnd, context_id);
++    CAContext *context = remote_context;
++    CAMetalLayer *layer = offscreen_layer;
++    macdrv_metal_device dev = device;
++
++    OnMainThreadAsync(^{
++        [context setLayer:nil];
++        [context release];
++        [layer release];
++        if (dev) macdrv_release_metal_device(dev);
++    });
++
++    [super dealloc];
++}
++
++@end
++
++macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v, macdrv_metal_device device)
++{
++    return (macdrv_metal_swapchain)[[MetalViewSwapChain alloc] initWithView:v device:device];
++}
++
++macdrv_metal_swapchain macdrv_create_offscreen_swapchain(void* hwnd, void* child, CGRect bounds,
++                                                         macdrv_metal_device device)
++{
++    return (macdrv_metal_swapchain)[[CAContextSwapChain alloc] initWithHwnd:hwnd child:child
++                                                                        bounds:bounds device:device];
++}
++
++macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain)
++{
++    return (macdrv_metal_layer)[(id<WineMetalSwapChain>)swapchain layer];
++}
++
++void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain)
++{
++    [(id<WineMetalSwapChain>)swapchain release];
++}
++
++/* The frame arrives in Win32 raw pixels relative to the content view and CALayer.frame is in
++ * points: window.c works in Win32 space and the Cocoa side converts. A null frame (no child rect)
++ * stays null and selects the whole-view case. */
++void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id,
++                                             CGRect frame, double zpos, int zpos_valid)
++{
++@autoreleasepool
++{
++    WineWindow* window = (WineWindow*)w;
++
++    OnMainThread(^{
++        NSView* content_view = [window contentView];
++
++        if ([content_view isKindOfClass:[WineContentView class]])
++        {
++            CGRect mac_frame = CGRectIsNull(frame) ? CGRectNull : cgrect_mac_from_win(frame);
++
++            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id
++                                                                      frame:mac_frame];
++            if (zpos_valid)
++                [(WineContentView*)content_view setCALayerHostZPosition:context_id zPosition:zpos];
++        }
++    });
++}
++}
++
++void macdrv_window_update_ca_layer_host_frame(macdrv_window w, unsigned int context_id,
++                                              CGRect frame, double zpos, int zpos_valid)
++{
++@autoreleasepool
++{
++    WineWindow* window = (WineWindow*)w;
++
++    OnMainThread(^{
++        NSView* content_view = [window contentView];
++
++        if ([content_view isKindOfClass:[WineContentView class]])
++        {
++            CGRect mac_frame = CGRectIsNull(frame) ? CGRectNull : cgrect_mac_from_win(frame);
++
++            [(WineContentView*)content_view updateCALayerHostFrame:context_id frame:mac_frame];
++            if (zpos_valid)
++                [(WineContentView*)content_view setCALayerHostZPosition:context_id zPosition:zpos];
++        }
++    });
++}
++}
++
++void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id)
++{
++@autoreleasepool
++{
++    WineWindow* window = (WineWindow*)w;
++
++    OnMainThread(^{
++        NSView* content_view = [window contentView];
++
++        if ([content_view isKindOfClass:[WineContentView class]])
++            [(WineContentView*)content_view removeCALayerHostView:context_id];
++    });
++}
++}
++
+ bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2])
+ {
+     WineContentView* view = (WineContentView*)v;
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -244,6 +244,31 @@
+ void release_win_data(struct macdrv_win_data *data)
+ {
+     if (data) pthread_mutex_unlock(&win_data_mutex);
++}
++
++
++/***********************************************************************
++ *              macdrv_window_has_foreign_root
++ *
++ * Highball: TRUE when the root window of hwnd has no win data in this
++ * process, which is when another process created it: win_datas is per
++ * process, so get_win_data() cannot see a foreign window by construction.
++ * That is how a CEF GPU process (Steam, Rockstar, Ubisoft Connect) asks for
++ * a swapchain on a child of the browser process's window (Wine bug 60263).
++ */
++BOOL macdrv_window_has_foreign_root(HWND hwnd, HWND *root_ret)
++{
++    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
++    struct macdrv_win_data *data;
++
++    if (root_ret) *root_ret = root;
++    if (!root || root == NtUserGetDesktopWindow()) return FALSE;
++    if ((data = get_win_data(root)))
++    {
++        release_win_data(data);
++        return FALSE;
++    }
++    return TRUE;
+ }
+ 
+ 
+@@ -1146,8 +1171,7 @@
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
+-    if (surface->metal_view) macdrv_view_release_metal_view(surface->metal_view);
+-    if (surface->metal_device) macdrv_release_metal_device(surface->metal_device);
++    if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
+ }
+ 
+ static void macdrv_client_surface_detach(struct client_surface *client)
+@@ -1235,6 +1259,52 @@
+     }
+ 
+     return surface;
++}
++
++/***********************************************************************
++ *              macdrv_client_surface_acquire_metal_swapchain
++ *
++ * Highball: the Metal layer a client surface renders into. In our own
++ * windows that is a WineMetalView in the surface's view. When the root
++ * window belongs to another process (Wine bug 60263) there is no window of
++ * ours to put a view in, so the layer is exported through a CAContext and
++ * the root's owner hosts it in its content view (WM_MACDRV_CREATE_REMOTE_LAYER).
++ * device may be NULL, in which case the swapchain creates its own.
++ */
++BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface,
++                                                   macdrv_metal_device device)
++{
++    HWND hwnd = surface->client.hwnd, root;
++    struct macdrv_win_data *data;
++    RECT rect;
++
++    if (surface->metal_swapchain) return TRUE;
++
++    if (!macdrv_window_has_foreign_root(hwnd, &root))
++    {
++        surface->metal_swapchain = macdrv_create_view_swapchain(surface->cocoa_view, device);
++        return surface->metal_swapchain != NULL;
++    }
++
++    /* The layer's bounds only need the child's size; the root's owner positions the hosted
++     * layer from the child's window rect (see WM_MACDRV_CREATE_REMOTE_LAYER). */
++    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
++    OffsetRect(&rect, -rect.left, -rect.top);
++
++    TRACE("%s: root %p belongs to another process, hosting a remote layer there, bounds %s\n",
++          debugstr_client_surface(&surface->client), root, wine_dbgstr_rect(&rect));
++    surface->metal_swapchain = macdrv_create_offscreen_swapchain(root, root == hwnd ? NULL : hwnd,
++                                                                 cgrect_from_rect(rect), device);
++    if (!surface->metal_swapchain) return FALSE;
++
++    /* A child this process created has win data; its moves are relayed to the root's owner from
++     * WindowPosChanged so the hosted layer follows. */
++    if ((data = get_win_data(hwnd)))
++    {
++        data->remote_swapchain = 1;
++        release_win_data(data);
++    }
++    return TRUE;
+ }
+ 
+ /**********************************************************************
+@@ -1336,6 +1406,8 @@
+     /* CW HACK 22435 */
+     if (data->d3dmetal_client_surfaces) CFRelease(data->d3dmetal_client_surfaces);
+ 
++    if (data->remote_layer_children) CFRelease(data->remote_layer_children);
++
+     CFDictionaryRemoveValue(win_datas, hwnd);
+     release_win_data(data);
+     free(data);
+@@ -1591,10 +1663,314 @@
+         /* The ULW flags are a superset of the LWA flags. */
+         sync_window_opacity(data, alpha, TRUE, flags);
+         release_win_data(data);
++    }
++}
++
++
++/* Highball: hosting of layers rendered by another process (Wine bug 60263). The rendering
++ * process exports a CAContext and posts WM_MACDRV_CREATE_REMOTE_LAYER to the window that owns
++ * the NSWindow; this side hosts it, places it on the child's rect, stacks it in Win32 paint
++ * order and keeps it there as the child moves. */
++
++/* Win32 paint order for the hosted children of one root; higher index = nearer the viewer.
++ * Siblings are walked bottom to top (GW_HWNDNEXT runs top to bottom) and a window is recorded
++ * before its own children, so a child sits above its parent and an upper sibling above the whole
++ * subtree of a lower one. Built once per update, not once per layer: this runs during a drag. */
++#define PAINT_ORDER_DEPTH 32
++
++struct paint_order
++{
++    HWND *hwnds;                   /* index 0 = furthest back; grown by doubling */
++    int   count, capacity;
++    BOOL  truncated;               /* a bound was hit; z-order below is incomplete */
++};
++
++static void paint_order_truncated(struct paint_order *po, const char *why, HWND at)
++{
++    static BOOL warned;
++
++    if (!warned)
++    {
++        FIXME("%s below %p, paint order incomplete, hosted layers past the cap keep their z\n",
++              why, at);
++        warned = TRUE;
++    }
++    po->truncated = TRUE;
++}
++
++static BOOL paint_order_add(struct paint_order *po, HWND hwnd)
++{
++    if (po->count == po->capacity)
++    {
++        int capacity = po->capacity ? po->capacity * 2 : 32;
++        HWND *hwnds = realloc(po->hwnds, capacity * sizeof(*hwnds));
++
++        if (!hwnds)
++        {
++            paint_order_truncated(po, "out of memory", hwnd);
++            return FALSE;
++        }
++        po->hwnds = hwnds;
++        po->capacity = capacity;
++    }
++    po->hwnds[po->count++] = hwnd;
++    return TRUE;
++}
++
++/* GW_CHILD gives the topmost child and GW_HWNDLAST the bottommost sibling, so GW_HWNDPREV from
++ * there walks bottom to top. */
++static void paint_order_walk(HWND parent, struct paint_order *po, int depth)
++{
++    HWND k;
++
++    if (depth >= PAINT_ORDER_DEPTH)
++    {
++        paint_order_truncated(po, "window tree too deep", parent);
++        return;
++    }
++
++    if (!(k = NtUserGetWindowRelative(parent, GW_CHILD))) return;
++
++    for (k = NtUserGetWindowRelative(k, GW_HWNDLAST); k;
++         k = NtUserGetWindowRelative(k, GW_HWNDPREV))
++    {
++        if (!paint_order_add(po, k)) return;
++        paint_order_walk(k, po, depth + 1);
++    }
++}
++
++static void build_paint_order(HWND root, struct paint_order *po)
++{
++    po->hwnds = NULL;
++    po->count = po->capacity = 0;
++    po->truncated = FALSE;
++    if (root) paint_order_walk(root, po, 0);
++}
++
++static void paint_order_free(struct paint_order *po)
++{
++    free(po->hwnds);
++    po->hwnds = NULL;
++    po->count = po->capacity = 0;
++}
++
++/* TRUE + *zpos on success; on failure the caller must leave zPosition alone. Returning 0.0 for
++ * "not found" would be indistinguishable from a legitimate bottom-most position. */
++static BOOL paint_order_zpos(const struct paint_order *po, HWND child, double *zpos)
++{
++    int i;
++
++    for (i = 0; i < po->count; i++)
++        if (po->hwnds[i] == child) { *zpos = (double)(i + 1); return TRUE; }
++    return FALSE;
++}
++
++/* The child's window rect in the root's content view space, in Win32 pixels: the child's rect
++ * in the root's client coordinates, offset the way macdrv_client_surface_update() places a
++ * same-process child's view. FALSE when the child is gone. A hidden child gets an empty rect,
++ * which hides its layer. */
++static BOOL get_remote_layer_frame(struct macdrv_win_data *data, HWND child, RECT *frame)
++{
++    UINT dpi = NtUserGetWinMonitorDpi(data->hwnd, MDT_RAW_DPI);
++    RECT rect;
++
++    if (!NtUserGetWindowRect(child, &rect, dpi)) return FALSE;
++    if (!(NtUserGetWindowLongW(child, GWL_STYLE) & WS_VISIBLE))
++        SetRectEmpty(&rect);
++    else
++    {
++        NtUserMapWindowPoints(0, data->hwnd, (POINT *)&rect, 2, dpi);
++        OffsetRect(&rect, data->rects.client.left - data->rects.visible.left,
++                   data->rects.client.top - data->rects.visible.top);
++    }
++    *frame = rect;
++    return TRUE;
++}
++
++static CGRect cgrect_from_frame(const RECT *rect)
++{
++    return CGRectMake(rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top);
++}
++
++/* Retire every other hosted layer mirroring the same child, called once the replacement is in
++ * the layer tree. Retiring on the old swapchain's death instead leaves the child unhosted until
++ * the replacement's own message arrives, and the window shows straight through for that long. */
++static void retire_superseded_layers(struct macdrv_win_data *data, HWND child, unsigned int keep)
++{
++    CFIndex count, i;
++    const void **keys, **vals;
++
++    if (!data->remote_layer_children || !child) return;
++    if (!(count = CFDictionaryGetCount(data->remote_layer_children))) return;
++
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (!keys || !vals) { free(keys); free(vals); return; }
++    CFDictionaryGetKeysAndValues(data->remote_layer_children, keys, vals);
++
++    for (i = 0; i < count; i++)
++    {
++        unsigned int ctx = (unsigned int)(UINT_PTR)keys[i];
++
++        if (ctx == keep || (HWND)vals[i] != child) continue;
++        TRACE("retiring superseded layer ctx %u for child %p (replaced by %u)\n", ctx, child, keep);
++        if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, ctx);
++        CFDictionaryRemoveValue(data->remote_layer_children, (const void *)(UINT_PTR)ctx);
+     }
++    free(keys);
++    free(vals);
+ }
+ 
++/* The context id of this root's hosted layer for this child, or 0. */
++static unsigned int remote_layer_context_for(struct macdrv_win_data *data, HWND child)
++{
++    CFIndex count, i;
++    const void **keys, **vals;
++    unsigned int context_id = 0;
+ 
++    if (!data->remote_layer_children || !child) return 0;
++    if (!(count = CFDictionaryGetCount(data->remote_layer_children))) return 0;
++
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (keys && vals)
++    {
++        CFDictionaryGetKeysAndValues(data->remote_layer_children, keys, vals);
++        for (i = 0; i < count && !context_id; i++)
++            if ((HWND)vals[i] == child) context_id = (unsigned int)(UINT_PTR)keys[i];
++    }
++    free(keys);
++    free(vals);
++    return context_id;
++}
++
++/* Reposition one hosted layer. A child's own move only moves that child; refreshing every layer
++ * on the root for each child costs O(n) per child during a resize. The root's own
++ * WindowPosChanged still does the full pass. */
++static void update_remote_layer_frame_for(struct macdrv_win_data *data, HWND child,
++                                          unsigned int context_id)
++{
++    struct paint_order order;
++    RECT frame;
++    double zpos = 0.0;
++    BOOL have_z;
++
++    if (!data->cocoa_window || !child || !context_id) return;
++    if (!get_remote_layer_frame(data, child, &frame)) return;
++
++    build_paint_order(data->hwnd, &order);
++    have_z = paint_order_zpos(&order, child, &zpos);
++    paint_order_free(&order);
++
++    TRACE("child %p context %u frame %s zpos %.0f%s\n", child, context_id,
++          wine_dbgstr_rect(&frame), zpos, have_z ? "" : " (not in paint order)");
++    macdrv_window_update_ca_layer_host_frame(data->cocoa_window, context_id,
++                                             cgrect_from_frame(&frame), zpos, have_z);
++}
++
++/* Re-place every cross-process layer hosted on this window: they mirror children another process
++ * owns, so no WindowPosChanged of their own arrives here. */
++static void update_remote_layer_frames(struct macdrv_win_data *data)
++{
++    CFIndex count, i;
++    const void **keys, **vals;
++    struct paint_order order;
++
++    if (!data->remote_layer_children || !data->cocoa_window) return;
++    if (!(count = CFDictionaryGetCount(data->remote_layer_children))) return;
++
++    /* one walk for all of this window's hosted layers, not one per layer */
++    build_paint_order(data->hwnd, &order);
++
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (!keys || !vals) { free(keys); free(vals); paint_order_free(&order); return; }
++    CFDictionaryGetKeysAndValues(data->remote_layer_children, keys, vals);
++
++    for (i = 0; i < count; i++)
++    {
++        HWND child = (HWND)vals[i];
++        unsigned int context_id = (unsigned int)(UINT_PTR)keys[i];
++        double zpos = 0.0;
++        BOOL have_z;
++        RECT frame;
++
++        if (!child) continue;   /* a top-level's own layer fills the content view and autoresizes */
++        if (!get_remote_layer_frame(data, child, &frame))
++        {
++            /* the child is gone; left alone its layer would stay painted at its last frame */
++            TRACE("child %p gone, releasing hosted layer %u\n", child, context_id);
++            macdrv_window_release_ca_layer_host_view(data->cocoa_window, context_id);
++            CFDictionaryRemoveValue(data->remote_layer_children, (const void *)(UINT_PTR)context_id);
++            continue;
++        }
++        have_z = paint_order_zpos(&order, child, &zpos);
++
++        TRACE("child %p context %u frame %s zpos %.0f%s\n", child, context_id,
++              wine_dbgstr_rect(&frame), zpos, have_z ? "" : " (not in paint order)");
++        macdrv_window_update_ca_layer_host_frame(data->cocoa_window, context_id,
++                                                 cgrect_from_frame(&frame), zpos, have_z);
++    }
++    free(keys);
++    free(vals);
++    paint_order_free(&order);
++}
++
++/* WM_MACDRV_CREATE_REMOTE_LAYER: host the layer another process rendered into context_id,
++ * on the rect of child (0 for the window itself). */
++static void create_remote_layer(struct macdrv_win_data *data, HWND child, unsigned int context_id)
++{
++    struct paint_order order;
++    CGRect frame = CGRectNull;
++    double zpos = 0.0;
++    BOOL have_z;
++    RECT rect;
++
++    if (!data->cocoa_window) return;
++    if (child)
++    {
++        if (!get_remote_layer_frame(data, child, &rect))
++        {
++            /* the child went away between the post and this handler; with no rect the layer
++             * would cover the whole content view with nothing ever drawn into it */
++            TRACE("child %p gone before context %u could be hosted, not hosting\n", child, context_id);
++            return;
++        }
++        frame = cgrect_from_frame(&rect);
++        TRACE("child %p layer frame in root %p = %s\n", child, data->hwnd, wine_dbgstr_rect(&rect));
++    }
++
++    build_paint_order(data->hwnd, &order);
++    have_z = child && paint_order_zpos(&order, child, &zpos);
++    paint_order_free(&order);
++    macdrv_window_create_ca_layer_host_view(data->cocoa_window, context_id, frame, zpos, have_z);
++
++    /* Track every hosted layer: a child's so it can be repositioned, and a top-level's own
++     * (child NULL) so the release handler can tell "never tracked" from "already retired". */
++    if (!data->remote_layer_children)
++        data->remote_layer_children = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
++    if (data->remote_layer_children)
++    {
++        CFDictionarySetValue(data->remote_layer_children, (const void *)(UINT_PTR)context_id, child);
++        /* the replacement is hosted now, only now do its predecessors go */
++        if (child) retire_superseded_layers(data, child, context_id);
++    }
++}
++
++/* WM_MACDRV_RELEASE_REMOTE_LAYER: every hosted layer is tracked, so an untracked id is one
++ * retire_superseded_layers() already took, and skipping it keeps the two paths from racing
++ * over a reused id. */
++static void release_remote_layer(struct macdrv_win_data *data, unsigned int context_id)
++{
++    if (data->remote_layer_children &&
++        !CFDictionaryContainsKey(data->remote_layer_children, (const void *)(UINT_PTR)context_id))
++        return;
++    if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, context_id);
++    if (data->remote_layer_children)
++        CFDictionaryRemoveValue(data->remote_layer_children, (const void *)(UINT_PTR)context_id);
++}
++
++
+ /**********************************************************************
+  *              WindowMessage   (MACDRV.@)
+  */
+@@ -1617,6 +1993,30 @@
+         activate_on_following_focus();
+         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
+         return 0;
++    case WM_MACDRV_CREATE_REMOTE_LAYER:
++        if ((data = get_win_data(hwnd)))
++        {
++            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER child %p context_id %u\n", (HWND)wp, (unsigned int)lp);
++            create_remote_layer(data, (HWND)wp, (unsigned int)lp);
++            release_win_data(data);
++        }
++        return 0;
++    case WM_MACDRV_RELEASE_REMOTE_LAYER:
++        if ((data = get_win_data(hwnd)))
++        {
++            TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
++            release_remote_layer(data, (unsigned int)lp);
++            release_win_data(data);
++        }
++        return 0;
++    case WM_MACDRV_UPDATE_REMOTE_LAYER:
++        if ((data = get_win_data(hwnd)))
++        {
++            TRACE("WM_MACDRV_UPDATE_REMOTE_LAYER child %p\n", (HWND)wp);
++            update_remote_layer_frame_for(data, (HWND)wp, remote_layer_context_for(data, (HWND)wp));
++            release_win_data(data);
++        }
++        return 0;
+     }
+ 
+     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
+@@ -1624,6 +2024,20 @@
+ }
+ 
+ 
++/* Called from the rendering process. hwnd is the window whose owner hosts the layer, child the
++ * cross-process child it belongs to (NULL for the window itself). */
++void macdrv_create_remote_layer(void* hwnd_ptr, void* child_ptr, unsigned int context_id)
++{
++    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, (WPARAM)child_ptr, context_id);
++}
++
++
++void macdrv_release_remote_layer(void* hwnd_ptr, unsigned int context_id)
++{
++    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_RELEASE_REMOTE_LAYER, 0, context_id);
++}
++
++
+ /***********************************************************************
+  *              WindowPosChanging   (MACDRV.@)
+  */
+@@ -1692,8 +2106,31 @@
+     TRACE("win %p/%p new_rects %s style %08x flags %08x surface %p\n", hwnd, data->cocoa_window,
+           debugstr_window_rects(new_rects), new_style, swp_flags, surface);
+ 
+-    if (!data->cocoa_window) goto done;
++    if (!data->cocoa_window)
++    {
++        /* Highball: a child with a layer hosted on its root's window (Wine bug 60263) has win
++         * data but no Cocoa window, and its moves are only seen here, in its own thread. Either
++         * the root is ours (a foreign process's child re-parented into our window, or a child of
++         * another thread of ours) and the hosted layer is moved directly, or the root belongs to
++         * another process and that process is told. swp_flags are the effective flags, so a
++         * no-op call carries NOMOVE|NOSIZE|NOZORDER and costs nothing. */
++        HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
++        BOOL moved = (~swp_flags & (SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)) ||
++                     (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW));
++        BOOL remote = data->remote_swapchain;
+ 
++        release_win_data(data);
++        if (!moved || !root || root == hwnd) return;
++        if ((data = get_win_data(root)))
++        {
++            update_remote_layer_frame_for(data, hwnd, remote_layer_context_for(data, hwnd));
++            release_win_data(data);
++        }
++        else if (remote)
++            NtUserPostMessage(root, WM_MACDRV_UPDATE_REMOTE_LAYER, (WPARAM)hwnd, 0);
++        return;
++    }
++
+     if (data->on_screen)
+     {
+         if ((swp_flags & SWP_HIDEWINDOW) && !(new_style & WS_VISIBLE))
+@@ -1724,6 +2161,10 @@
+                 show_window(data);
+         }
+     }
++
++    /* after the Cocoa frame is current, so hosted cross-process layers are placed against the
++     * content view's new bounds rather than the ones it is about to leave */
++    update_remote_layer_frames(data);
+ 
+     if (fullscreen || fullscreen != data->fullscreen)
+     {
+@@ -1732,7 +2173,6 @@
+         data->fullscreen = fullscreen;
+     }
+ 
+-done:
+     release_win_data(data);
+ }
+ 
+--- a/dlls/winemac.drv/vulkan.c
++++ b/dlls/winemac.drv/vulkan.c
+@@ -52,8 +52,9 @@
+     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
+ 
+     if (!(surface = macdrv_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+-    if (!(surface->metal_device = macdrv_create_metal_device())) goto err;
+-    if (!(surface->metal_view = macdrv_view_create_metal_view(surface->cocoa_view, surface->metal_device))) goto err;
++    /* Highball: a swapchain in our own window, or a layer hosted by the window's owning process
++     * when that is another process (Wine bug 60263) */
++    if (!macdrv_client_surface_acquire_metal_swapchain(surface, NULL)) goto err;
+ 
+     if (instance->p_vkCreateMetalSurfaceEXT)
+     {
+@@ -61,7 +62,7 @@
+         create_info_host.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+         create_info_host.pNext = NULL;
+         create_info_host.flags = 0; /* reserved */
+-        create_info_host.pLayer = macdrv_view_get_metal_layer(surface->metal_view);
++        create_info_host.pLayer = macdrv_swapchain_get_layer(surface->metal_swapchain);
+ 
+         res = instance->p_vkCreateMetalSurfaceEXT(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
+     }
+@@ -71,7 +72,7 @@
+         create_info_host.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
+         create_info_host.pNext = NULL;
+         create_info_host.flags = 0; /* reserved */
+-        create_info_host.pView = macdrv_view_get_metal_layer(surface->metal_view);
++        create_info_host.pView = macdrv_swapchain_get_layer(surface->metal_swapchain);
+ 
+         res = instance->p_vkCreateMacOSSurfaceMVK(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
+     }
+--- a/dlls/winemac.drv/d3dmetal.c
++++ b/dlls/winemac.drv/d3dmetal.c
+@@ -26,6 +26,8 @@
+ 
+ #include "config.h"
+ 
++#include <pthread.h>
++
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "macdrv.h"
+@@ -92,6 +94,122 @@
+ void OnMainThread(dispatch_block_t block);
+ static void cf_client_surface_release(CFAllocatorRef allocator, const void *client_surface);
+ 
++/* Highball: cross-process swapchains (Wine bug 60263). A window whose root belongs to another
++ * process (a CEF GPU process presenting into the browser process's window: Steam, Rockstar,
++ * Ubisoft Connect) has no Cocoa view of ours to draw into. Its client surface renders into a
++ * CAContext-backed layer that the root's owner hosts, see
++ * macdrv_client_surface_acquire_metal_swapchain(). D3DMetal/DXMT are none the wiser: the
++ * surface's view is handed out as client_cocoa_view, doubles as the "metal view" handle, and the
++ * layer behind it is the offscreen swapchain's. Surfaces are keyed by that view, not by HWND: the
++ * same HWND is asked for a swapchain several times (CEF recreates it on every resize). */
++static pthread_mutex_t remote_layer_mutex = PTHREAD_MUTEX_INITIALIZER;
++static CFMutableDictionaryRef remote_layer_surfaces;   /* view -> client_surface D3DMetal/DXMT still uses */
++
++/* One retired surface held per child HWND. CAContextSwapChain's dealloc un-hosts the layer, and
++ * a client that resizes by destroying its swapchain and creating a new one would have nothing
++ * hosted between the two; so a released surface is held until the child's next release, which
++ * follows its successor's creation (the owner retires the old layer when the new one is hosted).
++ * A destroyed child never releases again, so a release whose child is gone is not held, and
++ * every release sweeps out dead slots. */
++static CFMutableDictionaryRef pending_by_child;        /* child HWND -> retired client_surface */
++
++static struct client_surface *remote_layer_surface_for_view(macdrv_view view)
++{
++    struct client_surface *client = NULL;
++
++    if (!view) return NULL;
++    pthread_mutex_lock(&remote_layer_mutex);
++    if (remote_layer_surfaces)
++        client = (struct client_surface *)CFDictionaryGetValue(remote_layer_surfaces, view);
++    pthread_mutex_unlock(&remote_layer_mutex);
++    return client;
++}
++
++static BOOL remote_layer_surface_add(struct macdrv_client_surface *surface)
++{
++    BOOL ret;
++
++    pthread_mutex_lock(&remote_layer_mutex);
++    if (!remote_layer_surfaces)
++        remote_layer_surfaces = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
++    if ((ret = remote_layer_surfaces && surface->cocoa_view))
++        CFDictionarySetValue(remote_layer_surfaces, surface->cocoa_view, &surface->client);
++    pthread_mutex_unlock(&remote_layer_mutex);
++    return ret;
++}
++
++/* The surface behind a view, removed from the table; NULL when the view is not one of ours. */
++static struct client_surface *remote_layer_surface_take(macdrv_view view)
++{
++    struct client_surface *client = NULL;
++
++    if (!view) return NULL;
++    pthread_mutex_lock(&remote_layer_mutex);
++    if (remote_layer_surfaces &&
++        (client = (struct client_surface *)CFDictionaryGetValue(remote_layer_surfaces, view)))
++        CFDictionaryRemoveValue(remote_layer_surfaces, view);
++    pthread_mutex_unlock(&remote_layer_mutex);
++    return client;
++}
++
++/* Remove every held surface whose child window no longer exists, for release outside the lock.
++ * Called with remote_layer_mutex held; at most max per call, the rest on the next release. */
++static CFIndex collect_dead_pending(struct client_surface **out, CFIndex max)
++{
++    CFIndex count, i, n = 0;
++    const void **keys, **vals;
++
++    if (!pending_by_child || !(count = CFDictionaryGetCount(pending_by_child))) return 0;
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (!keys || !vals) { free(keys); free(vals); return 0; }
++    CFDictionaryGetKeysAndValues(pending_by_child, keys, vals);
++    for (i = 0; i < count && n < max; i++)
++    {
++        if (NtUserIsWindow((HWND)keys[i])) continue;
++        out[n++] = (struct client_surface *)vals[i];
++        CFDictionaryRemoveValue(pending_by_child, keys[i]);
++    }
++    free(keys);
++    free(vals);
++    return n;
++}
++
++/* Retire the surface behind a view D3DMetal/DXMT is finished with; TRUE if the view was one of
++ * ours, so the caller falls through to the ordinary metal view release when it was not. */
++static BOOL release_remote_layer_view(macdrv_view view)
++{
++    struct client_surface *client, *drain = NULL;
++    struct client_surface *dead[16];
++    CFIndex ndead, i;
++    HWND owner;
++
++    if (!(client = remote_layer_surface_take(view))) return FALSE;
++
++    owner = client->hwnd;
++    pthread_mutex_lock(&remote_layer_mutex);
++    if (!pending_by_child)
++        pending_by_child = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
++    if (!pending_by_child || !owner || !NtUserIsWindow(owner))
++    {
++        /* no table, or the child is already gone and no successor will ever come: release now */
++        drain = client;
++    }
++    else
++    {
++        drain = (struct client_surface *)CFDictionaryGetValue(pending_by_child, owner);
++        CFDictionarySetValue(pending_by_child, owner, client);
++    }
++    ndead = collect_dead_pending(dead, ARRAY_SIZE(dead));
++    pthread_mutex_unlock(&remote_layer_mutex);
++
++    TRACE("view %p child %p: %s, draining %p and %ld dead-child slot(s)\n", view, owner,
++          drain == client ? "child gone, released now" : "held", drain, (long)ndead);
++    if (drain) client_surface_release(drain);
++    for (i = 0; i < ndead; i++) client_surface_release(dead[i]);
++    return TRUE;
++}
++
+ static void my_macdrv_init_display_devices(BOOL p1)
+ {
+     TRACE("macdrv_init_display_devices %d - no-op\n", p1);
+@@ -102,6 +220,7 @@
+     struct macdrv_win_data *data;
+     struct d3dmetal_macdrv_win_data *d3dm_data;
+     struct macdrv_client_surface *client_surface;
++    BOOL remote;
+     TRACE("get_win_data %p\n", hwnd);
+ 
+     /* Creating a client surface on each call to get_win_data() means it's no longer idempotent,
+@@ -111,9 +230,14 @@
+      */
+     client_surface = macdrv_client_surface_create(hwnd);
+ 
++    /* Highball: a window whose root another process owns gets a remote layer instead of a view
++     * in a window of ours; the layer is created once the renderer hands over its Metal device,
++     * in my_macdrv_view_create_metal_view(). */
++    remote = macdrv_window_has_foreign_root(hwnd, NULL);
++
+     /* get_win_data() needs to happen after client_surface creation to avoid deadlocks */
+     data = get_win_data(hwnd);
+-    if (!data)
++    if (!data && !remote)
+     {
+         client_surface_release((struct client_surface *)client_surface);
+         return NULL;
+@@ -121,34 +245,81 @@
+ 
+     macdrv_set_view_d3dmetal_client_surface(client_surface->cocoa_view, &client_surface->client);
+ 
+-    if (!data->d3dmetal_client_surfaces)
++    if (remote)
+     {
+-        static const CFArrayCallBacks callbacks = { .release = cf_client_surface_release };
+-        data->d3dmetal_client_surfaces = CFArrayCreateMutable(NULL, 0, &callbacks);
++        /* owned by the tables above, not by the window's data: the window may not have any */
++        if (!remote_layer_surface_add(client_surface))
++        {
++            release_win_data(data);
++            client_surface_release((struct client_surface *)client_surface);
++            return NULL;
++        }
++        TRACE("hwnd %p: root belongs to another process, surface %p view %p\n", hwnd,
++              client_surface, client_surface->cocoa_view);
+     }
+-    CFArrayAppendValue(data->d3dmetal_client_surfaces, client_surface);
++    else
++    {
++        if (!data->d3dmetal_client_surfaces)
++        {
++            static const CFArrayCallBacks callbacks = { .release = cf_client_surface_release };
++            data->d3dmetal_client_surfaces = CFArrayCreateMutable(NULL, 0, &callbacks);
++        }
++        CFArrayAppendValue(data->d3dmetal_client_surfaces, client_surface);
++    }
+ 
+     d3dm_data = calloc(1, sizeof(*d3dm_data));
+ 
+-    d3dm_data->hwnd = data->hwnd;
+-    d3dm_data->cocoa_window = data->cocoa_window;
++    d3dm_data->hwnd = hwnd;
+     /* cocoa_view is no longer present in macdrv_win_data. D3DMetal doesn't use it. */
+     d3dm_data->client_cocoa_view = client_surface->cocoa_view;
+-    d3dm_data->window_rect = data->rects.window;
+-    d3dm_data->whole_rect = data->rects.visible;
+-    d3dm_data->client_rect = data->rects.client;
+-    d3dm_data->pixel_format = data->pixel_format;
+-    /* color_key is no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
+-    d3dm_data->drag_event = data->drag_event;
+-    d3dm_data->on_screen = data->on_screen;
+-    d3dm_data->shaped = data->shaped;
+-    d3dm_data->layered = data->layered;
+-    d3dm_data->ulw_layered = data->ulw_layered;
+-    d3dm_data->per_pixel_alpha = data->per_pixel_alpha;
+-    d3dm_data->minimized = data->minimized;
+-    /* swap_interval is no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
+-    /* surface/unminimized_surface are no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
+-    d3dm_data->padding[0] = data;
++    if (data)
++    {
++        d3dm_data->cocoa_window = data->cocoa_window;
++        d3dm_data->window_rect = data->rects.window;
++        d3dm_data->whole_rect = data->rects.visible;
++        d3dm_data->client_rect = data->rects.client;
++        d3dm_data->pixel_format = data->pixel_format;
++        /* color_key is no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
++        d3dm_data->drag_event = data->drag_event;
++        d3dm_data->on_screen = data->on_screen;
++        d3dm_data->shaped = data->shaped;
++        d3dm_data->layered = data->layered;
++        d3dm_data->ulw_layered = data->ulw_layered;
++        d3dm_data->per_pixel_alpha = data->per_pixel_alpha;
++        d3dm_data->minimized = data->minimized;
++        /* swap_interval is no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
++        /* surface/unminimized_surface are no longer present in macdrv_win_data. Assume D3DMetal doesn't use it. */
++    }
++    else
++    {
++        /* Highball: a window this process never positioned, owned by another process. The rects
++         * are the ones the driver would have recorded, relative to the parent's client area. */
++        HWND parent = NtUserGetAncestor(hwnd, GA_PARENT);
++        UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
++        RECT window_rect, client_rect;
++
++        if (NtUserGetWindowRect(hwnd, &window_rect, dpi))
++        {
++            if (parent) NtUserMapWindowPoints(0, parent, (POINT *)&window_rect, 2, dpi);
++            d3dm_data->window_rect = d3dm_data->whole_rect = window_rect;
++        }
++        if (NtUserGetClientRect(hwnd, &client_rect, dpi))
++        {
++            NtUserMapWindowPoints(hwnd, parent, (POINT *)&client_rect, 2, dpi);
++            d3dm_data->client_rect = client_rect;
++        }
++        d3dm_data->on_screen = !!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE);
++    }
++
++    if (remote)
++    {
++        /* Highball: nothing here needs the window's data locked while the renderer sets up, and
++         * the swapchain creation below waits on the main thread. */
++        release_win_data(data);
++        d3dm_data->padding[0] = NULL;
++    }
++    else
++        d3dm_data->padding[0] = data;
+ 
+     return d3dm_data;
+ }
+@@ -160,7 +331,7 @@
+     if (!data)
+         return;
+ 
+-    release_win_data(data->padding[0]);
++    if (data->padding[0]) release_win_data(data->padding[0]);
+     free(data);
+ }
+ 
+@@ -184,19 +355,47 @@
+ 
+ static macdrv_metal_view my_macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d)
+ {
++    struct client_surface *client;
++
+     TRACE("macdrv_view_create_metal_view %p %p\n", v, d);
++
++    /* Highball: a remote surface's view is a placeholder. The layer it hands out is the offscreen
++     * swapchain's, created here with the renderer's device, and the view itself is the handle
++     * the renderer gets back, so that get_metal_layer() and release_metal_view() find it. */
++    if ((client = remote_layer_surface_for_view(v)))
++    {
++        struct macdrv_client_surface *surface = impl_from_client_surface(client);
++
++        if (!macdrv_client_surface_acquire_metal_swapchain(surface, d))
++        {
++            ERR("no remote swapchain for %s\n", debugstr_client_surface(client));
++            if (remote_layer_surface_take(v)) client_surface_release(client);
++            return NULL;
++        }
++        return (macdrv_metal_view)v;
++    }
++
+     return macdrv_view_create_metal_view(v, d);
+ }
+ 
+ static macdrv_metal_layer my_macdrv_view_get_metal_layer(macdrv_metal_view v)
+ {
++    struct client_surface *client;
++
+     TRACE("macdrv_view_get_metal_layer %p\n", v);
++
++    if ((client = remote_layer_surface_for_view((macdrv_view)v)))
++        return macdrv_swapchain_get_layer(impl_from_client_surface(client)->metal_swapchain);
++
+     return macdrv_view_get_metal_layer(v);
+ }
+ 
+ static void my_macdrv_view_release_metal_view(macdrv_metal_view v)
+ {
+     TRACE("macdrv_view_release_metal_view %p\n", v);
++
++    if (release_remote_layer_view((macdrv_view)v)) return;
++
+     return macdrv_view_release_metal_view(v);
+ }
+ 
