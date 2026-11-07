@@ -29,6 +29,7 @@ enum Edition: String, CaseIterable, Identifiable {
     case xbox, steam
     var id: String { rawValue }
     var title: String { self == .xbox ? "Xbox / Microsoft Store" : "Steam" }
+    var shortTitle: String { self == .xbox ? "Xbox" : "Steam" }
 }
 
 /// The app's settings. Run from a development build (no bundle identifier), the same domain is used by name.
@@ -47,6 +48,9 @@ let logDirectory: URL = {
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }()
+
+/// Left by metalhorizon-play.sh when Xbox refused the saved sign-in during a run.
+var signInExpiredMarker: URL { logDirectory.appendingPathComponent("signin-expired") }
 
 /// ~/Library/Application Support/MetalHorizon: Blackwell Engine, D3DMetal and the DirectX 12 shim live here.
 /// MH_SUPPORT_DIR puts them elsewhere (the installer's tests use a throwaway folder).

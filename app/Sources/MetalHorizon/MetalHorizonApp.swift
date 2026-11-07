@@ -212,6 +212,9 @@ final class LauncherModel: ObservableObject {
     @Published var activity = Activity.idle
     @Published var status = "Ready."
     @Published var accountSaved = false
+    /// Xbox refused the saved sign-in during the last Play (metalhorizon-play.sh leaves this marker): the account step
+    /// is to do again, and a new sign-in clears it.
+    @Published var signInExpired = fileExists(signInExpiredMarker.path)
     @Published var installFraction: Double?
     @Published var steamStatus = SteamStatus()
     @Published var findings: [Finding] = []
@@ -242,6 +245,7 @@ final class LauncherModel: ObservableObject {
     private let gameTail = LogTail()
     private var runOutputTimer: Timer?
     private var steamTimer: Timer?
+    private var steamInstallOffered = false
     private var loginApplication: NSRunningApplication?
     private var loginObserver: NSObjectProtocol?
     private var loginStatusTimer: Timer?
@@ -278,18 +282,7 @@ final class LauncherModel: ObservableObject {
                   app.bundleIdentifier == "org.xodus-gaming.xodus-cli" else { return }
             Task { @MainActor in
                 guard let self, self.loginApplication?.processIdentifier == app.processIdentifier else { return }
-                self.loginApplication = nil
-                self.activity = .idle
-                self.readLoginStatus()
-                self.loginStatusTimer?.invalidate()
-                self.loginStatusTimer = nil
-                if self.status != "Xbox account connected."
-                    && self.status != "Microsoft sign-in returned a response Xbox could not accept."
-                    && self.status != "Xbox token exchange failed; the sign-in window has stopped."
-                    && self.status != "Microsoft sign-in was cancelled." {
-                    self.status = "The sign-in window closed before Xbox accepted the account."
-                }
-                self.refreshSavedAccountStatus(continueAfterSignIn: self.status == "Xbox account connected.")
+                self.finishSignIn()
             }
         }
         refreshSavedAccountStatus()
@@ -500,7 +493,7 @@ final class LauncherModel: ObservableObject {
         status = "Opening Microsoft sign-in…"
         loginStatusTimer?.invalidate()
         loginStatusTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.readLoginStatus() }
+            Task { @MainActor in self?.pollLogin() }
         }
         NSWorkspace.shared.openApplication(at: loginApp, configuration: configuration) { [weak self] app, error in
             Task { @MainActor in
@@ -515,6 +508,47 @@ final class LauncherModel: ObservableObject {
                 self.loginApplication = app
                 self.status = "Microsoft sign-in is open."
             }
+        }
+    }
+
+    /// Ends the sign-in, whichever comes first: the helper reporting an end state (complete, cancelled, refused),
+    /// or its window closing. The helper does not always quit after "complete", and its quit is not always seen:
+    /// waiting for it alone left the button on "Signing In…" after a successful sign-in.
+    private func finishSignIn() {
+        guard activity == .signIn else { return }
+        loginStatusTimer?.invalidate()
+        loginStatusTimer = nil
+        readLoginStatus()
+        if let app = loginApplication, !app.isTerminated { app.terminate() }
+        loginApplication = nil
+        activity = .idle
+        let connected = status == "Xbox account connected."
+        if !connected
+            && status != "Microsoft sign-in returned a response Xbox could not accept."
+            && status != "Xbox token exchange failed; the sign-in window has stopped."
+            && status != "Microsoft sign-in was cancelled." {
+            status = "The sign-in window closed before Xbox accepted the account."
+        }
+        if connected {
+            try? FileManager.default.removeItem(at: signInExpiredMarker)
+            signInExpired = false
+            // the running xodus-service still holds the old session: the next Play starts a fresh one
+            let stop = Process()
+            stop.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            stop.arguments = ["-f", "xodus-service"]
+            try? stop.run()
+        }
+        refreshSavedAccountStatus(continueAfterSignIn: connected)
+    }
+
+    /// The helper's end states: the sign-in is over whether or not its window is still open.
+    private static let loginEndStates: Set<String> = ["complete", "cancelled", "exchange_rejected", "exchange_failed"]
+
+    private func pollLogin() {
+        readLoginStatus()
+        let raw = (try? String(contentsOf: loginStatusFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if Self.loginEndStates.contains(raw) || loginApplication?.isTerminated == true {
+            finishSignIn()
         }
     }
 
@@ -568,16 +602,27 @@ final class LauncherModel: ObservableObject {
             await MainActor.run {
                 if self.steamStatus != parsed { self.steamStatus = parsed }
                 self.objectWillChange.send()
+                self.continueAfterSteamSignIn()
             }
         }
     }
 
+    /// Once the player has signed in in Steam's window and the game is not in the library, Steam's install window
+    /// for it opens by itself, once per launch of MetalHorizon.
+    private func continueAfterSteamSignIn() {
+        guard edition == .steam, !isBusy, !steamInstallOffered, steamStatus.clientRunning, steamStatus.clientMode == "window" else { return }
+        let files = setup.steam
+        guard files.signedInOnce, files.manifest == nil else { return }
+        installGameInSteam()
+    }
+
     private func runSteam(_ action: String, activity newActivity: Activity, statusText: String,
-                          finished: @escaping (Int32) -> String) {
+                          extra: [String: String] = [:], finished: @escaping (Int32) -> String) {
         guard let script = steamScript else { return }
         let gameInput = Controllers.gameInputEnabled(mode: controllerMode, connected: Controllers.connected())
         run(executable: URL(fileURLWithPath: "/bin/bash"), arguments: [script.path, action],
-            environment: setup.steamEnvironment(gameInput: gameInput), activity: newActivity, statusText: statusText,
+            environment: setup.steamEnvironment(gameInput: gameInput).merging(extra) { _, new in new },
+            activity: newActivity, statusText: statusText,
             logName: "steam-\(action)", finished: finished)
     }
 
@@ -596,8 +641,26 @@ final class LauncherModel: ObservableObject {
 
     func openSteam() {
         guard edition == .steam else { return }
+        // signed in and the game not in the library yet: Steam opens straight on its install window for the game
+        let files = setup.steam
+        if files.signedInOnce && files.manifest == nil {
+            installGameInSteam()
+            return
+        }
         runSteam("open", activity: .steam, statusText: "Opening Steam…") { code in
-            code == 0 ? "Steam is open. Sign in, then install Forza Horizon 6 from your Library." : "Steam did not open (error \(code)). What to do shows under the button."
+            code == 0 ? "Steam is open. Sign in: its install window for Forza Horizon 6 then opens by itself." : "Steam did not open (error \(code)). What to do shows under the button."
+        }
+    }
+
+    /// Steam's own install window for Forza Horizon 6 (steam://install/<appid>): Steam checks the licence and
+    /// downloads; the player only confirms there.
+    func installGameInSteam() {
+        guard edition == .steam else { return }
+        steamInstallOffered = true
+        runSteam("open", activity: .steam, statusText: "Opening Steam's install window for Forza Horizon 6…",
+                 extra: ["MH_STEAM_URL": "steam://install/\(steamAppID)"]) { code in
+            code == 0 ? "In Steam's window, click Install. Play lights up when the download is done (about 160 GB)."
+                      : "Steam did not open (error \(code)). What to do shows under the button."
         }
     }
 
@@ -751,7 +814,10 @@ final class LauncherModel: ObservableObject {
                     self.status += " Diagnosis: \(first.issue.title)."
                 }
                 self.session = nil
-                if logName == "play" || logName == "steam-play",
+                self.signInExpired = fileExists(signInExpiredMarker.path)
+                if logName == "play" && code == 87 {
+                    self.status = "Xbox no longer accepts the saved sign-in, so the game was stopped before it touched your save. Sign in again, then Play."
+                } else if logName == "play" || logName == "steam-play",
                    let info = LogStore.sessions().first(where: { $0.id == newSession.id }),
                    let report = CrashReport.make(info, edition: self.edition) {
                     self.offerCrashReport(report)

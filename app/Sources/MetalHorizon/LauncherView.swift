@@ -6,18 +6,18 @@ import SwiftUI
 
 /// The few values the window is drawn with; nothing below picks a colour or a size of its own.
 enum Theme {
-    /// One signal colour, a deep horizon blue: the next step and the road already travelled, nothing else.
-    /// 5.6:1 against white text in light mode, 4.4:1 in dark mode on the bold button label.
+    /// Industrial: graphite and black, no hue. The signal is a dark steel the white label reads on
+    /// (about 14:1 in light mode, 9:1 in dark mode).
     static let accent = Color(nsColor: NSColor(name: "MetalHorizonAccent") { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(srgbRed: 0.13, green: 0.45, blue: 0.93, alpha: 1)
-            : NSColor(srgbRed: 0.04, green: 0.38, blue: 0.85, alpha: 1)
+            ? NSColor(srgbRed: 0.28, green: 0.28, blue: 0.30, alpha: 1)
+            : NSColor(srgbRed: 0.13, green: 0.13, blue: 0.14, alpha: 1)
     })
-    /// The sky behind the glass: the accent, faded towards the middle of the window.
+    /// Behind the glass: a cold steel haze, fading towards the middle of the window.
     static let sky = Color(nsColor: NSColor(name: "MetalHorizonSky") { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(srgbRed: 0.10, green: 0.30, blue: 0.75, alpha: 0.45)
-            : NSColor(srgbRed: 0.35, green: 0.62, blue: 1.00, alpha: 0.30)
+            ? NSColor(srgbRed: 0.45, green: 0.46, blue: 0.48, alpha: 0.35)
+            : NSColor(srgbRed: 0.40, green: 0.41, blue: 0.43, alpha: 0.30)
     })
     static let track = Color(nsColor: .separatorColor)
     static let panel = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
@@ -59,20 +59,18 @@ struct LauncherView: View {
         .tint(Theme.accent)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Picker("Edition", selection: $model.edition) {
-                    ForEach(Edition.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 300)
-                .disabled(model.isBusy)
-                .help("Which copy of Forza Horizon 6 you own")
+                EditionSwitch(edition: $model.edition)
+                    .disabled(model.isBusy)
+            }
+            if #available(macOS 26, *) {
+                ToolbarSpacer(.flexible)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { showActivity.toggle() } label: { Label("Activity", systemImage: "sidebar.right") }
                     .help("Show or hide the activity log")
             }
         }
+        .hidingToolbarTitle()
         .inspector(isPresented: $showActivity) {
             ActivityInspector(model: model)
                 .inspectorColumnWidth(min: 300, ideal: 380, max: 640)
@@ -164,15 +162,15 @@ struct LauncherView: View {
                     } label: {
                         Label(Setup.tildePath(model.gameDirectory.isEmpty ? "~/FH6" : model.gameDirectory), systemImage: "folder")
                     }
-                    .buttonStyle(.link)
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
                     .help("Where the game is. Click to choose another folder.")
                     .disabled(model.isBusy)
                 } else if model.setup.steam.installed {
                     Button("Open Steam", action: model.openSteam)
-                        .buttonStyle(.link)
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
                         .disabled(model.isBusy && model.activity != .game)
                     Button("Stop Steam", action: model.stopSteam)
-                        .buttonStyle(.link)
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
                         .disabled(model.isBusy || !model.steamStatus.clientRunning)
                 }
             }
@@ -190,11 +188,44 @@ struct LauncherView: View {
         return SettingsLink {
             Label(text, systemImage: pads.first?.kind == "Racing wheel" ? "steeringwheel" : "gamecontroller")
         }
-        .buttonStyle(.link)
+        .buttonStyle(.plain).foregroundStyle(.secondary)
         .foregroundStyle(pads.isEmpty ? .secondary : .primary)
         .help(pads.isEmpty
               ? "Xbox, PlayStation, Switch Pro, 8BitDo and most USB or Bluetooth pads work. Plug one in before Play."
               : pads.map { "\($0.name): \($0.route)" }.joined(separator: "\n"))
+    }
+}
+
+// MARK: - The edition switch
+
+/// Which copy you own, in the middle of the toolbar: two short, equal segments; the full names are in the tooltip. On macOS 26 the toolbar draws it in glass.
+struct EditionSwitch: View {
+    @Binding var edition: Edition
+
+    var body: some View {
+        Picker("Edition", selection: $edition) {
+            ForEach(Edition.allCases) { item in
+                Text(item.shortTitle).tag(item)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 190)
+        .help("Which copy of Forza Horizon 6 you own: \(Edition.allCases.map(\.title).joined(separator: " or "))")
+        .accessibilityLabel("Edition")
+    }
+}
+
+extension View {
+    /// The window's name stays for the Window menu and Mission Control; the bar itself shows only the switch, since
+    /// the window already opens on the game's name.
+    @ViewBuilder
+    func hidingToolbarTitle() -> some View {
+        if #available(macOS 15, *) {
+            self.toolbar(removing: .title)
+        } else {
+            self
+        }
     }
 }
 
@@ -369,7 +400,7 @@ struct AttentionList: View {
             HStack {
                 Spacer()
                 Button("Report an Issue…", action: report)
-                    .buttonStyle(.link)
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
                     .font(.callout)
             }
             .padding(12)
@@ -481,7 +512,7 @@ struct WelcomeSheet: View {
 
             HStack {
                 Button("Support MetalHorizon…", action: model.openSupportPage)
-                    .buttonStyle(.link)
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
                 Spacer()
                 Button("Continue", action: model.finishWelcome)
                     .compactPrimaryButton()

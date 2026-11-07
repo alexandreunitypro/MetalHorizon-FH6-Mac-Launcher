@@ -181,10 +181,14 @@ cmd_install() {
 
 cmd_open() {
     [ -f "$STEAM_EXE" ] || mh_fail "Steam is not installed in this prefix: Install Steam first"
+    # MH_STEAM_URL: a steam:// link Steam opens once it is up, such as steam://install/2483190 (Steam's own install
+    # window for the game, its licence checked by Steam). Only steam:// links are passed on.
+    local url="${MH_STEAM_URL:-}"
+    case "$url" in steam://*) ;; *) url="" ;; esac
     case "$(client_mode)" in
         window)
-            echo "== Steam is running: bringing its window up"
-            ( join_live_sync; "$ENGINE/bin/wine" "$STEAM_WIN" "steam://open/main" >> "$LOGS/steam-forward.log" 2>&1 & )
+            echo "== Steam is running: ${url:+opening $url, }bringing its window up"
+            ( join_live_sync; "$ENGINE/bin/wine" "$STEAM_WIN" "${url:-steam://open/main}" >> "$LOGS/steam-forward.log" 2>&1 & )
             return 0 ;;
         game)
             if [ -n "$(game_pids)" ]; then
@@ -198,7 +202,7 @@ cmd_open() {
     echo "== opening Steam (DXMT, sync off). Log: $LOGS/steam-window.log"
     mh_print_env
     mark window none
-    ( cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" > "$LOGS/steam-window.log" 2>&1 & )
+    ( cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" ${url:+"$url"} > "$LOGS/steam-window.log" 2>&1 & )
     sleep 3
     echo "Steam is starting. Its first start updates the client and can look frozen for a while."
 }

@@ -118,6 +118,22 @@ final class ScriptTests: XCTestCase {
         XCTAssertTrue(status.engine32bit)
     }
 
+    /// Open with MH_STEAM_URL hands Steam its own install link for the game; anything but a steam:// link is dropped.
+    func testSteamOpensOnTheGamesInstallWindow() throws {
+        var env = try fakeComponents(i386: true)
+        env["MH_PREFIX"] = root.appendingPathComponent("Steam prefix").path
+        try touch("Steam prefix/drive_c/Program Files (x86)/Steam/steam.exe")
+        let log = root.appendingPathComponent("logs/steam-window.log")
+        env["MH_STEAM_URL"] = "steam://install/2483190"
+        var (code, out) = try run("metalhorizon-steam.sh", ["open"], env: env)
+        XCTAssertEqual(code, 0, out)
+        XCTAssertTrue(try String(contentsOf: log, encoding: .utf8).contains("steam://install/2483190"))
+        env["MH_STEAM_URL"] = "https://example.com/x"
+        (code, out) = try run("metalhorizon-steam.sh", ["open"], env: env)
+        XCTAssertEqual(code, 0, out)
+        XCTAssertFalse(try String(contentsOf: log, encoding: .utf8).contains("example.com"))
+    }
+
     func testSteamRefusesAnEngineWithout32BitHalf() throws {
         var env = try fakeComponents(i386: false)
         env["MH_PREFIX"] = root.appendingPathComponent("p").path
@@ -128,6 +144,10 @@ final class ScriptTests: XCTestCase {
     }
 
     /// mh_run_game relaunches once after the Neural Engine failure, then stops on the clean run.
+    func testInvalidProfileIsRecognized() {
+        XCTAssertTrue(Diagnostics.scan(text: "Code d'erreur : E:43-1b-4", source: "t").contains { $0.id == "forza-invalid-profile" })
+    }
+
     func testRelaunchAfterNeuralEngineFailure() throws {
         let env = try fakeComponents(i386: false)
         let counter = root.appendingPathComponent("count").path

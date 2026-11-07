@@ -14,8 +14,8 @@ Say which copy you own when it first opens. From then on the window has **one bu
 step**, and a line that shows how far along you are:
 - **Xbox / Microsoft Store**: Install the Engine, Sign In with Microsoft (on Microsoft's own page), Download the Game,
   **Play**. A copy already on the Mac or on an external disk is found by itself.
-- **Steam**: Install the Engine, Install Steam (in its own Wine prefix), Open Steam to sign in and install the game
-  from your Library, **Play** (the game starts through Steam).
+- **Steam**: Install the Engine, Install Steam (in its own Wine prefix), Open Steam and sign in there; Steam's own
+  install window for the game then opens by itself, click Install, then **Play** (the game starts through Steam).
 
 MetalHorizon installs [Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine) and Apple's D3DMetal
 by itself (after you accept Apple's licence). No CrossOver, nothing to download by hand. Controllers (Xbox,

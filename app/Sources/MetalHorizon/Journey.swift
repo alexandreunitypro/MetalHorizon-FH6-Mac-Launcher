@@ -33,7 +33,7 @@ extension LauncherModel {
         switch edition {
         case .xbox:
             done = [("engine", "Engine", componentsDone),
-                    ("account", "Account", accountSaved),
+                    ("account", "Account", accountSaved && !signInExpired),
                     ("game", "Game", setup.gameCheck.ok)]
         case .steam:
             done = [("engine", "Engine", componentsDone),
@@ -59,6 +59,10 @@ extension LauncherModel {
         }
         switch edition {
         case .xbox:
+            if signInExpired {
+                return NextStep(action: .signIn, title: "Sign In Again", symbol: "person.crop.circle.badge.exclamationmark",
+                                hint: "Xbox no longer accepts the saved sign-in. Your profile and saves are safe; sign in again on Microsoft's page.")
+            }
             if !accountSaved {
                 return NextStep(action: .signIn, title: "Sign In with Microsoft", symbol: "person.crop.circle",
                                 hint: "On Microsoft's own page. MetalHorizon never sees your password.")
@@ -74,13 +78,15 @@ extension LauncherModel {
             }
             if !setup.steam.signedInOnce {
                 return NextStep(action: .openSteam, title: "Open Steam", symbol: "macwindow",
-                                hint: "Sign in in Steam's window. Its first start updates Steam and can take 20 minutes.")
+                                hint: "Sign in in Steam's window; its first start updates Steam and can take 20 minutes. The game's install window follows by itself.")
             }
             if !setup.steamGameCheck.ok {
-                return NextStep(action: .openSteam, title: "Open Steam", symbol: "macwindow",
-                                hint: setup.steam.manifest != nil
-                                    ? "Steam is still downloading Forza Horizon 6. Play lights up when it is done."
-                                    : "Install Forza Horizon 6 from your Steam Library. Play lights up when it is done.")
+                if setup.steam.manifest != nil {
+                    return NextStep(action: .openSteam, title: "Open Steam", symbol: "macwindow",
+                                    hint: "Steam is downloading Forza Horizon 6. Play lights up when it is done.")
+                }
+                return NextStep(action: .openSteam, title: "Install the Game", symbol: "icloud.and.arrow.down",
+                                hint: "Steam's own install window for Forza Horizon 6. Click Install there.")
             }
         }
         return NextStep(action: .play, title: "Play", symbol: "play.fill", hint: quit)
