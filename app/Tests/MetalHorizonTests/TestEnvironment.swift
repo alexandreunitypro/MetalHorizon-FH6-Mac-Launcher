@@ -11,6 +11,7 @@ enum TestEnvironment {
         done = true
         try? FileManager.default.removeItem(at: root)
         setenv("MH_SUPPORT_DIR", root.path, 1)
+        setenv("MH_LOG_DIR", root.appendingPathComponent("Logs").path, 1)   // before logDirectory is first read
         if ProcessInfo.processInfo.environment["MH_TEST_DOWNLOAD"] != nil {
             unsetenv("MH_COMPONENTS_DIR")      // like a new Mac: from the public release over the network
         } else if ProcessInfo.processInfo.environment["MH_COMPONENTS_DIR"] == nil {

@@ -299,8 +299,13 @@ final class LauncherModel: ObservableObject {
         return edition == .xbox ? setup.gameCheck.ok : setup.steamClientCheck.ok
     }
 
-    /// The checks before Play and what the last run left, recomputed off the main thread.
+    /// The checks before Play and what the last run left, recomputed off the main thread. A game package left behind
+    /// by a move is put back first (Setup.repairXboxPackage).
     func refreshChecks() {
+        if edition == .xbox, !isBusy, ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil,
+           let note = Setup.repairXboxPackage(in: gameDirectory) {
+            status = note
+        }
         let current = setup
         Task.detached(priority: .utility) {
             let items = Diagnostics.preflight(current)

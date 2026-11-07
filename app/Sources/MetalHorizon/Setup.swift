@@ -40,8 +40,10 @@ func fileExists(_ path: String) -> Bool { FileManager.default.fileExists(atPath:
 
 func expandTilde(_ path: String) -> String { (path as NSString).expandingTildeInPath }
 
+/// ~/Library/Logs/MetalHorizon; MH_LOG_DIR puts it elsewhere (the tests use a throwaway folder).
 let logDirectory: URL = {
-    let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MetalHorizon")
+    let dir = ProcessInfo.processInfo.environment["MH_LOG_DIR"].map { URL(fileURLWithPath: $0) }
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MetalHorizon")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }()
@@ -132,17 +134,53 @@ struct Setup {
     }
 
     /// Where the Xbox package went when it did not move with the game: the usual places, a real file of some size.
-    static func findXboxPackage(besides folder: String) -> String? {
+    /// Returns its real path (links resolved).
+    static func findXboxPackage(besides folder: String, searching: [String]? = nil) -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let parent = (folder as NSString).deletingLastPathComponent
-        for dir in [home + "/Desktop", home + "/FH6", home + "/Downloads", home + "/Documents", parent] where dir != folder {
-            let path = dir + "/.xodus-streaming.msixvc"
-            let real = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        let places = searching ?? [home + "/Desktop", home + "/FH6", home + "/Downloads", home + "/Documents", parent]
+        for dir in places where dir != folder {
+            let real = URL(fileURLWithPath: dir + "/.xodus-streaming.msixvc").resolvingSymlinksInPath().path
+            guard real != URL(fileURLWithPath: folder + "/.xodus-streaming.msixvc").resolvingSymlinksInPath().path else { continue }
             if let size = (try? FileManager.default.attributesOfItem(atPath: real))?[.size] as? Int64, size > 100_000_000 {
-                return real.replacingOccurrences(of: home, with: "~")
+                return real
             }
         }
         return nil
+    }
+
+    static func tildePath(_ path: String) -> String {
+        path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
+    }
+
+    /// The package left behind when the game files were moved (seen on a player's Mac: the game in ~/Documents, its
+    /// package still on the Desktop) goes back into the game folder by itself, when that is safe: the game is there
+    /// without its package, one real package was found in the usual places, and it is on the same disk, so the move is
+    /// a rename (instant, nothing copied, nothing deleted). A link stays at the old place for anything that used it.
+    /// Returns what was done, or nil when nothing was (nothing to do, or not safe: then the Setup line explains it).
+    static func repairXboxPackage(in folder: String, searching: [String]? = nil) -> String? {
+        let fm = FileManager.default
+        let target = folder + "/.xodus-streaming.msixvc"
+        guard !folder.isEmpty, fileExists(folder + "/forzahorizon6.exe"), !fileExists(target),
+              let source = findXboxPackage(besides: folder, searching: searching) else { return nil }
+        let volume: (String) -> AnyHashable? = { path in
+            (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? AnyHashable
+        }
+        guard let a = volume(source), let b = volume(folder), a == b else { return nil }
+        // a dangling link where the package belongs (left by an earlier move) is replaced; it points nowhere
+        if (try? fm.destinationOfSymbolicLink(atPath: target)) != nil { try? fm.removeItem(atPath: target) }
+        do {
+            try fm.moveItem(atPath: source, toPath: target)
+        } catch {
+            return nil
+        }
+        try? fm.createSymbolicLink(atPath: source, withDestinationPath: target)
+        let note = "Moved the game's package (.xodus-streaming.msixvc) from \(tildePath((source as NSString).deletingLastPathComponent)) into the game folder; a link stays at the old place."
+        let log = logDirectory.appendingPathComponent("repairs.log")
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(source) -> \(target)\n"
+        if let handle = try? FileHandle(forWritingTo: log) { handle.seekToEndOfFile(); handle.write(Data(line.utf8)); try? handle.close() }
+        else { try? line.write(to: log, atomically: true, encoding: .utf8) }
+        return note
     }
 
     /// Steam installs carry steam_api64.dll and live under steamapps/common; the Xbox edition has neither.
@@ -178,8 +216,9 @@ struct Setup {
             let moved = (try? FileManager.default.destinationOfSymbolicLink(atPath: package)).map { " (its link points to \($0), which is gone)" } ?? ""
             let interrupted = fileExists(gameDirectory + "/.xodus-streaming-tmp.msixvc")
                 ? " The .xodus-streaming-tmp.msixvc here is what an interrupted download leaves, not the package." : ""
-            let found = Setup.findXboxPackage(besides: gameDirectory).map { " It is at \($0): move it into this folder (Finder: Cmd-Shift-. shows hidden files)." }
-                ?? " Move it here, or Download from Xbox again."
+            let found = Setup.findXboxPackage(besides: gameDirectory).map {
+                " It is at \(Setup.tildePath($0)), on another disk: move it into this folder (Finder: Cmd-Shift-. shows hidden files)."
+            } ?? " Move it here, or Download from Xbox again."
             return Check(ok: false, text: gameDirectory + " · the game's package is missing",
                          fix: "The hidden file .xodus-streaming.msixvc is not in this folder\(moved): it did not move with the game files.\(interrupted)\(found)")
         }

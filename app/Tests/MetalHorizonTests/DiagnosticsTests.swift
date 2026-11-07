@@ -154,6 +154,36 @@ final class DiagnosticsTests: XCTestCase {
                        "SDL2 → Xbox layout")
     }
 
+    // MARK: - Repairs
+
+    func testXboxPackageLeftBehindIsMovedBack() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("pkg-\(UUID().uuidString)").path
+        defer { try? fm.removeItem(atPath: root) }
+        let game = root + "/Documents/FORZA HORIZON 6", desktop = root + "/Desktop"
+        try fm.createDirectory(atPath: game, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: desktop, withIntermediateDirectories: true)
+        fm.createFile(atPath: game + "/forzahorizon6.exe", contents: Data("MZ".utf8))
+        fm.createFile(atPath: game + "/.xodus-streaming-tmp.msixvc", contents: Data(count: 10))
+        // a sparse file stands for the 1 GB package
+        let package = desktop + "/.xodus-streaming.msixvc"
+        fm.createFile(atPath: package, contents: nil)
+        let handle = try XCTUnwrap(FileHandle(forWritingAtPath: package))
+        try handle.truncate(atOffset: 200_000_000)
+        try handle.close()
+
+        XCTAssertFalse(Setup(gameDirectory: game).xboxGameCheck.ok)
+        XCTAssertNil(Setup.repairXboxPackage(in: game, searching: [root + "/nowhere"]), "nothing found, nothing moved")
+        let note = try XCTUnwrap(Setup.repairXboxPackage(in: game, searching: [desktop]))
+        XCTAssertTrue(note.contains("Moved"), note)
+        let attributes = try fm.attributesOfItem(atPath: game + "/.xodus-streaming.msixvc")
+        XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeRegular, "the package itself, not a link")
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: package), game + "/.xodus-streaming.msixvc", "a link stays behind")
+        XCTAssertTrue(fileExists(game + "/.xodus-streaming-tmp.msixvc"), "nothing else is touched")
+        XCTAssertNil(Setup.repairXboxPackage(in: game, searching: [desktop]), "a second run does nothing")
+        XCTAssertFalse(Setup(gameDirectory: game).xboxGameCheck.text.contains("missing"))
+    }
+
     // MARK: - Crash reports
 
     func testCrashMessageAndBacktraceFromWinedbg() {

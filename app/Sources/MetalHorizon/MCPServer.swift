@@ -302,6 +302,13 @@ enum MCPServer {
                 "key": ["type": "string", "enum": settingKeys],
                 "value": ["type": "string", "description": "A folder path (~ allowed), true/false, a number, or an enum value"]
              ], required: ["key", "value"], readOnly: false, handler: setSetting),
+        Tool(name: "repair_game_package", title: "Put the game's package back",
+             description: "Xbox edition: when the game folder has the game but not its package (.xodus-streaming.msixvc, left behind when the files were moved), finds it in the usual places and moves it back when it is on the same disk (a rename; a link stays at the old place). The app does the same by itself when it opens.",
+             readOnly: false, handler: { _ in
+                 let setup = Setup.load()
+                 if let note = Setup.repairXboxPackage(in: setup.gameDirectory) { return note }
+                 return "Nothing to do: \(redact(setup.xboxGameCheck.text))\(setup.xboxGameCheck.fix.map { ". " + $0 } ?? "")"
+             }),
         Tool(name: "xodus_service", title: "xodus-service",
              description: "Xbox edition: status, start or stop of xodus-service, the helper that holds the Xbox sign-in and gives the game its tokens. Without it: 'Cloud save synchronization failed' and no online play. Do not stop it while the game runs.",
              properties: ["action": ["type": "string", "enum": ["status", "start", "stop"]]],
