@@ -74,7 +74,7 @@ helper_pids() { prefix_processes | awk -F'\t' 'tolower($2) ~ /(steam\.exe|steamw
 game_pids() { prefix_processes | awk -F'\t' 'tolower($2) ~ /forzahorizon6\.exe/ {print $1}'; }
 client_mode() {   # game (msync + D3DMetal: started by play) or window (started by open), empty when none runs
     [ -n "$(client_pids)" ] || return 0
-    if [ "$(cut -d' ' -f1 "$MARKER" 2>/dev/null)" = game ]; then echo game; else echo window; fi
+    case "$(cut -d' ' -f1 "$MARKER" 2>/dev/null)" in game|direct) echo game ;; *) echo window ;; esac
 }
 live_sync() {   # msync or none: the mode of the server running in the prefix; empty when nothing runs
     [ -n "$(prefix_pids)" ] || return 0
@@ -127,7 +127,7 @@ stop_client() {
     if [ -z "$(game_pids)" ]; then
         "$ENGINE/bin/wineserver" -w >/dev/null 2>&1 & local w=$!
         for n in $(seq 20); do kill -0 "$w" 2>/dev/null || break; sleep 0.5; done
-        kill "$w" 2>/dev/null
+        { kill "$w" && wait "$w"; } 2>/dev/null
         [ -z "$(prefix_pids)" ] && "$ENGINE/bin/wineserver" -k 2>/dev/null
     fi
     return 0
@@ -210,6 +210,110 @@ manifest_value() {   # manifest_value <key>: a value of this game's appmanifest,
     done
 }
 
+STRATEGY_FILE="$PREFIX/.metalhorizon-steam-strategy"
+
+# The Steam client's own errors since <offset> in its output: a Steam client given D3DMetal for its web views aborts
+# ("NSViewBackingLayer setDisplaySyncEnabled", a player's M4 on macOS 27.2).
+client_aborted() {
+    tail -c +$(( ${2:-0} + 1 )) "$1" 2>/dev/null | grep -q -E 'setDisplaySyncEnabled|Terminating app due to uncaught exception'
+}
+
+# wait_for_game <log> <offset> <minutes>: 0 when the game runs, 1 when the client aborted or vanished, 2 on timeout.
+wait_for_game() {
+    local log="$1" offset="$2" limit=$(( $3 * 60 )) waited=0 gone=0
+    until [ -n "$(game_pids)" ]; do
+        sleep 2; waited=$((waited + 2))
+        [ $((waited % 60)) -eq 0 ] && echo "  waiting for the game to start ($((waited / 60)) min; Steam may be updating or signing in)"
+        client_aborted "$log" "$offset" && { echo "  the Steam client stopped with an error"; return 1; }
+        # Steam restarts itself after an update: only a client gone for 20 s in a row counts
+        if [ -z "$(client_pids)" ]; then gone=$((gone + 1)); else gone=0; fi
+        [ "$gone" -ge 10 ] && [ "$waited" -gt 30 ] && { echo "  the Steam client stopped"; return 1; }
+        [ "$waited" -ge "$limit" ] && return 2
+    done
+    return 0
+}
+
+# run_and_watch <offset> <start>: the game's run, the Neural Engine relaunch decision. 0 done, 3 relaunch.
+game_finished() {
+    local offset="$1" start="$2" attempt="$3" elapsed
+    while [ -n "$(game_pids)" ]; do sleep 2; done
+    elapsed=$(( $(date +%s) - start ))
+    echo "== game closed after ${elapsed}s"
+    if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 150 ] && mh_ane_failure "$GAME_LOG" "$offset"; then
+        echo "== D3DMetal stopped while preparing the Neural Engine (com.apple.appleneuralengine Code=26): relaunching"
+        mh_mark_retried "$GAME_LOG"; sleep 3; return 3
+    fi
+    [ "$elapsed" -ge 150 ] && mh_ane_failure "$GAME_LOG" "$offset" && mh_mark_retried "$GAME_LOG" harmless
+    return 0
+}
+
+# First way: Steam starts the game (-applaunch), from a silent client in game mode. Its web views run without the GPU
+# (-cef-disable-gpu): with it, they would draw through D3DMetal, which aborts on their windows; only the game, which
+# inherits the client's environment, needs D3DMetal. Returns 1 when Steam could not start the game.
+play_applaunch() {
+    local attempt=0 start offset code minutes=30
+    # someone who signed in already does not need 30 minutes: a hidden Steam dialog would wait forever
+    [ -f "$STEAM_DIR/config/loginusers.vdf" ] && grep -q '"AccountName"' "$STEAM_DIR/config/loginusers.vdf" && minutes=5
+    minutes="${MH_WAIT_MINUTES:-$minutes}"
+    # a client kept for the second way runs on DXMT: the game would inherit it
+    [ "$(cut -d' ' -f1 "$MARKER" 2>/dev/null)" = direct ] && stop_client && end_leftovers msync
+    while :; do
+        attempt=$((attempt + 1)); start=$(date +%s)
+        : >> "$GAME_LOG"; offset=$(mh_size "$GAME_LOG")
+        if [ -n "$(client_pids)" ]; then
+            echo "== launch $attempt: asking the running Steam client"
+            ( join_live_sync; "$ENGINE/bin/wine" "$STEAM_WIN" -applaunch "$APPID" >> "$LOGS/steam-forward.log" 2>&1 & )
+        else
+            echo "== launch $attempt: a silent Steam client (web views without GPU) starts the game. Steam output: $GAME_LOG"
+            mark game msync
+            ( cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" -silent -cef-disable-gpu -cef-disable-gpu-compositing \
+                -applaunch "$APPID" >> "$GAME_LOG" 2>&1 & )
+        fi
+        wait_for_game "$GAME_LOG" "$offset" "$minutes"; code=$?
+        [ "$code" -eq 0 ] || return 1
+        echo "== game started (through Steam). Quit it from its own menu; Steam stays open in the background."
+        game_finished "$offset" "$start" "$attempt"
+        [ $? -eq 3 ] && continue
+        return 0
+    done
+}
+
+# Second way: Steam runs beside the game, silent, with its web views on DXMT as its window would be, and MetalHorizon
+# starts the game itself with D3DMetal. The game gets its Steam ticket from that client: SteamAppId and SteamGameId tell
+# its Steam library which game it is, as Steam does for the games it starts. From C:\Program Files (x86)\Steam, so
+# the game's path check passes.
+play_direct() {
+    local dir attempt=0 start offset code waited=0
+    dir="$(manifest_value installdir)"
+    [ -n "$dir" ] && [ -f "$STEAM_DIR/steamapps/common/$dir/forzahorizon6.exe" ] || mh_fail "the game's files are not in Steam's library folder (steamapps/common/$dir)"
+    if [ "$(cut -d' ' -f1 "$MARKER" 2>/dev/null)" != direct ] || [ -z "$(client_pids)" ]; then
+        [ -z "$(client_pids)" ] || stop_client
+        end_leftovers msync
+        echo "== starting Steam beside the game (silent, DXMT, msync)"
+        mark direct msync
+        ( window_env; export WINEMSYNC=1 WINEESYNC=0; cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" -silent >> "$GAME_LOG" 2>&1 & )
+        # the client signs in from its saved session; give it the time to be there for the game
+        until [ "$waited" -ge 45 ]; do
+            sleep 3; waited=$((waited + 3))
+            [ -n "$(client_pids)" ] && [ "$waited" -ge 20 ] && break
+        done
+        [ -n "$(client_pids)" ] || { mh_tail_errors "$GAME_LOG"; mh_fail "the Steam client did not start"; }
+    fi
+    export SteamAppId="$APPID" SteamGameId="$APPID" SteamOverlayGameId="$APPID"
+    while :; do
+        attempt=$((attempt + 1)); start=$(date +%s)
+        : >> "$GAME_LOG"; offset=$(mh_size "$GAME_LOG")
+        echo "== launch $attempt: MetalHorizon starts the game (D3DMetal), Steam beside it"
+        ( cd "$STEAM_DIR/steamapps/common/$dir" && exec "$ENGINE/bin/wine" "C:\\Program Files (x86)\\Steam\\steamapps\\common\\$dir\\forzahorizon6.exe" >> "$GAME_LOG" 2>&1 & )
+        wait_for_game "$GAME_LOG" "$offset" 2; code=$?
+        if [ "$code" -ne 0 ]; then mh_tail_errors "$GAME_LOG"; mh_fail "the game did not start"; fi
+        echo "== game started. Quit it from its own menu; Steam stays open in the background."
+        game_finished "$offset" "$start" "$attempt"
+        [ $? -eq 3 ] && continue
+        return 0
+    done
+}
+
 cmd_play() {
     [ -f "$STEAM_EXE" ] || mh_fail "Steam is not installed in this prefix: Install Steam first"
     local flags; flags="$(manifest_value StateFlags)"
@@ -219,7 +323,8 @@ cmd_play() {
     mh_game_env
     if [ -n "${MH_DRY_RUN:-}" ]; then
         export -p | sed -n 's/^declare -x //p' | grep -E '^(CX_|WINE|D3DM_|MTL_|HB_|DYLD_|MVK_)' | sort
-        echo "run: $ENGINE/bin/wine '$STEAM_WIN' -silent -applaunch $APPID"
+        echo "run: $ENGINE/bin/wine '$STEAM_WIN' -silent -cef-disable-gpu -cef-disable-gpu-compositing -applaunch $APPID"
+        echo "fallback: Steam silent on DXMT beside the game, then forzahorizon6.exe with SteamAppId=$APPID (strategy now: $(cat "$STRATEGY_FILE" 2>/dev/null || echo applaunch))"
         exit 0
     fi
     echo "== MetalHorizon Play, Steam edition (appid $APPID, build $(manifest_value buildid)), $(date '+%Y-%m-%d %H:%M:%S')"
@@ -231,41 +336,16 @@ cmd_play() {
         if [ "$(client_mode)" = window ]; then stop_client; fi
         end_leftovers msync
         mh_crash_to_log
-        local attempt=0 start
-        while :; do
-            attempt=$((attempt + 1)); start=$(date +%s)
-            : >> "$GAME_LOG"; local offset; offset=$(mh_size "$GAME_LOG")
-            if [ -n "$(client_pids)" ]; then
-                echo "== launch $attempt: asking the running Steam client"
-                ( join_live_sync; "$ENGINE/bin/wine" "$STEAM_WIN" -applaunch "$APPID" >> "$LOGS/steam-forward.log" 2>&1 & )
-            else
-                echo "== launch $attempt: starting a silent Steam client, which then starts the game. Steam output: $GAME_LOG"
-                mark game msync
-                ( cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" -silent -applaunch "$APPID" >> "$GAME_LOG" 2>&1 & )
-            fi
-            local waited=0 gone=0 limit=$(( ${MH_WAIT_MINUTES:-30} * 60 ))
-            until [ -n "$(game_pids)" ]; do
-                sleep 2; waited=$((waited + 2))
-                [ $((waited % 60)) -eq 0 ] && echo "  waiting for Steam to start the game ($((waited / 60)) min; Steam may be updating or signing in)"
-                # Steam restarts itself after an update: only a client gone for 20 s in a row counts
-                if [ -z "$(client_pids)" ]; then gone=$((gone + 1)); else gone=0; fi
-                if [ "$gone" -ge 10 ] && [ "$waited" -gt 30 ]; then
-                    mh_tail_errors "$GAME_LOG"; mh_fail "the Steam client stopped before starting the game"
-                fi
-                [ "$waited" -ge "$limit" ] && mh_fail "Steam did not start the game within ${MH_WAIT_MINUTES:-30} minutes. Open Steam: it may be waiting for you (sign-in, an update, a licence agreement)."
-            done
-            echo "== game started. Quit it from its own menu; Steam stays open in the background."
-            while [ -n "$(game_pids)" ]; do sleep 2; done
-            local elapsed=$(( $(date +%s) - start ))
-            echo "== game closed after ${elapsed}s"
-            if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 150 ] && mh_ane_failure "$GAME_LOG" "$offset"; then
-                echo "== D3DMetal stopped while preparing the Neural Engine (com.apple.appleneuralengine Code=26): relaunching"
-                mh_mark_retried "$GAME_LOG"
-                sleep 3; continue
-            fi
-            [ "$elapsed" -ge 150 ] && mh_ane_failure "$GAME_LOG" "$offset" && mh_mark_retried "$GAME_LOG" harmless
-            break
-        done
+        local strategy
+        strategy="${MH_STEAM_STRATEGY:-$(cat "$STRATEGY_FILE" 2>/dev/null)}"
+        [ "$strategy" = direct ] || strategy=applaunch
+        if [ "$strategy" = applaunch ]; then
+            if play_applaunch; then echo applaunch > "$STRATEGY_FILE"; mh_tail_errors "$GAME_LOG"; return 0; fi
+            echo "== Steam could not start the game itself: MetalHorizon starts it, with Steam running beside it"
+            stop_client
+            end_leftovers msync
+        fi
+        play_direct && echo direct > "$STRATEGY_FILE"
     fi
     while [ -n "$(game_pids)" ]; do sleep 2; done
     mh_tail_errors "$GAME_LOG"

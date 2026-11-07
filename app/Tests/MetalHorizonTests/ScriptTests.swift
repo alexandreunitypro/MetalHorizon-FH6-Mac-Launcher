@@ -106,7 +106,8 @@ final class ScriptTests: XCTestCase {
         dry["MH_DRY_RUN"] = "1"
         (code, out) = try run("metalhorizon-steam.sh", ["play"], env: dry)
         XCTAssertEqual(code, 0, out)
-        XCTAssertTrue(out.contains("-silent -applaunch 2483190"), out)
+        XCTAssertTrue(out.contains("-silent -cef-disable-gpu -cef-disable-gpu-compositing -applaunch 2483190"), out)
+        XCTAssertTrue(out.contains("fallback: Steam silent on DXMT beside the game"), out)
         XCTAssertTrue(out.contains("WINEMSYNC=\"1\""), out)
         XCTAssertTrue(out.contains("CX_GRAPHICS_BACKEND=\"d3dmetal\""), out)
         XCTAssertTrue(out.contains("WINE_GAMEINPUT=\"1\""), out)
