@@ -131,6 +131,20 @@ struct Setup {
         fileExists(path + "/drive_c") && SteamFiles(prefix: path).installed
     }
 
+    /// Where the Xbox package went when it did not move with the game: the usual places, a real file of some size.
+    static func findXboxPackage(besides folder: String) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let parent = (folder as NSString).deletingLastPathComponent
+        for dir in [home + "/Desktop", home + "/FH6", home + "/Downloads", home + "/Documents", parent] where dir != folder {
+            let path = dir + "/.xodus-streaming.msixvc"
+            let real = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+            if let size = (try? FileManager.default.attributesOfItem(atPath: real))?[.size] as? Int64, size > 100_000_000 {
+                return real.replacingOccurrences(of: home, with: "~")
+            }
+        }
+        return nil
+    }
+
     /// Steam installs carry steam_api64.dll and live under steamapps/common; the Xbox edition has neither.
     static func looksLikeSteamGameFolder(_ path: String) -> Bool {
         fileExists(path + "/steam_api64.dll") || path.lowercased().contains("/steamapps/common/")
@@ -162,8 +176,12 @@ struct Setup {
         let package = gameDirectory + "/.xodus-streaming.msixvc"
         if fileExists(exe) && !fileExists(package) {
             let moved = (try? FileManager.default.destinationOfSymbolicLink(atPath: package)).map { " (its link points to \($0), which is gone)" } ?? ""
+            let interrupted = fileExists(gameDirectory + "/.xodus-streaming-tmp.msixvc")
+                ? " The .xodus-streaming-tmp.msixvc here is what an interrupted download leaves, not the package." : ""
+            let found = Setup.findXboxPackage(besides: gameDirectory).map { " It is at \($0): move it into this folder (Finder: Cmd-Shift-. shows hidden files)." }
+                ?? " Move it here, or Download from Xbox again."
             return Check(ok: false, text: gameDirectory + " · the game's package is missing",
-                         fix: "The hidden file .xodus-streaming.msixvc is not in this folder\(moved): it did not move with the game files. Move it here, or Download from Xbox again.")
+                         fix: "The hidden file .xodus-streaming.msixvc is not in this folder\(moved): it did not move with the game files.\(interrupted)\(found)")
         }
         if fileExists(exe) { return Check(ok: true, text: gameDirectory) }
         return Check(ok: false, text: gameDirectory + " · not downloaded yet",
