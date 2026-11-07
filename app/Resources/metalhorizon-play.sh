@@ -23,7 +23,7 @@ fi
 [ -e "$SOURCE/forzahorizon6.exe" ] || mh_fail "no forzahorizon6.exe in $SOURCE: download the game first"
 # xodus reads the game from its package; the files beside it are not enough (a game folder moved without it fails
 # with a bare "No such file or directory" panic in xodus-cli)
-[ -e "$SOURCE/.xodus-streaming.msixvc" ] || mh_fail "the game's package .xodus-streaming.msixvc is not in $SOURCE: it was not moved with the game files. Move it into this folder, or Download from Xbox again"
+[ -e "$SOURCE/.xodus-streaming.msixvc" ] || mh_fail "the game's package .xodus-streaming.msixvc is not in $SOURCE: it was not moved with the game files. Move it into this folder, or Download the Game again"
 PREFIX="$SOURCE/.blackwell-wine"                    # the prefix the working setup already has
 [ -d "$PREFIX" ] || PREFIX="$SOURCE/.metalhorizon-wine"
 PREFIX="${MH_PREFIX:-$PREFIX}"                      # tests: another prefix

@@ -5,21 +5,23 @@ Blackwell Engine (Wine) + xodus or Steam + Apple's D3DMetal, open source, no Cro
 
 ## Download
 
-**[MetalHorizon 0.4 (early alpha)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
+**[MetalHorizon 0.5 (early alpha)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
 right-click it → **Open** the first time (it is not notarized yet). From 0.4.0 on, the app updates itself: each time
 it opens, it checks these releases and installs a newer version once nothing is running, keeping your settings,
 sign-in, engines and game.
 
-Choose your edition at the top of the window; the app does the rest by itself. It installs
-[Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine) and Apple's D3DMetal (after you accept
-Apple's licence). Then:
-- **Xbox / Microsoft Store**: sign in on Microsoft's own page, click **Download from Xbox**, then **Play**.
-- **Steam**: click **Install Steam** (MetalHorizon installs Steam in its own Wine prefix), **Open Steam**, sign in
-  there and install the game from your Library, then **Play** (the game starts through Steam).
+Say which copy you own when it first opens. From then on the window has **one button that always does the next
+step**, and a line that shows how far along you are:
+- **Xbox / Microsoft Store**: Install the Engine, Sign In with Microsoft (on Microsoft's own page), Download the Game,
+  **Play**. A copy already on the Mac or on an external disk is found by itself.
+- **Steam**: Install the Engine, Install Steam (in its own Wine prefix), Open Steam to sign in and install the game
+  from your Library, **Play** (the game starts through Steam).
 
-No CrossOver, nothing to download by hand. Controllers (Xbox, PlayStation, Switch Pro, 8BitDo, generic pads) work
-through GameInput and SDL2. When something goes wrong, the **Diagnosis** box names the problem and the fix, and
-**Export Diagnostics** writes a zip (secrets removed) for a GitHub issue.
+MetalHorizon installs [Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine) and Apple's D3DMetal
+by itself (after you accept Apple's licence). No CrossOver, nothing to download by hand. Controllers (Xbox,
+PlayStation, Switch Pro, 8BitDo, generic pads) work through GameInput and SDL2. When something goes wrong, the
+window says what and how to fix it; the Activity panel shows the log, and **Export Diagnostics** writes a zip
+(secrets removed) for a GitHub issue.
 
 > **The Steam version just got released (0.4)!** **Prototype.** Tested on one Mac so far (M5 Pro, macOS 27). Known: stutter, black near foliage. The Xbox /
 > Microsoft Store edition is tested in game. The **Steam edition** is tested up to Steam's sign-in window (install,

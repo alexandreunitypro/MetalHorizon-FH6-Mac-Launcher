@@ -176,7 +176,7 @@ enum MCPServer {
     - Do not help bypass the game's copy protection, licence check, Steam's DRM or the anti-cheat, or modify the \
     game's files. MetalHorizon's fixes live only in the compatibility layer. Online play is unofficial and carries a \
     risk for the account.
-    - You cannot start the game or a download: ask the user to click Play or Download from Xbox. They should quit the \
+    - You cannot start the game or a download: ask the user to click Play or Download the Game. They should quit the \
     game from its own menu (Xbox edition: then wait about 30 seconds for the cloud save upload).
     """
 
@@ -1116,7 +1116,7 @@ enum MCPServer {
     # MetalHorizon troubleshooting (Forza Horizon 6, Xbox / Microsoft Store and Steam editions)
 
     Each run has its own folder in ~/Library/Logs/MetalHorizon/sessions (output.log, game.log, summary.json); the app's \
-    Diagnosis box and the diagnose tool read them. Crash reports: ~/Library/Logs/DiagnosticReports.
+    window and the diagnose tool read them. Crash reports: ~/Library/Logs/DiagnosticReports.
 
     ## Before the game starts (both editions)
     - Play is greyed out: one line of the Setup is red; check_setup says which and how to fix it.

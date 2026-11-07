@@ -195,7 +195,7 @@ struct Setup {
     var xboxGameCheck: Check {
         guard !gameDirectory.isEmpty else {
             return Check(ok: false, text: "Choose a folder with a short path, such as ~/FH6",
-                         fix: "Pick a real folder with a short path (~/FH6), not in iCloud Drive, then Download from Xbox.")
+                         fix: "Pick a real folder with a short path (~/FH6), not in iCloud Drive, then Download the Game.")
         }
         let resolved = URL(fileURLWithPath: gameDirectory).resolvingSymlinksInPath().path
         if resolved != gameDirectory {
@@ -218,13 +218,13 @@ struct Setup {
                 ? " The .xodus-streaming-tmp.msixvc here is what an interrupted download leaves, not the package." : ""
             let found = Setup.findXboxPackage(besides: gameDirectory).map {
                 " It is at \(Setup.tildePath($0)), on another disk: move it into this folder (Finder: Cmd-Shift-. shows hidden files)."
-            } ?? " Move it here, or Download from Xbox again."
+            } ?? " Move it here, or Download the Game again."
             return Check(ok: false, text: gameDirectory + " · the game's package is missing",
                          fix: "The hidden file .xodus-streaming.msixvc is not in this folder\(moved): it did not move with the game files.\(interrupted)\(found)")
         }
         if fileExists(exe) { return Check(ok: true, text: gameDirectory) }
         return Check(ok: false, text: gameDirectory + " · not downloaded yet",
-                     fix: "Sign in with Microsoft, then press Download from Xbox (about 160 GB).")
+                     fix: "Sign in with Microsoft, then press Download the Game (about 160 GB).")
     }
 
     var steamClientCheck: Check {
