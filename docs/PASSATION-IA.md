@@ -940,3 +940,75 @@ Essai sans traces (`WINEDEBUG=-all`, comme Play) : plus de 10 minutes de jeu, 6,
   `app/components.json`. Tant que le dépôt est privé, le téléchargement anonyme répond 404 ; l'app prend alors
   `~/Library/Application Support/MetalHorizon/Downloads/`.
 - `tools/jouer.sh` et `tools/mac_launch_fh6.sh` (outils de développement) utilisent encore CrossOver.app ; l'app non.
+
+### 13.1 Variante Steam (expérimentale, 31 octobre 2026)
+
+À la demande de l'utilisateur (« reprend du code Highball open source github », sans redirection vers Highball),
+MetalHorizon joue aussi l'édition **Steam** : un second moteur (`engine/series-steam` = les 9 patches +
+`0010`/`0011`, copiés **verbatim** de `highball-engine/patches/0006` et `0007`, LGPL-2.1-or-later,
+voir `engine/patches/ORIGIN-steam.md`) pour qu'une fenêtre de lanceur dessine au lieu de rester noire, puis
+l'installation de Steam lui-même (installeur officiel téléchargé depuis `cdn.steampowered.com`, sans compte) dans
+un préfixe séparé (`<jeu>/.blackwell-wine-steam`), et un lancement par `steam.exe -applaunch <appid>` pour que le
+client Steam reste présent dans le même préfixe (sans ça, Highball note que FH6 Steam se referme après ~12 s).
+
+**Construit et vérifié** : les deux patches s'appliquent sans conflit sur l'arbre déjà patché
+(`patch -p1 --dry-run`, propre) ; le moteur Steam compile (`engine/build.sh --series series-steam`, 550 Mo,
+`wine-11.0`) et s'empaquette (`blackwell-engine-steam-1.0.tar.xz`, sha256 `0726aecb...`). Les scripts
+`metalhorizon-install-steam.sh` et `metalhorizon-play-steam.sh` passent en `MH_DRY_RUN=1` avec des dossiers
+factices. **Non vérifié en jeu** : ce projet n'a pas de copie Steam de FH6 ; aucune garantie que ça marche dans
+Steam (connexion, téléchargement, lancement du jeu) n'a pu être obtenue au-delà de ces essais à sec.
+
+Changé par rapport à Highball : le compilateur PE reste llvm-mingw (pas mingw-w64 gcc comme Highball l'utilise
+pour la connexion Steam) — changer tout le compilateur PE du moteur est un chantier bien plus lourd, non testable
+sans jeu Steam, donc non entrepris ; rien ne prouve que llvm-mingw pose un problème ici.
+
+## 14. Version 0.4 : Steam corrigé, manettes, journaux, diagnostic, MCP (7 novembre 2026)
+
+Point de départ : le rapport d'un joueur Steam (macOS 27.2, M4 Pro) et les issues GitHub #1 à #3. Tout ce qui suit
+reprend la méthode de Highball (code ouvert : `highball` GPL-3.0, `highball-engine` LGPL, `highball-db` CC0).
+
+**Steam, cause par cause**
+- `curl (60)` sur `cdn.steampowered.com` : ce nom tombe sur un serveur Akamai générique sur certains réseaux (reproduit
+  ici même : le `network_check` du MCP donne l'erreur 60 sur ce nom et 200 sur les autres). Le script télécharge depuis
+  les miroirs de Valve (akamai, media, cloudflare, fastly) et vérifie « MZ » et la taille.
+- `syswow64\ntdll.dll c0000135` : le moteur Steam 1.0 était `--enable-archs=x86_64`. Le 1.1 est i386+x86_64, compilé
+  avec mingw-w64 gcc (`i386_CFLAGS` SSE2 de Highball). Le patch 0013 garde les diagnostics x86_64 de 0005 hors du 32 bits.
+- Fenêtre noire : la v0.80 de DXMT refuse `CreateSwapChain` inter-processus. Le build DXMT de Highball (commit 331c552)
+  l'accepte avec `DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN=1`, avec le patch 0011 côté winemac. Mesuré : fenêtre de connexion
+  créée et visible (700×440, `WasHidden 0`), GPU actif (ANGLE), aucun « fond transparent » ni « 0×0 ».
+- Police absente puis « division par zéro » dans Steam : `nohup` (binaire protégé par SIP) retire `DYLD_LIBRARY_PATH`,
+  donc le moteur perd FreeType. Les scripts lancent en arrière-plan sans `nohup`.
+- `wineserver -k` à chaque Play (perte de connexion), mélange msync / sans msync (`msync_init Failed`) : le client Steam
+  est arrêté par `steam.exe -shutdown`, chaque commande rejoint le mode du serveur vivant. Le mode du client (fenêtre ou
+  jeu) est écrit dans `<préfixe>/.metalhorizon-steam-mode`, car l'environnement d'un processus Wine n'est pas lisible
+  (Wine écrit sa ligne de commande Windows par-dessus). Les processus d'un préfixe se reconnaissent à leur dossier de
+  travail (`lsof -d cwd`), comme le `ProcessTable` de Highball.
+- Jeu : client silencieux en msync + D3DMetal (`steam.exe -silent -applaunch 2483190`), qui démarre le jeu. Le préfixe
+  Steam est à MetalHorizon (`~/Library/Application Support/MetalHorizon/Steam`) : le jeu part de `C:\Program Files (x86)\
+  Steam\steamapps\common\ForzaHorizon6` (court), ce qui règle « Installation path is too long ».
+- **Non vérifié en jeu** : pas de copie Steam. Vérifié : installation (27 s), mise à jour de Steam, fenêtre, passage
+  fenêtre → mode jeu → fenêtre, arrêt propre (7 s), tout cela avec le moteur 1.1.
+
+**Manettes** : FH6 (GDK) lit les manettes par GameInput, un bouchon dans Wine (E_NOTIMPL). Patch 0012 : GameInput v0/v1/v2
+sur XInput 1.4 (4 manettes), plus un clavier et une souris (`GetAsyncKeyState`, `GetCursorPos`), actif seulement avec
+`WINE_GAMEINPUT=1` : l'app le met quand une manette est branchée (réglage Automatique / Toujours / Désactivé). Testé avec
+`tools/gameinputprobe` (création, QueryInterface v2, énumération bloquante, lectures, désinscription) ; pas encore avec
+une manette dans le jeu. SDL2 2.32.10 est dans les deux moteurs (winebus `bus_sdl.c`).
+
+**Journaux** : un dossier par lancement (`sessions/<date>-<type>/output.log, game.log, summary.json`), la sortie du jeu
+n'est plus jetée (`/dev/null`), rotation (40 dossiers, 1,5 Go), lecture incrémentale (`LogTail`), bruit MoltenVK coupé
+(`MVK_CONFIG_LOG_LEVEL=1` et filtre). `Diagnostics.swift` : plus de 30 problèmes connus (motif → cause → correction),
+contrôles avant Play (macOS, Rosetta, mémoire, app en quarantaine ou translocée, lien de jeu cassé, iCloud, espace,
+Steam macOS), export zip expurgé, issue GitHub pré-remplie. Relance automatique sur l'échec ANE de D3DMetal
+(`com.apple.appleneuralengine Code=26`), en ne regardant que la partie du journal écrite par le dernier lancement.
+
+**MCP** : 25 outils (diagnose, explain_error, list_known_issues, list_sessions, read_session, search_logs,
+read_crash_reports, export_diagnostics, network_check, check_components, steam_status, steam_control, list_controllers,
+prefix_info, get_settings, set_setting…), des ressources (`metalhorizon://setup`, `known-issues`, `guide`, journaux) et
+6 prompts. Les Steam ID et noms de compte sont expurgés en plus des jetons, e-mails, XUID et gamertags.
+
+**Tests** : 19 tests (`swift test`), dont les lignes exactes du rapport et des issues, la relance ANE, les essais à blanc
+des scripts. Bug trouvé par les tests : la relance ANE relisait l'ancienne ligne d'erreur et relançait une fois de trop.
+
+**Piste suivante** : le moteur arm64 de Highball (FEX, `previewRoute` de la recette FH6) donne 30 i/s réguliers sans le
+à-coup de Rosetta, avec 32 Go minimum. Non intégré.

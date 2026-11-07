@@ -1,0 +1,1625 @@
+/*
+ * GameInput, on top of XInput (gamepads) and the desktop's key and cursor state
+ *
+ * Copyright 2024 Rémi Bernon for CodeWeavers
+ * Copyright 2026 MetalHorizon contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/*
+ * Games built with Microsoft's GDK read their controllers through GameInput. Wine's gameinput.dll was a stub
+ * (GameInputCreate returned E_NOTIMPL), so such a game saw no controller at all while XInput saw it fine.
+ *
+ * This implementation serves the three published interface versions (v0, v1, v2: GameInputCreate hands out the
+ * v0 object and the GDK's C++ headers QueryInterface it for theirs) from:
+ *   - XInput 1.4 for gamepads: four slots, so every pad Wine's winebus.sys maps to XInput (Xbox pads directly,
+ *     PlayStation, Switch and generic pads through SDL2's mappings);
+ *   - GetAsyncKeyState and GetCursorPos for one keyboard and one mouse, so a game that switches its keyboard
+ *     to GameInput once GameInputCreate succeeds keeps working.
+ *
+ * It is off unless WINE_GAMEINPUT=1 is set: with it off the stub's behaviour is kept, which is what every game
+ * that works today was tested with. MetalHorizon sets the variable when the player turns controller support on.
+ * Readings are snapshots: no history (GetPreviousReading finds nothing), no raw HID reports, no force feedback
+ * beyond the four rumble motors XInput has.
+ */
+
+#include <stddef.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define COBJMACROS
+#include "windef.h"
+#include "winbase.h"
+#include "winuser.h"
+#include "xinput.h"
+
+#include "initguid.h"
+#include "gameinput.h"
+#include "wine/debug.h"
+#include "wine/list.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(ginput);
+
+#define MAX_PADS 4
+#define MAX_KEYS 32
+
+enum device_type { DEVICE_GAMEPAD, DEVICE_KEYBOARD, DEVICE_MOUSE };
+
+struct device
+{
+    v0_IGameInputDevice v0_iface;
+    v1_IGameInputDevice v1_iface;
+    v2_IGameInputDevice v2_iface;
+    enum device_type type;
+    DWORD slot;
+    GameInputKind kind;
+    BOOL connected;
+    uint64_t timestamp;
+    uint64_t sequence;
+    DWORD packet;
+    GameInputGamepadState gamepad;
+    GameInputSystemButtons system_buttons;
+    UINT key_count;
+    GameInputKeyState keys[MAX_KEYS];
+    GameInputMouseButtons mouse_buttons;
+    int64_t mouse_x, mouse_y, cursor_x, cursor_y;
+    char name[64];
+    GameInputString v0_name;
+    v0_GameInputDeviceInfo v0_info;
+    v1_GameInputDeviceInfo v1_info;
+    v2_GameInputDeviceInfo v2_info;
+    v0_GameInputKeyboardInfo v0_keyboard;
+    v1_GameInputKeyboardInfo v1_keyboard;
+    v0_GameInputMouseInfo v0_mouse;
+    v1_GameInputMouseInfo v1_mouse;
+};
+
+struct reading
+{
+    v0_IGameInputReading v0_iface;
+    v1_IGameInputReading v1_iface;
+    v2_IGameInputReading v2_iface;
+    LONG ref;
+    struct device *device;
+    GameInputKind kind;
+    uint64_t timestamp;
+    uint64_t sequence;
+    GameInputGamepadState gamepad;
+    UINT key_count;
+    GameInputKeyState keys[MAX_KEYS];
+    GameInputMouseButtons mouse_buttons;
+    int64_t mouse_x, mouse_y, cursor_x, cursor_y;
+};
+
+enum callback_type { CALLBACK_DEVICE, CALLBACK_READING, CALLBACK_SYSTEM_BUTTON, CALLBACK_KEYBOARD_LAYOUT };
+
+struct callback
+{
+    struct list entry;
+    GameInputCallbackToken token;
+    enum callback_type type;
+    int version;
+    struct device *device;
+    GameInputKind kind;
+    GameInputDeviceStatus filter;
+    void *context;
+    void *function;
+    BOOL stopped;
+    BOOL enumerate;
+};
+
+struct gameinput
+{
+    v0_IGameInput v0_iface;
+    v1_IGameInput v1_iface;
+    v2_IGameInput v2_iface;
+    LONG ref;
+};
+
+static struct gameinput gameinput;
+static struct device pads[MAX_PADS], keyboard, mouse;
+static struct list callbacks = LIST_INIT( callbacks );
+static GameInputCallbackToken next_token = 1;
+static HANDLE worker;
+static BOOL shutting_down;
+
+static CRITICAL_SECTION state_cs;
+static CRITICAL_SECTION_DEBUG state_cs_debug =
+{
+    0, 0, &state_cs,
+    { &state_cs_debug.ProcessLocksList, &state_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": state_cs") }
+};
+static CRITICAL_SECTION state_cs = { &state_cs_debug, -1, 0, 0, 0, 0 };
+
+/* Held while callbacks run, so that UnregisterCallback returns only once none of them is running. */
+static CRITICAL_SECTION dispatch_cs;
+static CRITICAL_SECTION_DEBUG dispatch_cs_debug =
+{
+    0, 0, &dispatch_cs,
+    { &dispatch_cs_debug.ProcessLocksList, &dispatch_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": dispatch_cs") }
+};
+static CRITICAL_SECTION dispatch_cs = { &dispatch_cs_debug, -1, 0, 0, 0, 0 };
+
+static DWORD (WINAPI *pXInputGetState)( DWORD, XINPUT_STATE * );
+static DWORD (WINAPI *pXInputSetState)( DWORD, XINPUT_VIBRATION * );
+static DWORD (WINAPI *pXInputGetCapabilitiesEx)( DWORD, DWORD, DWORD, XINPUT_CAPABILITIES_EX * );
+
+static const GameInputGamepadInfo gamepad_info =
+{
+    GameInputLabelXboxMenu, GameInputLabelXboxView, GameInputLabelXboxA, GameInputLabelXboxB,
+    GameInputLabelXboxX, GameInputLabelXboxY, GameInputLabelXboxDPadUp, GameInputLabelXboxDPadDown,
+    GameInputLabelXboxDPadLeft, GameInputLabelXboxDPadRight, GameInputLabelXboxLeftShoulder,
+    GameInputLabelXboxRightShoulder, GameInputLabelXboxLeftStickButton, GameInputLabelXboxRightStickButton,
+};
+
+static BOOL gameinput_enabled(void)
+{
+    char value[8];
+    DWORD len = GetEnvironmentVariableA( "WINE_GAMEINPUT", value, sizeof(value) );
+    return len && len < sizeof(value) && value[0] == '1';
+}
+
+static uint64_t current_timestamp(void)
+{
+    LARGE_INTEGER counter, frequency;
+    QueryPerformanceCounter( &counter );
+    QueryPerformanceFrequency( &frequency );
+    return (counter.QuadPart / frequency.QuadPart) * 1000000
+           + (counter.QuadPart % frequency.QuadPart) * 1000000 / frequency.QuadPart;
+}
+
+static float thumb_value( SHORT value )
+{
+    float ret = value / 32767.0f;
+    return ret < -1.0f ? -1.0f : ret;
+}
+
+static GameInputGamepadButtons gamepad_buttons( WORD buttons )
+{
+    static const struct { WORD xinput; GameInputGamepadButtons gameinput; } map[] =
+    {
+        { XINPUT_GAMEPAD_START, GameInputGamepadMenu },
+        { XINPUT_GAMEPAD_BACK, GameInputGamepadView },
+        { XINPUT_GAMEPAD_A, GameInputGamepadA },
+        { XINPUT_GAMEPAD_B, GameInputGamepadB },
+        { XINPUT_GAMEPAD_X, GameInputGamepadX },
+        { XINPUT_GAMEPAD_Y, GameInputGamepadY },
+        { XINPUT_GAMEPAD_DPAD_UP, GameInputGamepadDPadUp },
+        { XINPUT_GAMEPAD_DPAD_DOWN, GameInputGamepadDPadDown },
+        { XINPUT_GAMEPAD_DPAD_LEFT, GameInputGamepadDPadLeft },
+        { XINPUT_GAMEPAD_DPAD_RIGHT, GameInputGamepadDPadRight },
+        { XINPUT_GAMEPAD_LEFT_SHOULDER, GameInputGamepadLeftShoulder },
+        { XINPUT_GAMEPAD_RIGHT_SHOULDER, GameInputGamepadRightShoulder },
+        { XINPUT_GAMEPAD_LEFT_THUMB, GameInputGamepadLeftThumbstick },
+        { XINPUT_GAMEPAD_RIGHT_THUMB, GameInputGamepadRightThumbstick },
+    };
+    GameInputGamepadButtons ret = GameInputGamepadNone;
+    unsigned int i;
+    for (i = 0; i < ARRAY_SIZE(map); i++) if (buttons & map[i].xinput) ret |= map[i].gameinput;
+    return ret;
+}
+
+static void set_device_id( APP_LOCAL_DEVICE_ID *id, enum device_type type, DWORD slot )
+{
+    memset( id, 0, sizeof(*id) );
+    memcpy( id->value, "MetalHorizonGI", 14 );
+    id->value[16] = type;
+    id->value[17] = slot;
+}
+
+static void fill_device_info( struct device *device, WORD vid, WORD pid, WORD version )
+{
+    GameInputDeviceFamily family = vid == 0x045e ? GameInputFamilyXboxOne : GameInputFamilyHid;
+    GameInputUsage usage = { 0x01, device->type == DEVICE_GAMEPAD ? 0x05 : device->type == DEVICE_KEYBOARD ? 0x06 : 0x02 };
+    GameInputRumbleMotors rumble = device->type == DEVICE_GAMEPAD ? GameInputRumbleLowFrequency | GameInputRumbleHighFrequency : GameInputRumbleNone;
+    GameInputSystemButtons system = device->type == DEVICE_GAMEPAD ? GameInputSystemButtonGuide : GameInputSystemButtonNone;
+
+    device->v0_name.sizeInBytes = strlen( device->name ) + 1;
+    device->v0_name.codePointCount = strlen( device->name );
+    device->v0_name.data = device->name;
+
+    memset( &device->v0_info, 0, sizeof(device->v0_info) );
+    device->v0_info.infoSize = sizeof(device->v0_info);
+    device->v0_info.vendorId = vid;
+    device->v0_info.productId = pid;
+    device->v0_info.revisionNumber = version;
+    device->v0_info.usage = usage;
+    set_device_id( &device->v0_info.deviceId, device->type, device->slot );
+    device->v0_info.deviceRootId = device->v0_info.deviceId;
+    device->v0_info.deviceFamily = family;
+    device->v0_info.supportedInput = device->kind;
+    device->v0_info.supportedRumbleMotors = rumble;
+    device->v0_info.displayName = &device->v0_name;
+    device->v0_info.supportedSystemButtons = system;
+
+    memset( &device->v1_info, 0, sizeof(device->v1_info) );
+    device->v1_info.vendorId = vid;
+    device->v1_info.productId = pid;
+    device->v1_info.usage = usage;
+    device->v1_info.deviceId = device->v0_info.deviceId;
+    device->v1_info.deviceRootId = device->v0_info.deviceId;
+    device->v1_info.deviceFamily = family;
+    device->v1_info.supportedInput = device->kind;
+    device->v1_info.supportedRumbleMotors = rumble;
+    device->v1_info.supportedSystemButtons = system;
+    device->v1_info.displayName = device->name;
+    device->v1_info.pnpPath = "";
+
+    memset( &device->v2_info, 0, sizeof(device->v2_info) );
+    device->v2_info.vendorId = vid;
+    device->v2_info.productId = pid;
+    device->v2_info.revisionNumber = version;
+    device->v2_info.usage = usage;
+    device->v2_info.deviceId = device->v0_info.deviceId;
+    device->v2_info.deviceRootId = device->v0_info.deviceId;
+    device->v2_info.deviceFamily = family;
+    device->v2_info.supportedInput = device->kind;
+    device->v2_info.supportedRumbleMotors = rumble;
+    device->v2_info.supportedSystemButtons = system;
+    device->v2_info.displayName = device->name;
+    device->v2_info.pnpPath = "";
+
+    switch (device->type)
+    {
+    case DEVICE_GAMEPAD:
+        device->v0_info.gamepadInfo = &gamepad_info;
+        device->v1_info.gamepadInfo = &gamepad_info;
+        device->v2_info.gamepadInfo = &gamepad_info;
+        break;
+    case DEVICE_KEYBOARD:
+        device->v0_keyboard.kind = GameInputUnknownKeyboard;
+        device->v0_keyboard.layout = HandleToULong( GetKeyboardLayout( 0 ) );
+        device->v0_keyboard.keyCount = 104;
+        device->v0_keyboard.functionKeyCount = 12;
+        device->v0_keyboard.maxSimultaneousKeys = MAX_KEYS;
+        device->v1_keyboard.kind = device->v0_keyboard.kind;
+        device->v1_keyboard.layout = device->v0_keyboard.layout;
+        device->v1_keyboard.keyCount = device->v0_keyboard.keyCount;
+        device->v1_keyboard.functionKeyCount = device->v0_keyboard.functionKeyCount;
+        device->v1_keyboard.maxSimultaneousKeys = MAX_KEYS;
+        device->v0_info.keyboardInfo = &device->v0_keyboard;
+        device->v1_info.keyboardInfo = &device->v1_keyboard;
+        device->v2_info.keyboardInfo = &device->v1_keyboard;
+        break;
+    case DEVICE_MOUSE:
+        device->v0_mouse.supportedButtons = GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton
+                                            | GameInputMouseButton4 | GameInputMouseButton5;
+        device->v0_mouse.sampleRate = 125;
+        device->v0_mouse.sensorDpi = 800;
+        device->v1_mouse.supportedButtons = device->v0_mouse.supportedButtons;
+        device->v1_mouse.sampleRate = 125;
+        device->v0_info.mouseInfo = &device->v0_mouse;
+        device->v1_info.mouseInfo = &device->v1_mouse;
+        device->v2_info.mouseInfo = &device->v1_mouse;
+        break;
+    }
+}
+
+static const char *pad_name( WORD vid )
+{
+    switch (vid)
+    {
+    case 0x045e: return "Xbox Controller";
+    case 0x054c: return "PlayStation Controller";
+    case 0x057e: return "Nintendo Switch Controller";
+    case 0x2dc8: return "8BitDo Controller";
+    case 0x0f0d: return "HORI Controller";
+    case 0x0e6f: return "PDP Controller";
+    case 0x24c6: return "PowerA Controller";
+    case 0x046d: return "Logitech Controller";
+    case 0x044f: return "Thrustmaster Controller";
+    case 0x0eb7: return "Fanatec Controller";
+    default: return "Controller";
+    }
+}
+
+/* All the update functions are called with state_cs held. */
+
+static void update_pad( struct device *pad, uint64_t now )
+{
+    XINPUT_CAPABILITIES_EX caps;
+    XINPUT_STATE state;
+    BOOL connected;
+
+    connected = pXInputGetState && !pXInputGetState( pad->slot, &state );
+    if (connected && !pad->connected)
+    {
+        WORD vid = 0x045e, pid = 0x02ff, version = 0;
+        if (pXInputGetCapabilitiesEx && !pXInputGetCapabilitiesEx( 1, pad->slot, 0, &caps ))
+        {
+            if (caps.VendorId) vid = caps.VendorId;
+            if (caps.ProductId) pid = caps.ProductId;
+            version = caps.VersionNumber;
+        }
+        lstrcpynA( pad->name, pad_name( vid ), sizeof(pad->name) );
+        fill_device_info( pad, vid, pid, version );
+        pad->packet = ~0u;
+        TRACE( "pad %lu connected, %04x:%04x %s\n", pad->slot, vid, pid, pad->name );
+    }
+    else if (!connected && pad->connected)
+    {
+        TRACE( "pad %lu disconnected\n", pad->slot );
+        memset( &pad->gamepad, 0, sizeof(pad->gamepad) );
+        pad->system_buttons = GameInputSystemButtonNone;
+    }
+    pad->connected = connected;
+    if (!connected || state.dwPacketNumber == pad->packet) return;
+
+    pad->packet = state.dwPacketNumber;
+    pad->gamepad.buttons = gamepad_buttons( state.Gamepad.wButtons );
+    pad->gamepad.leftTrigger = state.Gamepad.bLeftTrigger / 255.0f;
+    pad->gamepad.rightTrigger = state.Gamepad.bRightTrigger / 255.0f;
+    pad->gamepad.leftThumbstickX = thumb_value( state.Gamepad.sThumbLX );
+    pad->gamepad.leftThumbstickY = thumb_value( state.Gamepad.sThumbLY );
+    pad->gamepad.rightThumbstickX = thumb_value( state.Gamepad.sThumbRX );
+    pad->gamepad.rightThumbstickY = thumb_value( state.Gamepad.sThumbRY );
+    /* XInputGetStateEx reports the guide button as 0x0400 */
+    pad->system_buttons = (state.Gamepad.wButtons & 0x0400) ? GameInputSystemButtonGuide : GameInputSystemButtonNone;
+    pad->timestamp = now;
+    pad->sequence++;
+}
+
+static void update_keyboard( uint64_t now )
+{
+    GameInputKeyState keys[MAX_KEYS];
+    UINT count = 0, vk, code;
+
+    for (vk = 1; vk < 255 && count < MAX_KEYS; vk++)
+    {
+        /* mouse buttons, and the generic modifiers that the left and right ones below already report */
+        if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_CANCEL || vk == VK_MBUTTON
+            || vk == VK_XBUTTON1 || vk == VK_XBUTTON2 || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU)
+            continue;
+        if (!(GetAsyncKeyState( vk ) & 0x8000)) continue;
+        keys[count].scanCode = MapVirtualKeyW( vk, MAPVK_VK_TO_VSC_EX );
+        code = MapVirtualKeyW( vk, MAPVK_VK_TO_CHAR );
+        keys[count].codePoint = code & 0x7fffffff;
+        keys[count].virtualKey = vk;
+        keys[count].isDeadKey = (code & 0x80000000) != 0;
+        count++;
+    }
+    if (count == keyboard.key_count && !memcmp( keys, keyboard.keys, count * sizeof(*keys) )) return;
+    keyboard.key_count = count;
+    memcpy( keyboard.keys, keys, count * sizeof(*keys) );
+    keyboard.timestamp = now;
+    keyboard.sequence++;
+}
+
+static void update_mouse( uint64_t now )
+{
+    GameInputMouseButtons buttons = GameInputMouseNone;
+    POINT pos;
+
+    if (GetAsyncKeyState( VK_LBUTTON ) & 0x8000) buttons |= GameInputMouseLeftButton;
+    if (GetAsyncKeyState( VK_RBUTTON ) & 0x8000) buttons |= GameInputMouseRightButton;
+    if (GetAsyncKeyState( VK_MBUTTON ) & 0x8000) buttons |= GameInputMouseMiddleButton;
+    if (GetAsyncKeyState( VK_XBUTTON1 ) & 0x8000) buttons |= GameInputMouseButton4;
+    if (GetAsyncKeyState( VK_XBUTTON2 ) & 0x8000) buttons |= GameInputMouseButton5;
+    if (!GetCursorPos( &pos )) pos.x = mouse.cursor_x, pos.y = mouse.cursor_y;
+
+    if (buttons == mouse.mouse_buttons && pos.x == mouse.cursor_x && pos.y == mouse.cursor_y) return;
+    /* the relative position is the sum of the cursor's moves: GameInput's v0 semantics */
+    mouse.mouse_x += pos.x - mouse.cursor_x;
+    mouse.mouse_y += pos.y - mouse.cursor_y;
+    mouse.cursor_x = pos.x;
+    mouse.cursor_y = pos.y;
+    mouse.mouse_buttons = buttons;
+    mouse.timestamp = now;
+    mouse.sequence++;
+}
+
+static void update_devices( GameInputKind kind )
+{
+    uint64_t now = current_timestamp();
+    unsigned int i;
+
+    if (kind & GameInputKindGamepad) for (i = 0; i < MAX_PADS; i++) update_pad( &pads[i], now );
+    if (kind & GameInputKindKeyboard) update_keyboard( now );
+    if (kind & GameInputKindMouse) update_mouse( now );
+}
+
+/* IGameInputReading */
+
+static void reading_init( struct reading *reading, struct device *device )
+{
+    reading->ref = 1;
+    reading->device = device;
+    reading->kind = device->kind;
+    reading->timestamp = device->timestamp;
+    reading->sequence = device->sequence;
+    reading->gamepad = device->gamepad;
+    reading->key_count = device->key_count;
+    memcpy( reading->keys, device->keys, sizeof(reading->keys) );
+    reading->mouse_buttons = device->mouse_buttons;
+    reading->mouse_x = device->mouse_x;
+    reading->mouse_y = device->mouse_y;
+    reading->cursor_x = device->cursor_x;
+    reading->cursor_y = device->cursor_y;
+}
+
+static struct reading *reading_create( struct device *device );
+
+static HRESULT reading_query_interface( struct reading *reading, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_v0_IGameInputReading )) *out = &reading->v0_iface;
+    else if (IsEqualGUID( iid, &IID_v1_IGameInputReading )) *out = &reading->v1_iface;
+    else if (IsEqualGUID( iid, &IID_v2_IGameInputReading )) *out = &reading->v2_iface;
+    else
+    {
+        *out = NULL;
+        WARN( "unsupported interface %s\n", debugstr_guid( iid ) );
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &reading->ref );
+    return S_OK;
+}
+
+static ULONG reading_release( struct reading *reading )
+{
+    ULONG ref = InterlockedDecrement( &reading->ref );
+    if (!ref) free( reading );
+    return ref;
+}
+
+static uint32_t reading_get_key_state( struct reading *reading, uint32_t count, GameInputKeyState *state )
+{
+    uint32_t n = min( count, reading->key_count );
+    if (!state) return 0;
+    memcpy( state, reading->keys, n * sizeof(*state) );
+    return n;
+}
+
+static bool reading_get_gamepad_state( struct reading *reading, GameInputGamepadState *state )
+{
+    if (reading->device->type != DEVICE_GAMEPAD)
+    {
+        memset( state, 0, sizeof(*state) );
+        return false;
+    }
+    *state = reading->gamepad;
+    return true;
+}
+
+static uint32_t zero_count( uint32_t count, void *state, size_t size )
+{
+    if (state && count) memset( state, 0, count * size );
+    return 0;
+}
+
+#define READING_COMMON( ver )                                                                                    \
+static inline struct reading *impl_from_v##ver##_IGameInputReading( v##ver##_IGameInputReading *iface )          \
+{                                                                                                                \
+    return CONTAINING_RECORD( iface, struct reading, v##ver##_iface );                                           \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_reading_QueryInterface( v##ver##_IGameInputReading *iface, REFIID iid, void **out ) \
+{                                                                                                                \
+    return reading_query_interface( impl_from_v##ver##_IGameInputReading( iface ), iid, out );                   \
+}                                                                                                                \
+static ULONG WINAPI v##ver##_reading_AddRef( v##ver##_IGameInputReading *iface )                                  \
+{                                                                                                                \
+    return InterlockedIncrement( &impl_from_v##ver##_IGameInputReading( iface )->ref );                          \
+}                                                                                                                \
+static ULONG WINAPI v##ver##_reading_Release( v##ver##_IGameInputReading *iface )                                 \
+{                                                                                                                \
+    return reading_release( impl_from_v##ver##_IGameInputReading( iface ) );                                     \
+}                                                                                                                \
+static GameInputKind WINAPI v##ver##_reading_GetInputKind( v##ver##_IGameInputReading *iface )                    \
+{                                                                                                                \
+    return impl_from_v##ver##_IGameInputReading( iface )->kind;                                                  \
+}                                                                                                                \
+static uint64_t WINAPI v##ver##_reading_GetTimestamp( v##ver##_IGameInputReading *iface )                         \
+{                                                                                                                \
+    return impl_from_v##ver##_IGameInputReading( iface )->timestamp;                                             \
+}                                                                                                                \
+static void WINAPI v##ver##_reading_GetDevice( v##ver##_IGameInputReading *iface, v##ver##_IGameInputDevice **device ) \
+{                                                                                                                \
+    struct reading *reading = impl_from_v##ver##_IGameInputReading( iface );                                     \
+    *device = &reading->device->v##ver##_iface;                                                                  \
+}                                                                                                                \
+static uint32_t WINAPI v##ver##_reading_GetControllerAxisCount( v##ver##_IGameInputReading *iface ) { return 0; } \
+static uint32_t WINAPI v##ver##_reading_GetControllerAxisState( v##ver##_IGameInputReading *iface, uint32_t count, float *state ) \
+{                                                                                                                \
+    return zero_count( count, state, sizeof(*state) );                                                           \
+}                                                                                                                \
+static uint32_t WINAPI v##ver##_reading_GetControllerButtonCount( v##ver##_IGameInputReading *iface ) { return 0; } \
+static uint32_t WINAPI v##ver##_reading_GetControllerButtonState( v##ver##_IGameInputReading *iface, uint32_t count, bool *state ) \
+{                                                                                                                \
+    return zero_count( count, state, sizeof(*state) );                                                           \
+}                                                                                                                \
+static uint32_t WINAPI v##ver##_reading_GetControllerSwitchCount( v##ver##_IGameInputReading *iface ) { return 0; } \
+static uint32_t WINAPI v##ver##_reading_GetControllerSwitchState( v##ver##_IGameInputReading *iface, uint32_t count, GameInputSwitchPosition *state ) \
+{                                                                                                                \
+    return zero_count( count, state, sizeof(*state) );                                                           \
+}                                                                                                                \
+static uint32_t WINAPI v##ver##_reading_GetKeyCount( v##ver##_IGameInputReading *iface )                          \
+{                                                                                                                \
+    return impl_from_v##ver##_IGameInputReading( iface )->key_count;                                             \
+}                                                                                                                \
+static uint32_t WINAPI v##ver##_reading_GetKeyState( v##ver##_IGameInputReading *iface, uint32_t count, GameInputKeyState *state ) \
+{                                                                                                                \
+    return reading_get_key_state( impl_from_v##ver##_IGameInputReading( iface ), count, state );                 \
+}                                                                                                                \
+static bool WINAPI v##ver##_reading_GetArcadeStickState( v##ver##_IGameInputReading *iface, GameInputArcadeStickState *state ) \
+{                                                                                                                \
+    memset( state, 0, sizeof(*state) );                                                                          \
+    return false;                                                                                                \
+}                                                                                                                \
+static bool WINAPI v##ver##_reading_GetFlightStickState( v##ver##_IGameInputReading *iface, GameInputFlightStickState *state ) \
+{                                                                                                                \
+    memset( state, 0, sizeof(*state) );                                                                          \
+    return false;                                                                                                \
+}                                                                                                                \
+static bool WINAPI v##ver##_reading_GetGamepadState( v##ver##_IGameInputReading *iface, GameInputGamepadState *state ) \
+{                                                                                                                \
+    return reading_get_gamepad_state( impl_from_v##ver##_IGameInputReading( iface ), state );                    \
+}                                                                                                                \
+static bool WINAPI v##ver##_reading_GetRacingWheelState( v##ver##_IGameInputReading *iface, GameInputRacingWheelState *state ) \
+{                                                                                                                \
+    memset( state, 0, sizeof(*state) );                                                                          \
+    return false;                                                                                                \
+}                                                                                                                \
+static bool WINAPI v##ver##_reading_GetUiNavigationState( v##ver##_IGameInputReading *iface, GameInputUiNavigationState *state ) \
+{                                                                                                                \
+    memset( state, 0, sizeof(*state) );                                                                          \
+    return false;                                                                                                \
+}
+
+READING_COMMON( 0 )
+READING_COMMON( 1 )
+READING_COMMON( 2 )
+
+static uint64_t WINAPI v0_reading_GetSequenceNumber( v0_IGameInputReading *iface, GameInputKind kind )
+{
+    return impl_from_v0_IGameInputReading( iface )->sequence;
+}
+
+static bool WINAPI v0_reading_GetRawReport( v0_IGameInputReading *iface, IGameInputRawDeviceReport **report )
+{
+    *report = NULL;
+    return false;
+}
+
+static bool WINAPI v0_reading_GetMouseState( v0_IGameInputReading *iface, v0_GameInputMouseState *state )
+{
+    struct reading *reading = impl_from_v0_IGameInputReading( iface );
+    memset( state, 0, sizeof(*state) );
+    if (reading->device->type != DEVICE_MOUSE) return false;
+    state->buttons = reading->mouse_buttons;
+    state->positionX = reading->mouse_x;
+    state->positionY = reading->mouse_y;
+    return true;
+}
+
+static bool mouse_state_v1( struct reading *reading, v1_GameInputMouseState *state )
+{
+    memset( state, 0, sizeof(*state) );
+    if (reading->device->type != DEVICE_MOUSE) return false;
+    state->buttons = reading->mouse_buttons;
+    state->positions = GameInputMouseRelativePosition | GameInputMouseAbsolutePosition;
+    state->positionX = reading->mouse_x;
+    state->positionY = reading->mouse_y;
+    state->absolutePositionX = reading->cursor_x;
+    state->absolutePositionY = reading->cursor_y;
+    return true;
+}
+
+static bool WINAPI v1_reading_GetMouseState( v1_IGameInputReading *iface, v1_GameInputMouseState *state )
+{
+    return mouse_state_v1( impl_from_v1_IGameInputReading( iface ), state );
+}
+
+static bool WINAPI v2_reading_GetMouseState( v2_IGameInputReading *iface, v2_GameInputMouseState *state )
+{
+    return mouse_state_v1( impl_from_v2_IGameInputReading( iface ), state );
+}
+
+static uint32_t WINAPI v0_reading_GetTouchCount( v0_IGameInputReading *iface ) { return 0; }
+
+static uint32_t WINAPI v0_reading_GetTouchState( v0_IGameInputReading *iface, uint32_t count, GameInputTouchState *state )
+{
+    return zero_count( count, state, sizeof(*state) );
+}
+
+static bool WINAPI v0_reading_GetMotionState( v0_IGameInputReading *iface, GameInputMotionState *state )
+{
+    memset( state, 0, sizeof(*state) );
+    return false;
+}
+
+static bool WINAPI v2_reading_GetSensorsState( v2_IGameInputReading *iface, GameInputSensorsState *state )
+{
+    memset( state, 0, sizeof(*state) );
+    return false;
+}
+
+static const struct v0_IGameInputReadingVtbl v0_reading_vtbl =
+{
+    .QueryInterface = v0_reading_QueryInterface,
+    .AddRef = v0_reading_AddRef,
+    .Release = v0_reading_Release,
+    .GetInputKind = v0_reading_GetInputKind,
+    .GetSequenceNumber = v0_reading_GetSequenceNumber,
+    .GetTimestamp = v0_reading_GetTimestamp,
+    .GetDevice = v0_reading_GetDevice,
+    .GetRawReport = v0_reading_GetRawReport,
+    .GetControllerAxisCount = v0_reading_GetControllerAxisCount,
+    .GetControllerAxisState = v0_reading_GetControllerAxisState,
+    .GetControllerButtonCount = v0_reading_GetControllerButtonCount,
+    .GetControllerButtonState = v0_reading_GetControllerButtonState,
+    .GetControllerSwitchCount = v0_reading_GetControllerSwitchCount,
+    .GetControllerSwitchState = v0_reading_GetControllerSwitchState,
+    .GetKeyCount = v0_reading_GetKeyCount,
+    .GetKeyState = v0_reading_GetKeyState,
+    .GetMouseState = v0_reading_GetMouseState,
+    .GetTouchCount = v0_reading_GetTouchCount,
+    .GetTouchState = v0_reading_GetTouchState,
+    .GetMotionState = v0_reading_GetMotionState,
+    .GetArcadeStickState = v0_reading_GetArcadeStickState,
+    .GetFlightStickState = v0_reading_GetFlightStickState,
+    .GetGamepadState = v0_reading_GetGamepadState,
+    .GetRacingWheelState = v0_reading_GetRacingWheelState,
+    .GetUiNavigationState = v0_reading_GetUiNavigationState,
+};
+
+static const struct v1_IGameInputReadingVtbl v1_reading_vtbl =
+{
+    .QueryInterface = v1_reading_QueryInterface,
+    .AddRef = v1_reading_AddRef,
+    .Release = v1_reading_Release,
+    .GetInputKind = v1_reading_GetInputKind,
+    .GetTimestamp = v1_reading_GetTimestamp,
+    .GetDevice = v1_reading_GetDevice,
+    .GetControllerAxisCount = v1_reading_GetControllerAxisCount,
+    .GetControllerAxisState = v1_reading_GetControllerAxisState,
+    .GetControllerButtonCount = v1_reading_GetControllerButtonCount,
+    .GetControllerButtonState = v1_reading_GetControllerButtonState,
+    .GetControllerSwitchCount = v1_reading_GetControllerSwitchCount,
+    .GetControllerSwitchState = v1_reading_GetControllerSwitchState,
+    .GetKeyCount = v1_reading_GetKeyCount,
+    .GetKeyState = v1_reading_GetKeyState,
+    .GetMouseState = v1_reading_GetMouseState,
+    .GetArcadeStickState = v1_reading_GetArcadeStickState,
+    .GetFlightStickState = v1_reading_GetFlightStickState,
+    .GetGamepadState = v1_reading_GetGamepadState,
+    .GetRacingWheelState = v1_reading_GetRacingWheelState,
+    .GetUiNavigationState = v1_reading_GetUiNavigationState,
+};
+
+static const struct v2_IGameInputReadingVtbl v2_reading_vtbl =
+{
+    .QueryInterface = v2_reading_QueryInterface,
+    .AddRef = v2_reading_AddRef,
+    .Release = v2_reading_Release,
+    .GetInputKind = v2_reading_GetInputKind,
+    .GetTimestamp = v2_reading_GetTimestamp,
+    .GetDevice = v2_reading_GetDevice,
+    .GetControllerAxisCount = v2_reading_GetControllerAxisCount,
+    .GetControllerAxisState = v2_reading_GetControllerAxisState,
+    .GetControllerButtonCount = v2_reading_GetControllerButtonCount,
+    .GetControllerButtonState = v2_reading_GetControllerButtonState,
+    .GetControllerSwitchCount = v2_reading_GetControllerSwitchCount,
+    .GetControllerSwitchState = v2_reading_GetControllerSwitchState,
+    .GetKeyCount = v2_reading_GetKeyCount,
+    .GetKeyState = v2_reading_GetKeyState,
+    .GetMouseState = v2_reading_GetMouseState,
+    .GetSensorsState = v2_reading_GetSensorsState,
+    .GetArcadeStickState = v2_reading_GetArcadeStickState,
+    .GetFlightStickState = v2_reading_GetFlightStickState,
+    .GetGamepadState = v2_reading_GetGamepadState,
+    .GetRacingWheelState = v2_reading_GetRacingWheelState,
+    .GetUiNavigationState = v2_reading_GetUiNavigationState,
+};
+
+/* called with state_cs held */
+static struct reading *reading_create( struct device *device )
+{
+    struct reading *reading;
+    if (!(reading = calloc( 1, sizeof(*reading) ))) return NULL;
+    reading->v0_iface.lpVtbl = &v0_reading_vtbl;
+    reading->v1_iface.lpVtbl = &v1_reading_vtbl;
+    reading->v2_iface.lpVtbl = &v2_reading_vtbl;
+    reading_init( reading, device );
+    return reading;
+}
+
+/* IGameInputDevice: static objects, alive for the whole process */
+
+static HRESULT device_query_interface( struct device *device, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_v0_IGameInputDevice )) *out = &device->v0_iface;
+    else if (IsEqualGUID( iid, &IID_v1_IGameInputDevice )) *out = &device->v1_iface;
+    else if (IsEqualGUID( iid, &IID_v2_IGameInputDevice )) *out = &device->v2_iface;
+    else
+    {
+        *out = NULL;
+        WARN( "unsupported interface %s\n", debugstr_guid( iid ) );
+        return E_NOINTERFACE;
+    }
+    return S_OK;
+}
+
+static GameInputDeviceStatus device_status( struct device *device )
+{
+    GameInputDeviceStatus status;
+    EnterCriticalSection( &state_cs );
+    status = device->connected ? GameInputDeviceConnected | GameInputDeviceInputEnabled : GameInputDeviceNoStatus;
+    if (device->connected && device->type == DEVICE_GAMEPAD) status |= GameInputDeviceOutputEnabled;
+    LeaveCriticalSection( &state_cs );
+    return status;
+}
+
+static void device_set_rumble( struct device *device, const GameInputRumbleParams *params )
+{
+    XINPUT_VIBRATION vibration = {0};
+    if (device->type != DEVICE_GAMEPAD || !pXInputSetState) return;
+    if (params)
+    {
+        float low = params->lowFrequency < 0 ? 0 : params->lowFrequency > 1 ? 1 : params->lowFrequency;
+        float high = params->highFrequency < 0 ? 0 : params->highFrequency > 1 ? 1 : params->highFrequency;
+        vibration.wLeftMotorSpeed = low * 65535;
+        vibration.wRightMotorSpeed = high * 65535;
+    }
+    pXInputSetState( device->slot, &vibration );
+}
+
+#define DEVICE_COMMON( ver )                                                                                     \
+static inline struct device *impl_from_v##ver##_IGameInputDevice( v##ver##_IGameInputDevice *iface )             \
+{                                                                                                                \
+    return CONTAINING_RECORD( iface, struct device, v##ver##_iface );                                            \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_device_QueryInterface( v##ver##_IGameInputDevice *iface, REFIID iid, void **out ) \
+{                                                                                                                \
+    return device_query_interface( impl_from_v##ver##_IGameInputDevice( iface ), iid, out );                     \
+}                                                                                                                \
+static ULONG WINAPI v##ver##_device_AddRef( v##ver##_IGameInputDevice *iface ) { return 2; }                      \
+static ULONG WINAPI v##ver##_device_Release( v##ver##_IGameInputDevice *iface ) { return 1; }                     \
+static GameInputDeviceStatus WINAPI v##ver##_device_GetDeviceStatus( v##ver##_IGameInputDevice *iface )           \
+{                                                                                                                \
+    return device_status( impl_from_v##ver##_IGameInputDevice( iface ) );                                        \
+}                                                                                                                \
+static bool WINAPI v##ver##_device_IsForceFeedbackMotorPoweredOn( v##ver##_IGameInputDevice *iface, uint32_t motor ) \
+{                                                                                                                \
+    return false;                                                                                                \
+}                                                                                                                \
+static void WINAPI v##ver##_device_SetForceFeedbackMotorGain( v##ver##_IGameInputDevice *iface, uint32_t motor, float gain ) \
+{                                                                                                                \
+}                                                                                                                \
+static void WINAPI v##ver##_device_SetRumbleState( v##ver##_IGameInputDevice *iface, const GameInputRumbleParams *params ) \
+{                                                                                                                \
+    device_set_rumble( impl_from_v##ver##_IGameInputDevice( iface ), params );                                   \
+}
+
+DEVICE_COMMON( 0 )
+DEVICE_COMMON( 1 )
+DEVICE_COMMON( 2 )
+
+static const v0_GameInputDeviceInfo * WINAPI v0_device_GetDeviceInfo( v0_IGameInputDevice *iface )
+{
+    return &impl_from_v0_IGameInputDevice( iface )->v0_info;
+}
+
+static HRESULT WINAPI v1_device_GetDeviceInfo( v1_IGameInputDevice *iface, const v1_GameInputDeviceInfo **info )
+{
+    *info = &impl_from_v1_IGameInputDevice( iface )->v1_info;
+    return S_OK;
+}
+
+static HRESULT WINAPI v2_device_GetDeviceInfo( v2_IGameInputDevice *iface, const v2_GameInputDeviceInfo **info )
+{
+    *info = &impl_from_v2_IGameInputDevice( iface )->v2_info;
+    return S_OK;
+}
+
+static HRESULT WINAPI v2_device_GetHapticInfo( v2_IGameInputDevice *iface, GameInputHapticInfo *info )
+{
+    memset( info, 0, sizeof(*info) );
+    return GAMEINPUT_E_HAPTIC_INFO_NOT_FOUND;
+}
+
+static void WINAPI v0_device_GetBatteryState( v0_IGameInputDevice *iface, GameInputBatteryState *state )
+{
+    memset( state, 0, sizeof(*state) );
+    state->status = GameInputBatteryUnknown;
+}
+
+static HRESULT WINAPI v0_device_CreateForceFeedbackEffect( v0_IGameInputDevice *iface, uint32_t motor,
+                                                           const GameInputForceFeedbackParams *params,
+                                                           v0_IGameInputForceFeedbackEffect **effect )
+{
+    *effect = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v1_device_CreateForceFeedbackEffect( v1_IGameInputDevice *iface, uint32_t motor,
+                                                           const GameInputForceFeedbackParams *params,
+                                                           v0_IGameInputForceFeedbackEffect **effect )
+{
+    *effect = NULL;
+    return GAMEINPUT_E_FEEDBACK_NOT_SUPPORTED;
+}
+
+static HRESULT WINAPI v2_device_CreateForceFeedbackEffect( v2_IGameInputDevice *iface, uint32_t motor,
+                                                           const GameInputForceFeedbackParams *params,
+                                                           v2_IGameInputForceFeedbackEffect **effect )
+{
+    *effect = NULL;
+    return GAMEINPUT_E_FEEDBACK_NOT_SUPPORTED;
+}
+
+static HRESULT WINAPI v0_device_SetHapticMotorState( v0_IGameInputDevice *iface, uint32_t motor, const GameInputHapticFeedbackParams *params )
+{
+    return E_NOTIMPL;
+}
+
+static void WINAPI v0_device_SetInputSynchronizationState( v0_IGameInputDevice *iface, bool enabled ) {}
+static void WINAPI v0_device_SendInputSynchronizationHint( v0_IGameInputDevice *iface ) {}
+static void WINAPI v0_device_PowerOff( v0_IGameInputDevice *iface ) {}
+
+static HRESULT WINAPI v0_device_CreateRawDeviceReport( v0_IGameInputDevice *iface, uint32_t id, GameInputRawDeviceReportKind kind,
+                                                       IGameInputRawDeviceReport **report )
+{
+    *report = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v0_device_GetRawDeviceFeature( v0_IGameInputDevice *iface, uint32_t id, IGameInputRawDeviceReport **report )
+{
+    *report = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v0_device_SetRawDeviceFeature( v0_IGameInputDevice *iface, IGameInputRawDeviceReport *report )
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v0_device_SendRawDeviceOutput( v0_IGameInputDevice *iface, IGameInputRawDeviceReport *report )
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v0_device_SendRawDeviceOutputWithResponse( v0_IGameInputDevice *iface, IGameInputRawDeviceReport *request,
+                                                                 IGameInputRawDeviceReport **reply )
+{
+    *reply = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v0_device_ExecuteRawDeviceIoControl( v0_IGameInputDevice *iface, uint32_t code, size_t in_size, const void *input,
+                                                           size_t out_size, void *output, size_t *size )
+{
+    if (size) *size = 0;
+    return E_NOTIMPL;
+}
+
+static bool WINAPI v0_device_AcquireExclusiveRawDeviceAccess( v0_IGameInputDevice *iface, uint64_t timeout_ms ) { return false; }
+static void WINAPI v0_device_ReleaseExclusiveRawDeviceAccess( v0_IGameInputDevice *iface ) {}
+
+static HRESULT WINAPI v2_device_DirectInputEscape( v2_IGameInputDevice *iface, uint32_t command, const void *input, uint32_t in_size,
+                                                   void *output, uint32_t out_size, uint32_t *size )
+{
+    if (size) *size = 0;
+    return E_NOTIMPL;
+}
+
+static const struct v0_IGameInputDeviceVtbl v0_device_vtbl =
+{
+    .QueryInterface = v0_device_QueryInterface,
+    .AddRef = v0_device_AddRef,
+    .Release = v0_device_Release,
+    .GetDeviceInfo = v0_device_GetDeviceInfo,
+    .GetDeviceStatus = v0_device_GetDeviceStatus,
+    .GetBatteryState = v0_device_GetBatteryState,
+    .CreateForceFeedbackEffect = v0_device_CreateForceFeedbackEffect,
+    .IsForceFeedbackMotorPoweredOn = v0_device_IsForceFeedbackMotorPoweredOn,
+    .SetForceFeedbackMotorGain = v0_device_SetForceFeedbackMotorGain,
+    .SetHapticMotorState = v0_device_SetHapticMotorState,
+    .SetRumbleState = v0_device_SetRumbleState,
+    .SetInputSynchronizationState = v0_device_SetInputSynchronizationState,
+    .SendInputSynchronizationHint = v0_device_SendInputSynchronizationHint,
+    .PowerOff = v0_device_PowerOff,
+    .CreateRawDeviceReport = v0_device_CreateRawDeviceReport,
+    .GetRawDeviceFeature = v0_device_GetRawDeviceFeature,
+    .SetRawDeviceFeature = v0_device_SetRawDeviceFeature,
+    .SendRawDeviceOutput = v0_device_SendRawDeviceOutput,
+    .SendRawDeviceOutputWithResponse = v0_device_SendRawDeviceOutputWithResponse,
+    .ExecuteRawDeviceIoControl = v0_device_ExecuteRawDeviceIoControl,
+    .AcquireExclusiveRawDeviceAccess = v0_device_AcquireExclusiveRawDeviceAccess,
+    .ReleaseExclusiveRawDeviceAccess = v0_device_ReleaseExclusiveRawDeviceAccess,
+};
+
+static const struct v1_IGameInputDeviceVtbl v1_device_vtbl =
+{
+    .QueryInterface = v1_device_QueryInterface,
+    .AddRef = v1_device_AddRef,
+    .Release = v1_device_Release,
+    .GetDeviceInfo = v1_device_GetDeviceInfo,
+    .GetDeviceStatus = v1_device_GetDeviceStatus,
+    .CreateForceFeedbackEffect = v1_device_CreateForceFeedbackEffect,
+    .IsForceFeedbackMotorPoweredOn = v1_device_IsForceFeedbackMotorPoweredOn,
+    .SetForceFeedbackMotorGain = v1_device_SetForceFeedbackMotorGain,
+    .SetRumbleState = v1_device_SetRumbleState,
+};
+
+static const struct v2_IGameInputDeviceVtbl v2_device_vtbl =
+{
+    .QueryInterface = v2_device_QueryInterface,
+    .AddRef = v2_device_AddRef,
+    .Release = v2_device_Release,
+    .GetDeviceInfo = v2_device_GetDeviceInfo,
+    .GetHapticInfo = v2_device_GetHapticInfo,
+    .GetDeviceStatus = v2_device_GetDeviceStatus,
+    .CreateForceFeedbackEffect = v2_device_CreateForceFeedbackEffect,
+    .IsForceFeedbackMotorPoweredOn = v2_device_IsForceFeedbackMotorPoweredOn,
+    .SetForceFeedbackMotorGain = v2_device_SetForceFeedbackMotorGain,
+    .SetRumbleState = v2_device_SetRumbleState,
+    .DirectInputEscape = v2_device_DirectInputEscape,
+};
+
+static void device_init( struct device *device, enum device_type type, DWORD slot, GameInputKind kind, const char *name )
+{
+    device->v0_iface.lpVtbl = &v0_device_vtbl;
+    device->v1_iface.lpVtbl = &v1_device_vtbl;
+    device->v2_iface.lpVtbl = &v2_device_vtbl;
+    device->type = type;
+    device->slot = slot;
+    device->kind = kind;
+    lstrcpynA( device->name, name, sizeof(device->name) );
+    fill_device_info( device, 0, 0, 0 );
+}
+
+static BOOL WINAPI init_devices( INIT_ONCE *once, void *param, void **context )
+{
+    HMODULE module;
+    unsigned int i;
+
+    if ((module = LoadLibraryW( L"xinput1_4.dll" )) || (module = LoadLibraryW( L"xinput1_3.dll" )))
+    {
+        /* XInputGetStateEx (ordinal 100) also reports the guide button */
+        if (!(pXInputGetState = (void *)GetProcAddress( module, (const char *)100 )))
+            pXInputGetState = (void *)GetProcAddress( module, "XInputGetState" );
+        pXInputSetState = (void *)GetProcAddress( module, "XInputSetState" );
+        pXInputGetCapabilitiesEx = (void *)GetProcAddress( module, (const char *)108 );
+    }
+    if (!pXInputGetState) ERR( "no XInput: gamepads will not be reported\n" );
+
+    for (i = 0; i < MAX_PADS; i++) device_init( &pads[i], DEVICE_GAMEPAD, i, GameInputKindGamepad, "Controller" );
+    device_init( &keyboard, DEVICE_KEYBOARD, 0, GameInputKindKeyboard, "Keyboard" );
+    device_init( &mouse, DEVICE_MOUSE, 0, GameInputKindMouse, "Mouse" );
+    keyboard.connected = TRUE;
+    mouse.connected = TRUE;
+    fill_device_info( &keyboard, 0, 0, 0 );
+    fill_device_info( &mouse, 0, 0, 0 );
+
+    EnterCriticalSection( &state_cs );
+    update_devices( GameInputKindGamepad | GameInputKindKeyboard | GameInputKindMouse );
+    LeaveCriticalSection( &state_cs );
+    return TRUE;
+}
+
+static struct device *all_devices( unsigned int index )
+{
+    if (index < MAX_PADS) return &pads[index];
+    if (index == MAX_PADS) return &keyboard;
+    if (index == MAX_PADS + 1) return &mouse;
+    return NULL;
+}
+
+/* called with state_cs held */
+static struct device *newest_device( GameInputKind kind )
+{
+    struct device *device, *found = NULL;
+    unsigned int i;
+
+    for (i = 0; (device = all_devices( i )); i++)
+    {
+        if (!device->connected || !(device->kind & kind)) continue;
+        if (!found || device->timestamp > found->timestamp) found = device;
+    }
+    return found;
+}
+
+static HRESULT get_current_reading( GameInputKind kind, struct device *device, struct reading **out )
+{
+    HRESULT hr = S_OK;
+
+    *out = NULL;
+    EnterCriticalSection( &state_cs );
+    update_devices( device ? device->kind : kind );
+    if (device && !device->connected) hr = GAMEINPUT_E_DEVICE_DISCONNECTED;
+    else if (device && !(device->kind & kind)) hr = GAMEINPUT_E_READING_NOT_FOUND;
+    else if (!device && !(device = newest_device( kind ))) hr = GAMEINPUT_E_READING_NOT_FOUND;
+    else if (!(*out = reading_create( device ))) hr = E_OUTOFMEMORY;
+    LeaveCriticalSection( &state_cs );
+
+    TRACE( "kind %#x -> %#lx\n", kind, hr );
+    return hr;
+}
+
+static HRESULT get_next_reading( struct reading *reference, GameInputKind kind, struct device *device, struct reading **out )
+{
+    HRESULT hr;
+
+    *out = NULL;
+    if (!reference) return E_INVALIDARG;
+    if (!device) device = reference->device;
+    if (FAILED(hr = get_current_reading( kind, device, out ))) return hr;
+    if ((*out)->sequence > reference->sequence || (*out)->timestamp > reference->timestamp) return S_OK;
+    reading_release( *out );
+    *out = NULL;
+    return GAMEINPUT_E_READING_NOT_FOUND;
+}
+
+static HRESULT find_device_from_id( const APP_LOCAL_DEVICE_ID *id, struct device **out )
+{
+    struct device *device;
+    unsigned int i;
+
+    *out = NULL;
+    if (!id) return E_INVALIDARG;
+    EnterCriticalSection( &state_cs );
+    for (i = 0; (device = all_devices( i )); i++)
+    {
+        if (!device->connected || memcmp( id, &device->v0_info.deviceId, sizeof(*id) )) continue;
+        *out = device;
+        break;
+    }
+    LeaveCriticalSection( &state_cs );
+    return *out ? S_OK : GAMEINPUT_E_DEVICE_NOT_FOUND;
+}
+
+/* Callbacks, run from one worker thread */
+
+static void *device_iface( struct device *device, int version )
+{
+    return version == 0 ? (void *)&device->v0_iface : version == 1 ? (void *)&device->v1_iface : (void *)&device->v2_iface;
+}
+
+static void *reading_iface( struct reading *reading, int version )
+{
+    return version == 0 ? (void *)&reading->v0_iface : version == 1 ? (void *)&reading->v1_iface : (void *)&reading->v2_iface;
+}
+
+static GameInputDeviceStatus status_of( BOOL connected, enum device_type type )
+{
+    if (!connected) return GameInputDeviceNoStatus;
+    return GameInputDeviceConnected | GameInputDeviceInputEnabled | (type == DEVICE_GAMEPAD ? GameInputDeviceOutputEnabled : 0);
+}
+
+struct event
+{
+    GameInputCallbackToken token;
+    enum callback_type type;
+    int version;
+    void *context;
+    void *function;
+    struct device *device;
+    struct reading *reading;
+    GameInputDeviceStatus current, previous;
+    GameInputSystemButtons buttons, previous_buttons;
+    uint64_t timestamp;
+};
+
+static BOOL callback_matches_device( const struct callback *callback, const struct device *device )
+{
+    if (callback->stopped) return FALSE;
+    if (callback->device && callback->device != device) return FALSE;
+    return (callback->kind & device->kind) != 0;
+}
+
+static void run_events( struct event *events, unsigned int count )
+{
+    unsigned int i;
+
+    EnterCriticalSection( &dispatch_cs );
+    for (i = 0; i < count; i++)
+    {
+        struct event *event = &events[i];
+        switch (event->type)
+        {
+        case CALLBACK_DEVICE:
+            /* the three versions' device callbacks have the same layout */
+            ((v0_GameInputDeviceCallback)event->function)( event->token, event->context, device_iface( event->device, event->version ),
+                                                           event->timestamp, event->current, event->previous );
+            break;
+        case CALLBACK_READING:
+            if (event->version == 0)
+                ((v0_GameInputReadingCallback)event->function)( event->token, event->context, &event->reading->v0_iface, false );
+            else
+                ((v1_GameInputReadingCallback)event->function)( event->token, event->context, reading_iface( event->reading, event->version ) );
+            reading_release( event->reading );
+            break;
+        case CALLBACK_SYSTEM_BUTTON:
+            ((v0_GameInputSystemButtonCallback)event->function)( event->token, event->context, device_iface( event->device, event->version ),
+                                                                 event->timestamp, event->buttons, event->previous_buttons );
+            break;
+        case CALLBACK_KEYBOARD_LAYOUT:
+            break;
+        }
+    }
+    LeaveCriticalSection( &dispatch_cs );
+}
+
+static DWORD WINAPI worker_proc( void *arg )
+{
+    struct event events[64];
+
+    SetThreadDescription( GetCurrentThread(), L"wine_gameinput_worker" );
+    while (!shutting_down)
+    {
+        BOOL connected[MAX_PADS + 2], wants_readings = FALSE;
+        GameInputSystemButtons buttons[MAX_PADS];
+        uint64_t sequence[MAX_PADS + 2];
+        struct callback *callback;
+        struct device *device;
+        unsigned int i, count = 0;
+        GameInputKind kinds = 0;
+
+        EnterCriticalSection( &state_cs );
+        LIST_FOR_EACH_ENTRY( callback, &callbacks, struct callback, entry )
+        {
+            if (callback->stopped) continue;
+            kinds |= callback->type == CALLBACK_SYSTEM_BUTTON ? GameInputKindGamepad : callback->kind;
+            if (callback->type == CALLBACK_READING) wants_readings = TRUE;
+        }
+        for (i = 0; (device = all_devices( i )); i++)
+        {
+            connected[i] = device->connected;
+            sequence[i] = device->sequence;
+            if (i < MAX_PADS) buttons[i] = device->system_buttons;
+        }
+        update_devices( kinds | GameInputKindGamepad );
+        LIST_FOR_EACH_ENTRY( callback, &callbacks, struct callback, entry )
+        {
+            for (i = 0; (device = all_devices( i )) && count < ARRAY_SIZE(events); i++)
+            {
+                struct event *event = &events[count];
+                if (!callback_matches_device( callback, device ) && callback->type != CALLBACK_SYSTEM_BUTTON) continue;
+                memset( event, 0, sizeof(*event) );
+                event->token = callback->token;
+                event->type = callback->type;
+                event->version = callback->version;
+                event->context = callback->context;
+                event->function = callback->function;
+                event->device = device;
+                event->timestamp = current_timestamp();
+                switch (callback->type)
+                {
+                case CALLBACK_DEVICE:
+                    event->current = status_of( device->connected, device->type );
+                    event->previous = callback->enumerate ? GameInputDeviceNoStatus : status_of( connected[i], device->type );
+                    if (callback->enumerate && !device->connected) continue;
+                    if (event->current == event->previous) continue;
+                    if (!((event->current | event->previous) & callback->filter)) continue;
+                    count++;
+                    break;
+                case CALLBACK_READING:
+                    if (!device->connected || device->sequence == sequence[i]) continue;
+                    if (!(event->reading = reading_create( device ))) continue;
+                    count++;
+                    break;
+                case CALLBACK_SYSTEM_BUTTON:
+                    if (callback->stopped || i >= MAX_PADS || (callback->device && callback->device != device)) continue;
+                    if (device->system_buttons == buttons[i] || !(callback->filter & (device->system_buttons | buttons[i]))) continue;
+                    event->buttons = device->system_buttons;
+                    event->previous_buttons = buttons[i];
+                    count++;
+                    break;
+                case CALLBACK_KEYBOARD_LAYOUT:
+                    break;
+                }
+            }
+            callback->enumerate = FALSE;
+        }
+        LeaveCriticalSection( &state_cs );
+
+        if (count) run_events( events, count );
+        Sleep( wants_readings ? 4 : 50 );
+    }
+    return 0;
+}
+
+static HRESULT register_callback( enum callback_type type, int version, struct device *device, GameInputKind kind,
+                                  GameInputDeviceStatus filter, GameInputEnumerationKind enumeration, void *context,
+                                  void *function, GameInputCallbackToken *token )
+{
+    struct event events[MAX_PADS + 2];
+    struct callback *callback;
+    unsigned int i, count = 0;
+    struct device *dev;
+
+    if (!function) return E_INVALIDARG;
+    if (!(callback = calloc( 1, sizeof(*callback) ))) return E_OUTOFMEMORY;
+    callback->type = type;
+    callback->version = version;
+    callback->device = device;
+    callback->kind = kind;
+    callback->filter = filter;
+    callback->context = context;
+    callback->function = function;
+    callback->enumerate = enumeration == GameInputAsyncEnumeration;
+
+    EnterCriticalSection( &state_cs );
+    callback->token = next_token++;
+    if (token) *token = callback->token;
+    update_devices( kind );
+    if (type == CALLBACK_DEVICE && enumeration == GameInputBlockingEnumeration)
+    {
+        /* the devices already there, before RegisterDeviceCallback returns */
+        for (i = 0; (dev = all_devices( i )); i++)
+        {
+            struct event *event = &events[count];
+            if (!dev->connected || !callback_matches_device( callback, dev )) continue;
+            memset( event, 0, sizeof(*event) );
+            event->token = callback->token;
+            event->type = type;
+            event->version = version;
+            event->context = context;
+            event->function = function;
+            event->device = dev;
+            event->timestamp = current_timestamp();
+            event->current = status_of( TRUE, dev->type );
+            event->previous = GameInputDeviceNoStatus;
+            if (event->current & filter) count++;
+        }
+    }
+    list_add_tail( &callbacks, &callback->entry );
+    if (!worker) worker = CreateThread( NULL, 0, worker_proc, NULL, 0, NULL );
+    LeaveCriticalSection( &state_cs );
+
+    TRACE( "type %u, version %d, kind %#x, filter %#x, enumeration %u -> token %I64u, %u devices now\n",
+           type, version, kind, filter, enumeration, callback->token, count );
+    if (count) run_events( events, count );
+    return S_OK;
+}
+
+static void stop_callback( GameInputCallbackToken token )
+{
+    struct callback *callback;
+    EnterCriticalSection( &state_cs );
+    LIST_FOR_EACH_ENTRY( callback, &callbacks, struct callback, entry )
+        if (callback->token == token) callback->stopped = TRUE;
+    LeaveCriticalSection( &state_cs );
+}
+
+static bool unregister_callback( GameInputCallbackToken token )
+{
+    struct callback *callback, *found = NULL;
+
+    EnterCriticalSection( &state_cs );
+    LIST_FOR_EACH_ENTRY( callback, &callbacks, struct callback, entry )
+    {
+        if (callback->token != token) continue;
+        found = callback;
+        list_remove( &callback->entry );
+        break;
+    }
+    LeaveCriticalSection( &state_cs );
+    if (!found) return false;
+    /* wait for a callback that may be running on the worker thread */
+    EnterCriticalSection( &dispatch_cs );
+    LeaveCriticalSection( &dispatch_cs );
+    free( found );
+    return true;
+}
+
+/* IGameInput */
+
+static HRESULT gameinput_query_interface( REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_v0_IGameInput )) *out = &gameinput.v0_iface;
+    else if (IsEqualGUID( iid, &IID_v1_IGameInput )) *out = &gameinput.v1_iface;
+    else if (IsEqualGUID( iid, &IID_v2_IGameInput )) *out = &gameinput.v2_iface;
+    else
+    {
+        *out = NULL;
+        FIXME( "unsupported interface %s\n", debugstr_guid( iid ) );
+        return E_NOINTERFACE;
+    }
+    TRACE( "%s\n", debugstr_guid( iid ) );
+    InterlockedIncrement( &gameinput.ref );
+    return S_OK;
+}
+
+#define GAMEINPUT_COMMON( ver )                                                                                  \
+static HRESULT WINAPI v##ver##_gameinput_QueryInterface( v##ver##_IGameInput *iface, REFIID iid, void **out )    \
+{                                                                                                                \
+    return gameinput_query_interface( iid, out );                                                                \
+}                                                                                                                \
+static ULONG WINAPI v##ver##_gameinput_AddRef( v##ver##_IGameInput *iface )                                       \
+{                                                                                                                \
+    return InterlockedIncrement( &gameinput.ref );                                                               \
+}                                                                                                                \
+static ULONG WINAPI v##ver##_gameinput_Release( v##ver##_IGameInput *iface )                                      \
+{                                                                                                                \
+    return InterlockedDecrement( &gameinput.ref );                                                               \
+}                                                                                                                \
+static uint64_t WINAPI v##ver##_gameinput_GetCurrentTimestamp( v##ver##_IGameInput *iface )                       \
+{                                                                                                                \
+    return current_timestamp();                                                                                  \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_GetCurrentReading( v##ver##_IGameInput *iface, GameInputKind kind,     \
+                                                            v##ver##_IGameInputDevice *device,                   \
+                                                            v##ver##_IGameInputReading **out )                   \
+{                                                                                                                \
+    struct reading *reading;                                                                                     \
+    HRESULT hr = get_current_reading( kind, device ? impl_from_v##ver##_IGameInputDevice( device ) : NULL, &reading ); \
+    *out = SUCCEEDED(hr) ? &reading->v##ver##_iface : NULL;                                                      \
+    return hr;                                                                                                   \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_GetNextReading( v##ver##_IGameInput *iface, v##ver##_IGameInputReading *reference, \
+                                                         GameInputKind kind, v##ver##_IGameInputDevice *device,  \
+                                                         v##ver##_IGameInputReading **out )                      \
+{                                                                                                                \
+    struct reading *reading;                                                                                     \
+    HRESULT hr = get_next_reading( reference ? impl_from_v##ver##_IGameInputReading( reference ) : NULL, kind,   \
+                                   device ? impl_from_v##ver##_IGameInputDevice( device ) : NULL, &reading );    \
+    *out = SUCCEEDED(hr) ? &reading->v##ver##_iface : NULL;                                                      \
+    return hr;                                                                                                   \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_GetPreviousReading( v##ver##_IGameInput *iface, v##ver##_IGameInputReading *reference, \
+                                                             GameInputKind kind, v##ver##_IGameInputDevice *device, \
+                                                             v##ver##_IGameInputReading **out )                  \
+{                                                                                                                \
+    *out = NULL;                                                                                                 \
+    return GAMEINPUT_E_READING_NOT_FOUND;                                                                        \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_RegisterDeviceCallback( v##ver##_IGameInput *iface, v##ver##_IGameInputDevice *device, \
+                                                                 GameInputKind kind, GameInputDeviceStatus filter, \
+                                                                 GameInputEnumerationKind enumeration, void *context, \
+                                                                 v##ver##_GameInputDeviceCallback callback,        \
+                                                                 GameInputCallbackToken *token )                   \
+{                                                                                                                \
+    return register_callback( CALLBACK_DEVICE, ver, device ? impl_from_v##ver##_IGameInputDevice( device ) : NULL, \
+                              kind, filter, enumeration, context, callback, token );                             \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_RegisterSystemButtonCallback( v##ver##_IGameInput *iface,              \
+                                                                       v##ver##_IGameInputDevice *device,        \
+                                                                       GameInputSystemButtons filter, void *context, \
+                                                                       v##ver##_GameInputSystemButtonCallback callback, \
+                                                                       GameInputCallbackToken *token )           \
+{                                                                                                                \
+    return register_callback( CALLBACK_SYSTEM_BUTTON, ver, device ? impl_from_v##ver##_IGameInputDevice( device ) : NULL, \
+                              GameInputKindGamepad, (GameInputDeviceStatus)filter, GameInputNoEnumeration, context, callback, token ); \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_RegisterKeyboardLayoutCallback( v##ver##_IGameInput *iface,            \
+                                                                         v##ver##_IGameInputDevice *device, void *context, \
+                                                                         v##ver##_GameInputKeyboardLayoutCallback callback, \
+                                                                         GameInputCallbackToken *token )         \
+{                                                                                                                \
+    return register_callback( CALLBACK_KEYBOARD_LAYOUT, ver, device ? impl_from_v##ver##_IGameInputDevice( device ) : NULL, \
+                              GameInputKindKeyboard, 0, GameInputNoEnumeration, context, callback, token );      \
+}                                                                                                                \
+static void WINAPI v##ver##_gameinput_StopCallback( v##ver##_IGameInput *iface, GameInputCallbackToken token )    \
+{                                                                                                                \
+    stop_callback( token );                                                                                      \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_CreateDispatcher( v##ver##_IGameInput *iface, IGameInputDispatcher **out ) \
+{                                                                                                                \
+    FIXME( "dispatcher not supported\n" );                                                                       \
+    *out = NULL;                                                                                                 \
+    return E_NOTIMPL;                                                                                            \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_FindDeviceFromId( v##ver##_IGameInput *iface, const APP_LOCAL_DEVICE_ID *id, \
+                                                           v##ver##_IGameInputDevice **out )                     \
+{                                                                                                                \
+    struct device *device;                                                                                       \
+    HRESULT hr = find_device_from_id( id, &device );                                                             \
+    *out = SUCCEEDED(hr) ? &device->v##ver##_iface : NULL;                                                       \
+    return hr;                                                                                                   \
+}                                                                                                                \
+static HRESULT WINAPI v##ver##_gameinput_FindDeviceFromPlatformString( v##ver##_IGameInput *iface, const WCHAR *value, \
+                                                                       v##ver##_IGameInputDevice **out )         \
+{                                                                                                                \
+    *out = NULL;                                                                                                 \
+    return GAMEINPUT_E_DEVICE_NOT_FOUND;                                                                         \
+}                                                                                                                \
+static void WINAPI v##ver##_gameinput_SetFocusPolicy( v##ver##_IGameInput *iface, GameInputFocusPolicy policy )   \
+{                                                                                                                \
+    /* readings are not filtered by focus: the game's window is the one in front while it reads them */         \
+    TRACE( "policy %#x\n", policy );                                                                             \
+}
+
+GAMEINPUT_COMMON( 0 )
+GAMEINPUT_COMMON( 1 )
+GAMEINPUT_COMMON( 2 )
+
+static HRESULT WINAPI v0_gameinput_GetTemporalReading( v0_IGameInput *iface, uint64_t timestamp, v0_IGameInputDevice *device,
+                                                       v0_IGameInputReading **out )
+{
+    *out = NULL;
+    return GAMEINPUT_E_READING_NOT_FOUND;
+}
+
+static HRESULT WINAPI v0_gameinput_RegisterReadingCallback( v0_IGameInput *iface, v0_IGameInputDevice *device, GameInputKind kind,
+                                                            float threshold, void *context, v0_GameInputReadingCallback callback,
+                                                            GameInputCallbackToken *token )
+{
+    return register_callback( CALLBACK_READING, 0, device ? impl_from_v0_IGameInputDevice( device ) : NULL, kind, 0,
+                              GameInputNoEnumeration, context, callback, token );
+}
+
+static HRESULT WINAPI v1_gameinput_RegisterReadingCallback( v1_IGameInput *iface, v1_IGameInputDevice *device, GameInputKind kind,
+                                                            void *context, v1_GameInputReadingCallback callback,
+                                                            GameInputCallbackToken *token )
+{
+    return register_callback( CALLBACK_READING, 1, device ? impl_from_v1_IGameInputDevice( device ) : NULL, kind, 0,
+                              GameInputNoEnumeration, context, callback, token );
+}
+
+static HRESULT WINAPI v2_gameinput_RegisterReadingCallback( v2_IGameInput *iface, v2_IGameInputDevice *device, GameInputKind kind,
+                                                            void *context, v2_GameInputReadingCallback callback,
+                                                            GameInputCallbackToken *token )
+{
+    return register_callback( CALLBACK_READING, 2, device ? impl_from_v2_IGameInputDevice( device ) : NULL, kind, 0,
+                              GameInputNoEnumeration, context, callback, token );
+}
+
+static bool WINAPI v0_gameinput_UnregisterCallback( v0_IGameInput *iface, GameInputCallbackToken token, uint64_t timeout_ms )
+{
+    return unregister_callback( token );
+}
+
+static bool WINAPI v1_gameinput_UnregisterCallback( v1_IGameInput *iface, GameInputCallbackToken token )
+{
+    return unregister_callback( token );
+}
+
+static bool WINAPI v2_gameinput_UnregisterCallback( v2_IGameInput *iface, GameInputCallbackToken token )
+{
+    return unregister_callback( token );
+}
+
+static HRESULT WINAPI v0_gameinput_CreateAggregateDevice( v0_IGameInput *iface, GameInputKind kind, v0_IGameInputDevice **out )
+{
+    *out = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI v0_gameinput_FindDeviceFromObject( v0_IGameInput *iface, IUnknown *value, v0_IGameInputDevice **out )
+{
+    *out = NULL;
+    return GAMEINPUT_E_DEVICE_NOT_FOUND;
+}
+
+static HRESULT WINAPI v0_gameinput_FindDeviceFromPlatformHandle( v0_IGameInput *iface, HANDLE value, v0_IGameInputDevice **out )
+{
+    *out = NULL;
+    return GAMEINPUT_E_DEVICE_NOT_FOUND;
+}
+
+static HRESULT WINAPI v0_gameinput_EnableOemDeviceSupport( v0_IGameInput *iface, uint16_t vid, uint16_t pid, uint8_t iface_number,
+                                                           uint8_t collection )
+{
+    return S_OK;
+}
+
+static const struct v0_IGameInputVtbl v0_gameinput_vtbl =
+{
+    .QueryInterface = v0_gameinput_QueryInterface,
+    .AddRef = v0_gameinput_AddRef,
+    .Release = v0_gameinput_Release,
+    .GetCurrentTimestamp = v0_gameinput_GetCurrentTimestamp,
+    .GetCurrentReading = v0_gameinput_GetCurrentReading,
+    .GetNextReading = v0_gameinput_GetNextReading,
+    .GetPreviousReading = v0_gameinput_GetPreviousReading,
+    .GetTemporalReading = v0_gameinput_GetTemporalReading,
+    .RegisterReadingCallback = v0_gameinput_RegisterReadingCallback,
+    .RegisterDeviceCallback = v0_gameinput_RegisterDeviceCallback,
+    .RegisterSystemButtonCallback = v0_gameinput_RegisterSystemButtonCallback,
+    .RegisterKeyboardLayoutCallback = v0_gameinput_RegisterKeyboardLayoutCallback,
+    .StopCallback = v0_gameinput_StopCallback,
+    .UnregisterCallback = v0_gameinput_UnregisterCallback,
+    .CreateDispatcher = v0_gameinput_CreateDispatcher,
+    .CreateAggregateDevice = v0_gameinput_CreateAggregateDevice,
+    .FindDeviceFromId = v0_gameinput_FindDeviceFromId,
+    .FindDeviceFromObject = v0_gameinput_FindDeviceFromObject,
+    .FindDeviceFromPlatformHandle = v0_gameinput_FindDeviceFromPlatformHandle,
+    .FindDeviceFromPlatformString = v0_gameinput_FindDeviceFromPlatformString,
+    .EnableOemDeviceSupport = v0_gameinput_EnableOemDeviceSupport,
+    .SetFocusPolicy = v0_gameinput_SetFocusPolicy,
+};
+
+static const struct v1_IGameInputVtbl v1_gameinput_vtbl =
+{
+    .QueryInterface = v1_gameinput_QueryInterface,
+    .AddRef = v1_gameinput_AddRef,
+    .Release = v1_gameinput_Release,
+    .GetCurrentTimestamp = v1_gameinput_GetCurrentTimestamp,
+    .GetCurrentReading = v1_gameinput_GetCurrentReading,
+    .GetNextReading = v1_gameinput_GetNextReading,
+    .GetPreviousReading = v1_gameinput_GetPreviousReading,
+    .RegisterReadingCallback = v1_gameinput_RegisterReadingCallback,
+    .RegisterDeviceCallback = v1_gameinput_RegisterDeviceCallback,
+    .RegisterSystemButtonCallback = v1_gameinput_RegisterSystemButtonCallback,
+    .RegisterKeyboardLayoutCallback = v1_gameinput_RegisterKeyboardLayoutCallback,
+    .StopCallback = v1_gameinput_StopCallback,
+    .UnregisterCallback = v1_gameinput_UnregisterCallback,
+    .CreateDispatcher = v1_gameinput_CreateDispatcher,
+    .FindDeviceFromId = v1_gameinput_FindDeviceFromId,
+    .FindDeviceFromPlatformString = v1_gameinput_FindDeviceFromPlatformString,
+    .SetFocusPolicy = v1_gameinput_SetFocusPolicy,
+};
+
+static const struct v2_IGameInputVtbl v2_gameinput_vtbl =
+{
+    .QueryInterface = v2_gameinput_QueryInterface,
+    .AddRef = v2_gameinput_AddRef,
+    .Release = v2_gameinput_Release,
+    .GetCurrentTimestamp = v2_gameinput_GetCurrentTimestamp,
+    .GetCurrentReading = v2_gameinput_GetCurrentReading,
+    .GetNextReading = v2_gameinput_GetNextReading,
+    .GetPreviousReading = v2_gameinput_GetPreviousReading,
+    .RegisterReadingCallback = v2_gameinput_RegisterReadingCallback,
+    .RegisterDeviceCallback = v2_gameinput_RegisterDeviceCallback,
+    .RegisterSystemButtonCallback = v2_gameinput_RegisterSystemButtonCallback,
+    .RegisterKeyboardLayoutCallback = v2_gameinput_RegisterKeyboardLayoutCallback,
+    .StopCallback = v2_gameinput_StopCallback,
+    .UnregisterCallback = v2_gameinput_UnregisterCallback,
+    .CreateDispatcher = v2_gameinput_CreateDispatcher,
+    .FindDeviceFromId = v2_gameinput_FindDeviceFromId,
+    .FindDeviceFromPlatformString = v2_gameinput_FindDeviceFromPlatformString,
+    .SetFocusPolicy = v2_gameinput_SetFocusPolicy,
+};
+
+static struct gameinput gameinput =
+{
+    {&v0_gameinput_vtbl},
+    {&v1_gameinput_vtbl},
+    {&v2_gameinput_vtbl},
+    0,
+};
+
+HRESULT WINAPI GameInputCreate( v0_IGameInput **out )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+
+    TRACE( "out %p\n", out );
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!gameinput_enabled())
+    {
+        FIXME( "out %p, stub! (set WINE_GAMEINPUT=1 for controllers through XInput)\n", out );
+        return E_NOTIMPL;
+    }
+    InitOnceExecuteOnce( &once, init_devices, NULL, NULL );
+    *out = &gameinput.v0_iface;
+    InterlockedIncrement( &gameinput.ref );
+    return S_OK;
+}
+
+HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
+{
+    FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid(clsid), debugstr_guid(riid), out );
+    return CLASS_E_CLASSNOTAVAILABLE;
+}
+
+BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+{
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls( instance );
+        break;
+    case DLL_PROCESS_DETACH:
+        shutting_down = TRUE;
+        break;
+    }
+    return TRUE;
+}

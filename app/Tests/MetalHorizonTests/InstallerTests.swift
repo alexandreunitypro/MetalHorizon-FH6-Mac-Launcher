@@ -7,19 +7,9 @@ import XCTest
 //   cd app && swift test          MH_TEST_DOWNLOAD=1 swift test
 // Only this test accepts Apple's licence (for its own throwaway copy); the app always asks the user.
 final class InstallerTests: XCTestCase {
-    static let root = FileManager.default.temporaryDirectory.appendingPathComponent("metalhorizon-installer-test-\(getpid())")
+    static var root: URL { TestEnvironment.root }
 
-    override class func setUp() {
-        try? FileManager.default.removeItem(at: root)
-        setenv("MH_SUPPORT_DIR", root.path, 1)   // before supportDirectory is first read
-        if ProcessInfo.processInfo.environment["MH_TEST_DOWNLOAD"] != nil {
-            unsetenv("MH_COMPONENTS_DIR")      // like a new Mac: from the public release over the network
-        } else if ProcessInfo.processInfo.environment["MH_COMPONENTS_DIR"] == nil {
-            setenv("MH_COMPONENTS_DIR", FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BlackwellEngine-build").path, 1)
-        }
-    }
-
-    override class func tearDown() { try? FileManager.default.removeItem(at: root) }
+    override class func setUp() { TestEnvironment.ensure() }
 
     private func components() throws -> [String: Component] {
         let json = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -79,6 +69,7 @@ final class InstallerTests: XCTestCase {
         let game = Self.root.appendingPathComponent("FH6").path
         try FileManager.default.createDirectory(atPath: game, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: game + "/forzahorizon6.exe", contents: Data())
+        FileManager.default.createFile(atPath: game + "/.xodus-streaming.msixvc", contents: Data())
         let script = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Resources/metalhorizon-play.sh")
         var env = Setup(gameDirectory: game, metalHUD: false).playEnvironment(resources: URL(fileURLWithPath: "/usr/bin"))
@@ -97,5 +88,32 @@ final class InstallerTests: XCTestCase {
         XCTAssertFalse(out.contains("STOP"), out)
         XCTAssertFalse(out.lowercased().contains("crossover"), out)
         XCTAssertTrue(out.contains("HB_D3D12_REAL=\"Z:" + shimDirectory + "/x86_64-windows/apd12.dll\""), out)
+    }
+
+    /// The Steam variant installs beside the Xbox one, with what Steam needs: the 32-bit half and DXMT.
+    func testInstallSteamEngine() async throws {
+        let steam = try XCTUnwrap(try components()["engine-steam"])
+        let local = ProcessInfo.processInfo.environment["MH_COMPONENTS_DIR"].map { URL(fileURLWithPath: $0) }
+        let name = URL(string: steam.url)!.lastPathComponent
+        if ProcessInfo.processInfo.environment["MH_TEST_DOWNLOAD"] == nil {
+            // the Steam tarball is made in its own work folder; the test reads it from there
+            let built = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("BlackwellEngine-build-steam/\(name)")
+            guard let local, fileExists(built.path) || fileExists(local.appendingPathComponent(name).path) else {
+                throw XCTSkip("\(name) is not built on this Mac")
+            }
+            if !fileExists(local.appendingPathComponent(name).path) {
+                setenv("MH_COMPONENTS_DIR", built.deletingLastPathComponent().path, 1)
+            }
+        }
+        defer { if let local { setenv("MH_COMPONENTS_DIR", local.path, 1) } }
+        try await Installer.install(steam, confirm: { _ in false }, progress: { _, _ in })
+        XCTAssertTrue(steam.isInstalled)
+        let setup = Setup(edition: .steam)
+        XCTAssertEqual(setup.engine, installedSteamEngineDirectory)
+        XCTAssertTrue(fileExists(installedSteamEngineDirectory + "/lib/wine/i386-windows/ntdll.dll"))
+        XCTAssertTrue(fileExists(installedSteamEngineDirectory + "/renderers/dxmt/wine/x86_64-windows/dxgi.dll"))
+        XCTAssertTrue(fileExists(installedSteamEngineDirectory + "/lib/libSDL2-2.0.0.dylib"))
+        XCTAssertTrue(setup.engineCheck.ok, setup.engineCheck.text)
+        XCTAssertNil(setup.engineCheck.fix, setup.engineCheck.fix ?? "")
     }
 }

@@ -18,3 +18,7 @@
 0009-diag-msgbox.patch
 0010-kernelbase-per-exe-command-line-append.patch
 0011-winemac-cross-process-child-swapchains.patch
+# GameInput (controllers in GDK games) on top of XInput; off unless WINE_GAMEINPUT=1. Source: src/gameinput/.
+0012-gameinput-xinput-backend.patch
+# The 32-bit half: 0005's FH6 diagnostics read x86_64 registers, kept to the 64-bit build.
+0013-i386-build-guards.patch

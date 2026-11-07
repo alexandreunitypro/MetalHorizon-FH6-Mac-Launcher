@@ -35,10 +35,14 @@
     "moltenvk": {
       "url": "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar",
       "sha256": "f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e"
+    },
+    "sdl2": {
+      "url": "https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz",
+      "sha256": "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+      "note": "Controllers: Wine's winebus.sys reads every pad SDL knows (Xbox, PlayStation, Switch, 8BitDo, generic HID) and maps it to an XInput layout."
     }
   },
   "configure": [
-    "--enable-archs=x86_64",
     "--enable-tools",
     "--with-mingw",
     "--with-coreaudio",
@@ -63,5 +67,31 @@
     "--without-x",
     "--disable-tests"
   ],
-  "configureNote": "The working engine's flags. FreeType and GnuTLS are off for configure and turned on afterwards in config.h with bare library names (as tools/mac_enable_freetype.sh and tools/mac_enable_gnutls.sh did), so Wine dlopens the x86_64 copies engine/build-deps.sh puts in the engine's lib/."
+  "configureNote": "The working engine's flags. FreeType and GnuTLS are off for configure and turned on afterwards in config.h with bare library names (as tools/mac_enable_freetype.sh and tools/mac_enable_gnutls.sh did), so Wine dlopens the x86_64 copies engine/build-deps.sh puts in the engine's lib/. SDL2 is handled the same way (SONAME_LIBSDL2, headers on make's command line). --enable-archs comes from the variant: the Steam variant adds the 32-bit half, which Steam's installer and client need (they are 32-bit programs).",
+  "dxmt": {
+    "name": "DXMT, Highball's build 331c552 (MIT)",
+    "url": "https://github.com/gauthierpiarrette/highball-engine/releases/download/dxmt-highball-20261017T231707Z-331c552/dxmt-highball-20261017T231707Z-331c552.tar.gz",
+    "sha256": "89e731b81cc1ef741accb2e707159f121ed822a083f14f16da445cd8dbbf4703",
+    "source": "https://github.com/gauthierpiarrette/dxmt (fork of 3Shain/dxmt), commit 331c552, built by highball-engine's build-dxmt.yml",
+    "license": "https://raw.githubusercontent.com/3Shain/dxmt/v0.80/LICENSE",
+    "licenseSha256": "6b928413c6308c106f3e0080bd94b6427b56d587d400fd40e6cbfbab7d9c4ae1",
+    "note": "Steam variant only: the renderer Steam's own window draws with. Steam's web views cannot present under D3DMetal (black window; Highball's SteamRestart.swift). DXMT's release builds refuse a swap chain for another process's window ('CreateSwapChain: cross-process swapchain not supported yet'), which is how Steam's GPU process draws; Highball's fork allows it behind DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN=1, with engine patch 0011 on the Mac driver's side. Measured 2026-11-07 on an M5 Pro, macOS 27.2: v0.80 logs that error, this build draws Steam's sign-in window."
+  },
+  "mingw-w64": {
+    "name": "mingw-w64 gcc (Homebrew, brew install mingw-w64)",
+    "note": "Steam variant only: the PE half and its 32-bit side, as Highball builds it. highball-engine/inputs.json: llvm-mingw is known to break Steam's login (frankea, 2026-08-04)."
+  },
+  "variants": {
+    "xbox": {
+      "series": "series",
+      "archs": "x86_64",
+      "pe": "llvm-mingw"
+    },
+    "steam": {
+      "series": "series-steam",
+      "archs": "i386,x86_64",
+      "pe": "mingw-w64",
+      "dxmt": true
+    }
+  }
 }

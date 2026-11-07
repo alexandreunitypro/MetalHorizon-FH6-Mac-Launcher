@@ -22,11 +22,15 @@ func xboxAccountSaved() -> Bool {
 }
 
 struct MetalHorizonApp: App {
+    @StateObject private var model = LauncherModel()
+    @StateObject private var updater = Updater()   // Updater.swift: the check at each launch, the forced update
+    @State private var showAssistant = false
+
     init() {
-        // MH_SNAPSHOT=<file.png>: draw the open window (with MH_SNAPSHOT_SHEET=1, the AI assistant sheet) into an image
-        // and quit, to check the layout. The app draws its own layers: no screen recording permission is needed.
+        // MH_SNAPSHOT=<file.png>: draw the open window (with MH_SNAPSHOT_SHEET=welcome, the first-launch sheet) into an
+        // image and quit, to check the layout. The app draws its own layers: no screen recording permission is needed.
         guard let path = ProcessInfo.processInfo.environment["MH_SNAPSHOT"] else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
             let window = NSApp.windows.first { $0.isSheet && $0.isVisible } ?? NSApp.windows.first { $0.isVisible }
             if let view = window?.contentView?.superview ?? window?.contentView, let layer = view.layer {
                 let scale = window?.backingScaleFactor ?? 2
@@ -48,12 +52,53 @@ struct MetalHorizonApp: App {
 
     var body: some Scene {
         WindowGroup("MetalHorizon") {
-            LauncherView()
-                .frame(minWidth: 640, minHeight: 600)
+            LauncherView(model: model)
+                .frame(minWidth: 720, minHeight: 760)
+                .sheet(isPresented: $showAssistant) { AssistantSheet() }
+                .appUpdates(updater, model: model)
         }
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About MetalHorizon") { showAbout() }
+                Button("Check for Updates…") { updater.checkNow(model: model) }
+            }
+            CommandMenu("Options") {
+                Toggle("Metal Performance HUD", isOn: $model.metalHUD)
+                Toggle("MetalFX Upscaling (DLSS in the Game)", isOn: $model.metalFX)
+                Picker("Frame Cap", selection: $model.maxFPS) {
+                    Text("None").tag(0)
+                    ForEach([30, 40, 45, 60], id: \.self) { Text("\($0) fps").tag($0) }
+                }
+                Picker("Controllers", selection: $model.controllerMode) {
+                    ForEach(ControllerMode.allCases) { Text($0.title).tag($0) }
+                }
+                Divider()
+                Toggle("Relaunch After D3DMetal Start-up Failure", isOn: $model.autoRetry)
+                Picker("Crash Reports", selection: $model.crashReportMode) {
+                    ForEach(CrashReportMode.allCases) { Text($0.title).tag($0) }
+                }
+            }
+            CommandMenu("Tools") {
+                Button("Run Checks Again") { model.refreshChecks() }
+                    .keyboardShortcut("r", modifiers: [.command])
+                Button("Export Diagnostics…") { model.exportDiagnostics() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                Button("Report an Issue on GitHub…") { model.reportIssue() }
+                Button("Send the Last Crash Report…") { model.showLastCrashReport() }
+                Divider()
+                Button("Show Logs in Finder") { model.revealLogs() }
+                Button("Open the Wine Prefix in Finder") { model.revealPrefix() }
+                Button("Test Controllers in Wine…") { model.runTool("joycpl") }
+                Button("Wine Configuration…") { model.runTool("winecfg") }
+                Divider()
+                Button("Open Steam") { model.openSteam() }
+                    .disabled(model.edition != .steam)
+                Button("Stop Steam") { model.stopSteam() }
+                    .disabled(model.edition != .steam)
+            }
+            CommandGroup(after: .help) {
+                Button("Connect an AI Assistant (MCP)…") { showAssistant = true }
+                Button("MetalHorizon on GitHub") { NSWorkspace.shared.open(issuesURL.deletingLastPathComponent()) }
             }
             // The projects MetalHorizon is built on; each item opens its GitHub page.
             CommandMenu("Thanks") {
@@ -78,6 +123,8 @@ struct MetalHorizonApp: App {
             ("Mullion", "https://github.com/dttdrv/mullion"),
             ("Wine", "https://github.com/wine-mirror/wine"),
             ("llvm-mingw", "https://github.com/mstorsjo/llvm-mingw"),
+            ("mingw-w64", "https://www.mingw-w64.org"),
+            ("SDL", "https://github.com/libsdl-org/SDL"),
             ("MoltenVK", "https://github.com/KhronosGroup/MoltenVK"),
             ("Blackwell Engine", "https://github.com/alexandreunitypro/blackwell-engine")
         ]
@@ -85,20 +132,32 @@ struct MetalHorizonApp: App {
 
     private func showAbout() {
         let credits = NSAttributedString(string: """
-            Prototype. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Playground Games, Apple or CodeWeavers. \
-            Built on Highball, Ferestre, xodus, Wine and Apple's D3DMetal: see the Thanks menu.
+            Prototype. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
+            Built on Highball, Ferestre, xodus, Wine, DXMT, SDL and Apple's D3DMetal: see the Thanks menu.
             """, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
         NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
         NSApp.activate(ignoringOtherApps: true)
     }
 }
 
-enum Activity { case idle, signIn, install, download, game }
+enum Activity { case idle, signIn, install, download, game, steam }
+
+enum LogView: String, CaseIterable, Identifiable {
+    case activity, game
+    var id: String { rawValue }
+    var title: String { self == .activity ? "Activity" : "Game Output" }
+}
 
 @MainActor
 final class LauncherModel: ObservableObject {
+    @Published var edition = Edition.xbox {
+        didSet { settingsStore().set(edition.rawValue, forKey: SettingKey.edition); editionChanged() }
+    }
     @Published var gameDirectory = "" {
-        didSet { settingsStore().set(gameDirectory, forKey: SettingKey.gameDirectory) }
+        didSet { settingsStore().set(gameDirectory, forKey: SettingKey.gameDirectory); refreshChecks() }
+    }
+    @Published var steamPrefix = "" {
+        didSet { settingsStore().set(steamPrefix, forKey: SettingKey.steamPrefix); refreshChecks() }
     }
     @Published var engineDirectory = "" {
         didSet { settingsStore().set(engineDirectory, forKey: SettingKey.engineDirectory) }
@@ -109,11 +168,29 @@ final class LauncherModel: ObservableObject {
     @Published var metalHUD = true {
         didSet { settingsStore().set(metalHUD, forKey: SettingKey.metalHUD) }
     }
+    @Published var controllerMode = ControllerMode.automatic {
+        didSet { settingsStore().set(controllerMode.rawValue, forKey: SettingKey.controllerMode) }
+    }
+    @Published var metalFX = false {
+        didSet { settingsStore().set(metalFX, forKey: SettingKey.metalFX) }
+    }
+    @Published var maxFPS = 0 {
+        didSet { settingsStore().set(maxFPS, forKey: SettingKey.maxFPS) }
+    }
+    @Published var autoRetry = true {
+        didSet { settingsStore().set(autoRetry, forKey: SettingKey.autoRetry) }
+    }
     @Published var activity = Activity.idle
     @Published var status = "Ready."
-    @Published var output = ""
     @Published var accountSaved = false
     @Published var installFraction: Double?
+    @Published var steamStatus = SteamStatus()
+    @Published var findings: [Finding] = []
+    @Published var preflight: [PreflightItem] = []
+    @Published var logView = LogView.activity { didSet { reloadLogView() } }
+    @Published var errorsOnly = false
+    @Published var search = ""
+    @Published private(set) var logLines: [String] = []
     /// The first-launch guide; the components install once it is closed, so Apple's licence comes after it.
     @Published var showWelcome: Bool = {
         if let sheet = ProcessInfo.processInfo.environment["MH_SNAPSHOT_SHEET"] { return sheet == "welcome" }
@@ -122,11 +199,20 @@ final class LauncherModel: ObservableObject {
     }()
     @Published var licenseText: String?
     private var licenseAnswer: CheckedContinuation<Bool, Never>?
+    /// A crash to show (CrashReport.swift): at launch for a run that crashed meanwhile, or right after one.
+    @Published var crashReport: CrashReport?
+    @Published var crashReportSending = false
+    @Published var crashReportMode = CrashReport.mode {
+        didSet { CrashReport.mode = crashReportMode }
+    }
 
     private var process: Process?
-    private var runLogFile: URL?
-    private var runLogHandle: FileHandle?
+    private var session: LogSession?
+    private var lastSessionURLs: (output: URL, game: URL)?
+    private let outputTail = LogTail()
+    private let gameTail = LogTail()
     private var runOutputTimer: Timer?
+    private var steamTimer: Timer?
     private var loginApplication: NSRunningApplication?
     private var loginObserver: NSObjectProtocol?
     private var loginStatusTimer: Timer?
@@ -137,10 +223,16 @@ final class LauncherModel: ObservableObject {
 
     init() {
         let saved = Setup.load()
+        edition = saved.edition
         gameDirectory = saved.gameDirectory
+        steamPrefix = saved.steamPrefix
         engineDirectory = saved.engineDirectory
         d3dmetalDirectory = saved.d3dmetalDirectory
         metalHUD = saved.metalHUD
+        controllerMode = saved.controllerMode
+        metalFX = saved.metalFX
+        maxFPS = saved.maxFPS
+        autoRetry = saved.autoRetry
         loginObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
@@ -165,6 +257,12 @@ final class LauncherModel: ObservableObject {
             }
         }
         refreshSavedAccountStatus()
+        refreshChecks()
+        showLastSession()
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil, let pending = CrashReport.pending(edition: edition) {
+            offerCrashReport(pending)
+        }
+        startSteamPolling()
         // Blackwell Engine and D3DMetal install by themselves (D3DMetal after Apple's licence is accepted).
         if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil && !showWelcome {
             Task { await self.installComponents() }
@@ -180,15 +278,36 @@ final class LauncherModel: ObservableObject {
 
     func openSupportPage() { NSWorkspace.shared.open(supportURL) }
 
+    private func editionChanged() {
+        refreshChecks()
+        startSteamPolling()
+        guard ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil, !showWelcome else { return }
+        Task { await installComponents() }
+    }
+
     // MARK: - What is set up
 
     var setup: Setup {
-        Setup(gameDirectory: gameDirectory, engineDirectory: engineDirectory,
-              d3dmetalDirectory: d3dmetalDirectory, metalHUD: metalHUD)
+        Setup(edition: edition, gameDirectory: gameDirectory, steamPrefix: steamPrefix, engineDirectory: engineDirectory,
+              d3dmetalDirectory: d3dmetalDirectory, metalHUD: metalHUD, controllerMode: controllerMode,
+              metalFX: metalFX, maxFPS: maxFPS, autoRetry: autoRetry)
     }
     var isBusy: Bool { activity != .idle }
-    var canDownload: Bool { !isBusy && !gameDirectory.isEmpty }
-    var canPlay: Bool { !isBusy && setup.gameCheck.ok }   // missing components install on the way
+    var canDownload: Bool { !isBusy && !gameDirectory.isEmpty && edition == .xbox }
+    var canPlay: Bool {
+        guard !isBusy else { return false }
+        return edition == .xbox ? setup.gameCheck.ok : setup.steamClientCheck.ok
+    }
+
+    /// The checks before Play and what the last run left, recomputed off the main thread.
+    func refreshChecks() {
+        let current = setup
+        Task.detached(priority: .utility) {
+            let items = Diagnostics.preflight(current)
+            await MainActor.run { self.preflight = items }
+        }
+        objectWillChange.send()
+    }
 
     // MARK: - Folders
 
@@ -208,15 +327,46 @@ final class LauncherModel: ObservableObject {
         if let url = pickFolder(title: "Folder for Forza Horizon 6",
                                 message: "Pick a real folder with a short path, such as ~/FH6, on a drive with about 160 GB free. Not in iCloud Drive.") {
             gameDirectory = url.path
+            if Setup.looksLikeSteamGameFolder(url.path) {
+                status = "That folder holds the Steam copy: switch the edition to Steam at the top of the window."
+            }
         }
+    }
+
+    /// The Steam prefix: MetalHorizon's own by default, or an existing bottle (Highball, CrossOver, Whisky) with Steam.
+    func chooseSteamPrefix() {
+        guard let url = pickFolder(title: "Steam prefix",
+                                   message: "Pick an empty folder for a new Steam prefix (about 170 GB with the game), or an existing Wine bottle that already has Steam and Forza Horizon 6 (Highball, CrossOver, Whisky).") else { return }
+        let path = url.path
+        if Setup.looksLikeSteamPrefix(path) {
+            steamPrefix = path
+            status = "Using the Steam already installed in \(path)."
+        } else if fileExists(path + "/drive_c") {
+            steamPrefix = path
+            status = "That bottle has no Steam yet: click Install Steam."
+        } else {
+            steamPrefix = path + "/MetalHorizon Steam"
+            status = "The Steam prefix will be created in \(steamPrefix)."
+        }
+    }
+
+    func useDefaultSteamPrefix() { steamPrefix = "" }
+
+    func revealLogs() { NSWorkspace.shared.open(logDirectory) }
+
+    func revealPrefix() {
+        let drive = setup.prefix + "/drive_c"
+        if fileExists(drive) { NSWorkspace.shared.open(URL(fileURLWithPath: drive)) }
+        else { status = "No Wine prefix yet: it is created by the first Play (Xbox) or by Install Steam." }
     }
 
     // MARK: - Blackwell Engine and D3DMetal
 
-    /// Installs what is missing (Blackwell Engine, then D3DMetal once Apple's licence is accepted) and the shim.
+    /// Installs what the edition is missing (its Blackwell Engine, then D3DMetal once Apple's licence is accepted) and
+    /// assembles the shim from that engine.
     func installComponents() async {
         guard !isBusy else { return }
-        let steam = setup.isSteamEdition
+        let steam = edition == .steam
         let missing = Component.all().filter { component in
             guard !component.isInstalled else { return false }
             switch component.id {
@@ -225,9 +375,11 @@ final class LauncherModel: ObservableObject {
             default: return d3dmetalDirectory.isEmpty
             }
         }
-        if missing.isEmpty && setup.shimReady { return }
+        let shimFrom = setup.engine + "/renderers/tsshim/x86_64-windows/d3d12.dll"
+        let shimStale = (try? FileManager.default.contentsEqual(atPath: shimFrom, andPath: shimDirectory + "/x86_64-windows/d3d12.dll")) == false
+        if missing.isEmpty && setup.shimReady && !shimStale { return }
         activity = .install
-        defer { activity = .idle; installFraction = nil; objectWillChange.send() }
+        defer { activity = .idle; installFraction = nil; refreshChecks() }
         do {
             for component in missing {
                 try await Installer.install(component, confirm: { [weak self] license in
@@ -241,7 +393,10 @@ final class LauncherModel: ObservableObject {
                fileExists(current.d3dmetal + "/wine/x86_64-windows/d3d12.dll") {
                 try Installer.prepareShim(engine: current.engine, d3dmetal: current.d3dmetal)
             }
-            status = setup.gameCheck.ok ? "Ready." : "Blackwell Engine and D3DMetal are installed. Download the game."
+            status = current.componentsReady
+                ? (current.edition == .xbox ? (current.gameCheck.ok ? "Ready." : "Blackwell Engine and D3DMetal are installed. Download the game.")
+                   : (current.steamClientCheck.ok ? "Ready." : "Blackwell Engine Steam and D3DMetal are installed. Install Steam."))
+                : "Some components are missing; see the red lines."
         } catch {
             status = "\(error)"
         }
@@ -322,6 +477,79 @@ final class LauncherModel: ObservableObject {
         }
     }
 
+    // MARK: - Steam
+
+    private var steamScript: URL? { Bundle.main.resourceURL?.appendingPathComponent("metalhorizon-steam.sh") }
+
+    private func startSteamPolling() {
+        steamTimer?.invalidate()
+        steamTimer = nil
+        guard edition == .steam, ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil else { return }
+        refreshSteamStatus()
+        steamTimer = Timer.scheduledTimer(withTimeInterval: 6, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshSteamStatus() }
+        }
+    }
+
+    /// What runs in the Steam prefix (metalhorizon-steam.sh status), read off the main thread.
+    func refreshSteamStatus() {
+        guard edition == .steam, let script = steamScript, fileExists(script.path) else { return }
+        let env = ProcessInfo.processInfo.environment.merging(setup.steamEnvironment()) { _, new in new }
+        Task.detached(priority: .utility) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/bash")
+            task.arguments = [script.path, "status"]
+            task.environment = env
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = FileHandle.nullDevice
+            guard (try? task.run()) != nil else { return }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            let parsed = SteamStatus.parse(String(decoding: data, as: UTF8.self))
+            await MainActor.run {
+                if self.steamStatus != parsed { self.steamStatus = parsed }
+                self.objectWillChange.send()
+            }
+        }
+    }
+
+    private func runSteam(_ action: String, activity newActivity: Activity, statusText: String,
+                          finished: @escaping (Int32) -> String) {
+        guard let script = steamScript else { return }
+        let gameInput = Controllers.gameInputEnabled(mode: controllerMode, connected: Controllers.connected())
+        run(executable: URL(fileURLWithPath: "/bin/bash"), arguments: [script.path, action],
+            environment: setup.steamEnvironment(gameInput: gameInput), activity: newActivity, statusText: statusText,
+            logName: "steam-\(action)", finished: finished)
+    }
+
+    func installSteam() {
+        Task {
+            await installComponents()
+            guard setup.engineCheck.ok else { status = "Install Blackwell Engine Steam first (Engine line)."; return }
+            runSteam("install", activity: .steam, statusText: "Installing Steam…") { [weak self] code in
+                guard code == 0 else { return "Steam's installation stopped (error \(code)). See Diagnosis and the activity log." }
+                // straight on to Steam's window: its first start updates it, then the player signs in there
+                DispatchQueue.main.async { self?.openSteam() }
+                return "Steam installed; opening it. Its first start updates Steam (it can look frozen for a while), then sign in."
+            }
+        }
+    }
+
+    func openSteam() {
+        guard edition == .steam else { return }
+        runSteam("open", activity: .steam, statusText: "Opening Steam…") { code in
+            code == 0 ? "Steam is open. Sign in, then install Forza Horizon 6 from your Library." : "Steam did not open (error \(code)). See Diagnosis."
+        }
+    }
+
+    func stopSteam() {
+        guard edition == .steam else { return }
+        runSteam("stop", activity: .steam, statusText: "Stopping Steam…") { code in
+            code == 0 ? "Steam stopped." : "Steam did not stop cleanly (error \(code))."
+        }
+    }
+
     // MARK: - Download and Play
 
     func download() {
@@ -338,8 +566,10 @@ final class LauncherModel: ObservableObject {
         if !setup.readyToPlay {
             Task {
                 await installComponents()
-                if setup.isSteamEdition, !setup.steamClientCheck.ok { installSteamClient(); return }
                 if setup.readyToPlay { startGame() }
+                else if edition == .steam && !setup.steamGameCheck.ok {
+                    status = setup.steamGameCheck.fix ?? "Install Forza Horizon 6 in Steam first."
+                }
             }
             return
         }
@@ -348,42 +578,35 @@ final class LauncherModel: ObservableObject {
 
     private func startGame() {
         guard let resources = Bundle.main.resourceURL else { return }
-        if setup.isSteamEdition {
-            run(executable: URL(fileURLWithPath: "/bin/bash"),
-                arguments: [resources.appendingPathComponent("metalhorizon-play-steam.sh").path],
-                environment: setup.steamEnvironment(),
-                activity: .game, statusText: "Playing through Steam (experimental). Quit from the game's own menu.",
-                logName: "play-steam") { code in
-                code == 0 ? "Game closed." : "The game stopped (error \(code)). See the activity log."
+        let connected = Controllers.connected()
+        let gameInput = Controllers.gameInputEnabled(mode: controllerMode, connected: connected)
+        if edition == .steam {
+            runSteam("play", activity: .game, statusText: "Playing through Steam. Quit from the game's own menu; Steam stays open in the background.") { code in
+                code == 0 ? "Game closed." : "The game did not start or stopped (error \(code)). See Diagnosis."
             }
             return
         }
         run(executable: URL(fileURLWithPath: "/bin/bash"),
             arguments: [resources.appendingPathComponent("metalhorizon-play.sh").path],
-            environment: setup.playEnvironment(resources: resources),
-            activity: .game, statusText: "Playing. Quit from the game's menu; the cloud save uploads as it closes.",
+            environment: setup.playEnvironment(resources: resources, gameInput: gameInput),
+            activity: .game, statusText: "Playing\(gameInput ? " (controllers on)" : ""). Quit from the game's menu; the cloud save uploads as it closes.",
             logName: "play") { code in
-            code == 0 ? "Game closed." : "The game stopped (error \(code)). See the activity log."
+            code == 0 ? "Game closed." : "The game stopped (error \(code)). See Diagnosis."
         }
     }
 
-    /// Downloads Steam's own installer and runs it in the game's Steam-only prefix (metalhorizon-install-steam.sh).
-    /// The user clicks through Steam's installer and signs in, same as Microsoft sign-in is their own step.
-    func installSteamClient() {
-        guard !isBusy, let resources = Bundle.main.resourceURL else { return }
-        let current = setup
-        run(executable: URL(fileURLWithPath: "/bin/bash"),
-            arguments: [resources.appendingPathComponent("metalhorizon-install-steam.sh").path],
-            environment: ["MH_ENGINE": current.engine, "MH_PREFIX": current.steamPrefix],
-            activity: .install, statusText: "Downloading Steam's installer…",
-            logName: "install-steam") { code in
-            code == 0 ? "Steam installed. Sign in, then Play." : "Steam's installer stopped (error \(code)). See the activity log."
-        }
-    }
-
-    /// Stops a download or the sign-in; for the game, ends every Wine process of its prefix.
+    /// Stops a download or the sign-in; for the game, ends it (Xbox: every Wine process of its prefix; Steam: the game
+    /// only, Steam stays).
     func stop() {
         if activity == .game {
+            if edition == .steam {
+                let kill = Process()
+                kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+                kill.arguments = ["-f", "forzahorizon6\\.exe"]
+                try? kill.run()
+                status = "Force-quitting the game (Steam stays open)…"
+                return
+            }
             let kill = Process()
             kill.executableURL = URL(fileURLWithPath: setup.engine + "/bin/wineserver")
             kill.arguments = ["-k"]
@@ -403,28 +626,53 @@ final class LauncherModel: ObservableObject {
         status = "Stopped."
     }
 
+    /// A Wine tool in the current prefix: Wine's game controller panel or winecfg.
+    func runTool(_ tool: String) {
+        guard let script = Bundle.main.resourceURL?.appendingPathComponent("metalhorizon-tool.sh") else { return }
+        var env = setup.optionsEnvironment(gameInput: true)
+        env["MH_PREFIX"] = setup.prefix
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        task.arguments = [script.path, tool]
+        task.environment = ProcessInfo.processInfo.environment.merging(env) { _, new in new }
+        let log = logDirectory.appendingPathComponent("tool-\(tool).log")
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+        if let handle = try? FileHandle(forWritingTo: log) { task.standardOutput = handle; task.standardError = handle }
+        do { try task.run(); status = tool == "joycpl" ? "Wine's Game Controllers panel is opening: move the sticks to test." : "Opening \(tool)…" }
+        catch { status = "Could not start \(tool): \(error.localizedDescription)" }
+    }
+
+    // MARK: - Runs, logs and diagnosis
+
     private func run(executable: URL, arguments: [String], environment: [String: String], activity newActivity: Activity,
                      statusText: String, logName: String, finished: @escaping (Int32) -> String) {
         guard !isBusy else { return }
-        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-        let logFile = logDirectory.appendingPathComponent("\(logName)-\(stamp).log")
-        guard FileManager.default.createFile(atPath: logFile.path, contents: nil),
-              let logHandle = try? FileHandle(forWritingTo: logFile) else {
+        let newSession: LogSession
+        do { newSession = try LogSession.create(kind: logName) } catch {
             status = "Could not create the log in \(logDirectory.path)."
             return
         }
+        guard let logHandle = try? FileHandle(forWritingTo: newSession.output) else {
+            status = "Could not write \(newSession.output.path)."
+            return
+        }
+        var env = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        env["MH_GAME_LOG"] = newSession.game.path
         let task = Process()
         task.executableURL = executable
         task.arguments = arguments
         task.standardOutput = logHandle
         task.standardError = logHandle
-        task.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        task.environment = env
         process = task
-        runLogFile = logFile
-        runLogHandle = logHandle
+        session = newSession
+        lastSessionURLs = (newSession.output, newSession.game)
+        outputTail.reset(newSession.output)
+        gameTail.reset(newSession.game)
+        logLines = []
         activity = newActivity
         status = statusText
-        output = ""
+        findings = []
         runOutputTimer?.invalidate()
         runOutputTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshRunOutput() }
@@ -434,12 +682,25 @@ final class LauncherModel: ObservableObject {
                 guard let self else { return }
                 self.runOutputTimer?.invalidate()
                 self.runOutputTimer = nil
-                try? self.runLogHandle?.close()
-                self.runLogHandle = nil
+                try? logHandle.close()
                 self.refreshRunOutput()
                 self.activity = .idle
                 self.process = nil
-                self.status = finished(done.terminationStatus)
+                let code = done.terminationStatus
+                self.findings = newSession.finish(exitCode: code)
+                self.status = finished(code)
+                if let first = self.findings.first, first.issue.severity >= .warning, code != 0 || first.issue.severity == .error {
+                    self.status += " Diagnosis: \(first.issue.title)."
+                }
+                self.session = nil
+                if logName == "play" || logName == "steam-play",
+                   let info = LogStore.sessions().first(where: { $0.id == newSession.id }),
+                   let report = CrashReport.make(info, edition: self.edition) {
+                    self.offerCrashReport(report)
+                }
+                self.refreshSavedAccountStatus()
+                self.refreshChecks()
+                self.refreshSteamStatus()
             }
         }
         do {
@@ -447,22 +708,110 @@ final class LauncherModel: ObservableObject {
         } catch {
             runOutputTimer?.invalidate()
             runOutputTimer = nil
-            try? runLogHandle?.close()
-            runLogHandle = nil
+            try? logHandle.close()
             process = nil
+            session = nil
             activity = .idle
             status = "Could not start: \(error.localizedDescription)"
         }
     }
 
-    private func refreshRunOutput() {
-        guard let runLogFile, let contents = try? String(contentsOf: runLogFile, encoding: .utf8) else { return }
-        let tail = String(contents.suffix(20_000))   // a download writes a lot of progress lines
-        if output != tail { output = tail }
+    /// The last session's logs and findings, when the app opens.
+    private func showLastSession() {
+        guard let last = LogStore.sessions().first else { return }
+        let output = last.directory.appendingPathComponent("output.log")
+        let game = last.directory.appendingPathComponent("game.log")
+        lastSessionURLs = (output, game)
+        outputTail.reset(output)
+        gameTail.reset(game)
+        findings = Diagnostics.scan(files: [output, game])
+        refreshRunOutput()
     }
 
-    func revealLogs() { NSWorkspace.shared.open(logDirectory) }
+    private func refreshRunOutput() {
+        let changed = logView == .activity ? outputTail.poll() : gameTail.poll()
+        if logView == .activity { gameTail.poll() } else { outputTail.poll() }
+        if changed || logLines.isEmpty { reloadLogView() }
+    }
 
+    private func reloadLogView() {
+        let source = logView == .activity ? outputTail.lines : gameTail.lines
+        let shown = LogFilter.apply(source, errorsOnly: errorsOnly, search: search)
+        logLines = Array(shown.suffix(1500))
+    }
+
+    func filterChanged() { reloadLogView() }
+
+    var logPlaceholder: String {
+        switch edition {
+        case .xbox: return "MetalHorizon installs Blackwell Engine and D3DMetal by itself. Sign in, download the game, then click Play."
+        case .steam: return "Install Steam, open it and sign in, install Forza Horizon 6 from your Steam Library, then click Play."
+        }
+    }
+
+    func exportDiagnostics() {
+        let current = setup
+        status = "Writing the diagnostics bundle…"
+        Task.detached(priority: .userInitiated) {
+            do {
+                let url = try Diagnostics.exportBundle(current)
+                await MainActor.run {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                    self.status = "Diagnostics saved on the Desktop: \(url.lastPathComponent). Secrets are removed; attach it to a GitHub issue."
+                }
+            } catch {
+                await MainActor.run { self.status = "Could not write the diagnostics: \(error)" }
+            }
+        }
+    }
+
+    func reportIssue() {
+        NSWorkspace.shared.open(Diagnostics.issueURL(setup, findings: findings))
+    }
+
+    // MARK: - Crash reports
+
+    private func offerCrashReport(_ report: CrashReport) {
+        switch CrashReport.mode {
+        case .never: return
+        case .automatic where CrashReport.endpoint != nil: sendCrashReport(report)
+        default: crashReport = report
+        }
+    }
+
+    func sendCrashReport(_ report: CrashReport) {
+        let current = setup
+        crashReportSending = true
+        status = "Sending the crash report…"
+        Task {
+            let result = await report.send(setup: current)
+            crashReportSending = false
+            crashReport = nil
+            status = result
+        }
+    }
+
+    func dismissCrashReport() {
+        if let report = crashReport { CrashReport.markHandled(report.id) }
+        crashReport = nil
+    }
+
+    /// Tools › Send the Last Crash Report…: the newest play run, even if it was dismissed before.
+    func showLastCrashReport() {
+        guard let session = LogStore.sessions().first(where: { $0.kind == "play" || $0.kind == "steam-play" }) else {
+            status = "No game run yet."
+            return
+        }
+        if let report = CrashReport.make(session, edition: edition) { crashReport = report }
+        else { status = "The last game run did not crash. Export Diagnostics sends its logs anyway." }
+    }
+
+    func copyRosettaCommand() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("softwareupdate --install-rosetta --agree-to-license", forType: .string)
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+        status = "The command is copied: paste it in Terminal and press Return."
+    }
 }
 
 // MARK: - Window
@@ -474,49 +823,57 @@ private func statusLight(_ check: Check) -> some View {
     return Image(nsImage: NSImage(named: name) ?? NSImage())
 }
 
-struct LauncherView: View {
-    @StateObject private var model: LauncherModel
-    private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-
-    @MainActor init(model: LauncherModel? = nil) {
-        _model = StateObject(wrappedValue: model ?? LauncherModel())
+private func severityIcon(_ severity: Severity) -> some View {
+    let name: String
+    let color: Color
+    switch severity {
+    case .error: name = "xmark.octagon.fill"; color = .red
+    case .warning: name = "exclamationmark.triangle.fill"; color = .orange
+    case .info: name = "info.circle.fill"; color = .secondary
     }
+    return Image(systemName: name).foregroundColor(color)
+}
+
+struct LauncherView: View {
+    @ObservedObject var model: LauncherModel
+    @StateObject private var controllers = ControllerMonitor()
+
+    private let labelWidth: CGFloat = 96
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            GroupBox(label: Text("Xbox Account")) {
-                HStack(spacing: 8) {
-                    statusLight(Check(ok: model.accountSaved, text: ""))
-                    Text(model.accountSaved
-                         ? "Signed in. The session is kept in the macOS Keychain."
-                         : "Not signed in. You sign in on Microsoft's own page; MetalHorizon never sees your password.")
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button(model.accountSaved ? "Sign In Again…" : "Sign In with Microsoft…") { model.connectMicrosoft() }
-                        .disabled(model.isBusy)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Edition:")
+                Picker("Edition", selection: $model.edition) {
+                    ForEach(Edition.allCases) { Text($0.title).tag($0) }
                 }
-                .padding(6)
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 360)
+                .disabled(model.isBusy)
+                Spacer()
             }
+
+            if model.edition == .xbox { xboxAccount } else { steamBox }
 
             GroupBox(label: Text("Setup")) {
                 VStack(alignment: .leading, spacing: 8) {
-                    settingRow("Game folder:", model.setup.gameCheck, title: "Choose…", action: model.chooseGameDirectory)
+                    if model.edition == .xbox {
+                        settingRow("Game folder:", model.setup.gameCheck, title: "Choose…", action: model.chooseGameDirectory)
+                    } else {
+                        settingRow("Steam prefix:", Check(ok: true, text: model.setup.steamPrefixPath), title: "Choose…",
+                                   action: model.chooseSteamPrefix)
+                        settingRow("Game:", model.setup.steamGameCheck, title: nil, action: nil)
+                    }
                     settingRow("Engine:", model.setup.engineCheck, title: "Install",
                                action: model.setup.engineCheck.ok ? nil : { Task { await model.installComponents() } })
                     settingRow("D3DMetal 4:", model.setup.d3dmetalCheck, title: "Install…",
                                action: model.setup.d3dmetalCheck.ok ? nil : { Task { await model.installComponents() } })
-                    if model.setup.isSteamEdition {
-                        settingRow("Steam client:", model.setup.steamClientCheck, title: "Install Steam…",
-                                   action: model.setup.steamClientCheck.ok ? nil : { model.installSteamClient() })
-                    }
-                    HStack {
-                        Spacer().frame(width: labelWidth + 8)
-                        Toggle("Show the Metal performance HUD in the game", isOn: $model.metalHUD)
-                            .toggleStyle(.checkbox)
-                    }
                 }
                 .padding(6)
             }
+
+            controllersBox
 
             HStack(spacing: 8) {
                 if model.activity == .install, let fraction = model.installFraction {
@@ -527,12 +884,13 @@ struct LauncherView: View {
                 Text(model.status)
                     .foregroundColor(.secondary)
                     .lineLimit(2)
+                    .help(model.status)
                 Spacer()
                 if model.isBusy {
                     Button(model.activity == .game ? "Force Quit" : "Stop") { model.stop() }
                         .help(model.activity == .game ? "Quit from the game's menu when you can: force-quitting skips the cloud save upload." : "")
                 }
-                if !model.setup.isSteamEdition {
+                if model.edition == .xbox {
                     Button("Download from Xbox") { model.download() }
                         .disabled(!model.canDownload)
                 }
@@ -541,39 +899,213 @@ struct LauncherView: View {
                     .disabled(!model.canPlay)
             }
 
-            GroupBox(label: Text("Activity")) {
-                ScrollView {
-                    Text(model.output.isEmpty
-                         ? "MetalHorizon installs Blackwell Engine and D3DMetal by itself. Sign in, download the game, then click Play."
-                         : model.output)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(model.output.isEmpty ? .secondary : .primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(4)
+            diagnosisBox
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Picker("Log", selection: $model.logView) {
+                            ForEach(LogView.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 220)
+                        Toggle("Errors only", isOn: $model.errorsOnly)
+                            .toggleStyle(.checkbox)
+                            .onChange(of: model.errorsOnly) { _ in model.filterChanged() }
+                        Spacer()
+                        TextField("Search", text: $model.search)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 180)
+                            .onChange(of: model.search) { _ in model.filterChanged() }
+                    }
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                if model.logLines.isEmpty {
+                                    Text(model.logPlaceholder).foregroundColor(.secondary)
+                                }
+                                ForEach(Array(model.logLines.enumerated()), id: \.offset) { index, line in
+                                    Text(line)
+                                        .foregroundColor(LogFilter.isProblem(line) ? Color(nsColor: .systemRed) : .primary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .id(index)
+                                }
+                            }
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(4)
+                        }
+                        .onChange(of: model.logLines.count) { count in
+                            if count > 0 { proxy.scrollTo(count - 1, anchor: .bottom) }
+                        }
+                    }
+                    .frame(minHeight: 110, maxHeight: .infinity)
                 }
-                .frame(minHeight: 110, maxHeight: .infinity)
             }
 
             HStack {
                 Button("Show Logs in Finder") { model.revealLogs() }
+                Button("Export Diagnostics…") { model.exportDiagnostics() }
                 Button("☕ Support Me") { model.openSupportPage() }
                     .help("MetalHorizon is free. Support it on Buy Me a Coffee.")
                 Spacer()
             }
         }
-        .padding(20)
+        .padding(18)
         .sheet(isPresented: Binding(get: { model.showWelcome }, set: { if !$0 { model.finishWelcome() } })) {
             WelcomeSheet(start: model.finishWelcome, support: model.openSupportPage)
         }
         .sheet(isPresented: Binding(get: { model.licenseText != nil }, set: { if !$0 { model.answerLicense(false) } })) {
             LicenseSheet(text: model.licenseText ?? "", answer: model.answerLicense)
         }
+        .sheet(item: Binding(get: { model.licenseText == nil && !model.showWelcome ? model.crashReport : nil },
+                             set: { if $0 == nil && model.crashReport != nil && !model.crashReportSending { model.dismissCrashReport() } })) { report in
+            CrashReportSheet(report: report, sending: model.crashReportSending,
+                             send: { model.sendCrashReport(report) }, dismiss: model.dismissCrashReport)
+        }
     }
 
-    private let labelWidth: CGFloat = 92
+    private var xboxAccount: some View {
+        GroupBox(label: Text("Xbox Account")) {
+            HStack(spacing: 8) {
+                statusLight(Check(ok: model.accountSaved, text: ""))
+                Text(model.accountSaved
+                     ? "Signed in. The session is kept in the macOS Keychain."
+                     : "Not signed in. You sign in on Microsoft's own page; MetalHorizon never sees your password.")
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button(model.accountSaved ? "Sign In Again…" : "Sign In with Microsoft…") { model.connectMicrosoft() }
+                    .disabled(model.isBusy)
+            }
+            .padding(6)
+        }
+    }
 
-    private func settingRow(_ label: String, _ check: Check, title: String, action: (() -> Void)?) -> some View {
+    private var steamBox: some View {
+        GroupBox(label: Text("Steam")) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    statusLight(model.setup.steamClientCheck)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.setup.steamClientCheck.text)
+                        Text(steamRunningText)
+                            .font(.callout)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    if !model.setup.steam.installed {
+                        Button("Install Steam…") { model.installSteam() }
+                            .disabled(model.isBusy)
+                    } else {
+                        Button("Open Steam") { model.openSteam() }
+                            .disabled(model.isBusy && model.activity != .game)
+                        Button("Stop Steam") { model.stopSteam() }
+                            .disabled(model.isBusy || !model.steamStatus.clientRunning)
+                    }
+                }
+                Text("You sign in and install the game in Steam's own window. Steam's first start updates it: 15 to 25 minutes that can look frozen.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(6)
+        }
+    }
+
+    private var steamRunningText: String {
+        let s = model.steamStatus
+        if s.gameRunning { return "Forza Horizon 6 is running; Steam runs in game mode." }
+        if s.clientRunning { return s.clientMode == "game" ? "Steam runs silently for games (Open Steam shows its window once the game is closed)." : "Steam is open." }
+        return model.setup.steam.installed ? "Steam is not running." : "MetalHorizon downloads Valve's installer and installs Steam in its own prefix."
+    }
+
+    private var controllersBox: some View {
+        GroupBox(label: Text("Controllers")) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Picker("In the game:", selection: $model.controllerMode) {
+                        ForEach(ControllerMode.allCases) { Text($0.title).tag($0) }
+                    }
+                    .frame(width: 260)
+                    Spacer()
+                    Button("Test in Wine…") { model.runTool("joycpl") }
+                        .disabled(model.isBusy && model.edition == .xbox)
+                }
+                if controllers.controllers.isEmpty {
+                    Text("No controller connected. Xbox, PlayStation, Switch Pro, 8BitDo and most USB or Bluetooth pads work; plug one in or pair it in System Settings › Bluetooth.")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(controllers.controllers) { pad in
+                        HStack(spacing: 8) {
+                            Image(systemName: pad.kind == "Racing wheel" ? "steeringwheel" : "gamecontroller.fill")
+                                .foregroundColor(.accentColor)
+                            Text(pad.name)
+                            Text([pad.kind, pad.transport].filter { !$0.isEmpty }.joined(separator: " · "))
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(pad.route)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if model.controllerMode == .off {
+                        Text("Controllers are off: the game only gets the keyboard and the mouse.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
+            }
+            .padding(6)
+        }
+    }
+
+    @ViewBuilder
+    private var diagnosisBox: some View {
+        let problems = model.preflight.filter { $0.severity > .info }
+        if !problems.isEmpty || !model.findings.isEmpty {
+            GroupBox(label: Text("Diagnosis")) {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(problems) { item in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            severityIcon(item.severity)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("\(item.title): \(item.check.text)").fontWeight(.medium)
+                                if let fix = item.check.fix {
+                                    Text(fix).font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            Spacer()
+                            if item.id == "rosetta" {
+                                Button("Copy Command") { model.copyRosettaCommand() }
+                            }
+                        }
+                    }
+                    ForEach(model.findings.prefix(5)) { finding in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            severityIcon(finding.issue.severity)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(finding.issue.title).fontWeight(.medium)
+                                Text(finding.issue.explanation).font(.callout).fixedSize(horizontal: false, vertical: true)
+                                Text("What to do: " + finding.issue.fix).font(.callout).foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .help("Seen in \(finding.source): \(finding.evidence)")
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Report an Issue…") { model.reportIssue() }
+                    }
+                }
+                .padding(6)
+            }
+        }
+    }
+
+    private func settingRow(_ label: String, _ check: Check, title: String?, action: (() -> Void)?) -> some View {
         HStack(spacing: 8) {
             Text(label)
                 .frame(width: labelWidth, alignment: .trailing)
@@ -583,7 +1115,7 @@ struct LauncherView: View {
                 .truncationMode(.middle)
                 .help(check.fix ?? check.text)
             Spacer(minLength: 8)
-            if let action {
+            if let action, let title {
                 Button(title, action: action)
                     .disabled(model.isBusy)
             }
@@ -597,18 +1129,18 @@ struct WelcomeSheet: View {
     var support: () -> Void
 
     private let steps: [(String, String)] = [
-        ("1", "MetalHorizon installs Blackwell Engine and Apple's D3DMetal by itself. Accept Apple's licence when it asks."),
-        ("2", "Sign In with Microsoft. You sign in on Microsoft's own page; your password never goes through MetalHorizon."),
-        ("3", "Choose a game folder with a short path, such as ~/FH6, not in iCloud Drive. Then click Download from Xbox (about 160 GB)."),
-        ("4", "Click Play. Quit the game from its own menu and wait about 30 seconds: the cloud save uploads as it closes."),
-        ("5", "If macOS asks to let xodus-service use the \"Xodus Service\" Keychain item, choose Always Allow.")
+        ("1", "Choose your edition at the top: Xbox / Microsoft Store, or Steam. MetalHorizon installs Blackwell Engine and Apple's D3DMetal by itself; accept Apple's licence when it asks."),
+        ("2", "Xbox: Sign In with Microsoft on Microsoft's own page, choose a short folder such as ~/FH6, then Download from Xbox (about 160 GB)."),
+        ("3", "Steam: Install Steam, Open Steam and sign in there, then install Forza Horizon 6 from your Steam Library."),
+        ("4", "Click Play. Quit the game from its own menu; for the Xbox edition, wait about 30 seconds while the cloud save uploads."),
+        ("5", "Controllers: plug in or pair your pad before Play. If something goes wrong, the Diagnosis box says what and how to fix it.")
     ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Welcome to MetalHorizon")
                 .font(.title2.weight(.semibold))
-            Text("Play your own Xbox / Microsoft Store copy of Forza Horizon 6 on this Mac. No CrossOver, nothing to download by hand.")
+            Text("Play your own copy of Forza Horizon 6, Xbox / Microsoft Store or Steam, on this Mac. No CrossOver, nothing to download by hand.")
                 .fixedSize(horizontal: false, vertical: true)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(steps, id: \.0) { number, text in
@@ -631,17 +1163,66 @@ struct WelcomeSheet: View {
                 }
                 .padding(6)
             }
-            Text("Steam edition: point the game folder at your Steam install and MetalHorizon plays it too — experimental, not yet tested in game (no Steam copy to test with).")
-                .font(.callout)
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("Prototype: tested on one Mac so far. Unofficial; not affiliated with Microsoft or Apple.")
+            Text("Prototype: the Xbox edition is tested on one Mac so far; the Steam edition is tested up to Steam's sign-in, not in game. Unofficial; not affiliated with Microsoft, Valve or Apple.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
                 Button("Get Started", action: start)
                     .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 580)
+    }
+}
+
+/// A crashed run: the error as the player would have read it, what MetalHorizon recognized, and Send.
+struct CrashReportSheet: View {
+    let report: CrashReport
+    let sending: Bool
+    var send: () -> Void
+    var dismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.octagon.fill").foregroundColor(.red).font(.title2)
+                Text(report.headline).font(.headline)
+            }
+            Text("Forza Horizon 6 stopped during the run of \(report.date.formatted(date: .abbreviated, time: .shortened)) (\(report.gameVersion)).")
+                .fixedSize(horizontal: false, vertical: true)
+            if !report.message.isEmpty {
+                GroupBox(label: Text("Error message")) {
+                    Text(report.message + (report.backtrace.isEmpty ? "" : "\n" + report.backtrace.prefix(8).joined(separator: "\n")))
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(4)
+                }
+            }
+            ForEach(report.findings.prefix(3)) { finding in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(finding.issue.title).fontWeight(.medium)
+                    Text("What to do: " + finding.issue.fix).font(.callout).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Text(CrashReport.endpoint == nil
+                 ? "Send to the Developer opens a GitHub issue with this report filled in and shows a zip of the logs to attach. Passwords, tokens, e-mail addresses, Xbox and Steam IDs are removed first."
+                 : "Send to the Developer uploads this report and a zip of the logs. Passwords, tokens, e-mail addresses, Xbox and Steam IDs are removed first.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if sending { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Not Now", action: dismiss)
+                    .disabled(sending)
+                Button("Send to the Developer", action: send)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(sending)
             }
         }
         .padding(20)
@@ -705,7 +1286,7 @@ struct AssistantSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Connect an AI Assistant")
                 .font(.headline)
-            Text("MetalHorizon includes an MCP server. An assistant such as Claude can then check your setup, read the logs (tokens and e-mail addresses removed), explain errors and change MetalHorizon's settings with you. It never sees your password and cannot start the game or a download.")
+            Text("MetalHorizon includes an MCP server. An assistant such as Claude can then run the checks, read the logs (tokens and e-mail addresses removed), recognize known errors, look at the controllers and Steam, change MetalHorizon's settings with you and export the diagnostics. It never sees your password and cannot start the game or a download.")
                 .fixedSize(horizontal: false, vertical: true)
             Text("Move MetalHorizon to the Applications folder first: the path below follows the app.")
                 .font(.callout)

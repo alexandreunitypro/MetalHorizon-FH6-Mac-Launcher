@@ -1,19 +1,29 @@
 # MetalHorizon – FH6 Mac Launcher
 
-**Run your own Xbox / Microsoft Store copy of Forza Horizon 6 on an Apple Silicon Mac AND STEAM!**
-Blackwell Engine (Wine) + xodus + Apple's D3DMetal, open source, no CrossOver, no DRM bypass.
+**Run your own copy of Forza Horizon 6 on an Apple Silicon Mac: Xbox / Microsoft Store AND STEAM!**
+Blackwell Engine (Wine) + xodus or Steam + Apple's D3DMetal, open source, no CrossOver, no DRM bypass.
 
 ## Download
 
-**[MetalHorizon (latest prototype)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
-right-click it → **Open** the first time (it is not notarized yet).
+**[MetalHorizon 0.4 (early alpha)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
+right-click it → **Open** the first time (it is not notarized yet). From 0.4.0 on, the app updates itself: each time
+it opens, it checks these releases and installs a newer version once nothing is running, keeping your settings,
+sign-in, engines and game.
 
-The app does the rest by itself: it installs [Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine)
-and Apple's D3DMetal (after you accept Apple's licence), you sign in with your Microsoft account on Microsoft's own
-page, click **Download from Xbox**, then **Play**. No CrossOver, nothing to download by hand.
+Choose your edition at the top of the window; the app does the rest by itself. It installs
+[Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine) and Apple's D3DMetal (after you accept
+Apple's licence). Then:
+- **Xbox / Microsoft Store**: sign in on Microsoft's own page, click **Download from Xbox**, then **Play**.
+- **Steam**: click **Install Steam** (MetalHorizon installs Steam in its own Wine prefix), **Open Steam**, sign in
+  there and install the game from your Library, then **Play** (the game starts through Steam).
 
-> **Prototype.** Tested on one Mac so far (M5 Pro, macOS 27). Known: stutter, black near foliage. This is for the
-> **Xbox / Microsoft Store** edition (MSIXVC). If you own the **Steam** edition, **The steam version just got released!**
+No CrossOver, nothing to download by hand. Controllers (Xbox, PlayStation, Switch Pro, 8BitDo, generic pads) work
+through GameInput and SDL2. When something goes wrong, the **Diagnosis** box names the problem and the fix, and
+**Export Diagnostics** writes a zip (secrets removed) for a GitHub issue.
+
+> **The Steam version just got released (0.4)!** **Prototype.** Tested on one Mac so far (M5 Pro, macOS 27). Known: stutter, black near foliage. The Xbox /
+> Microsoft Store edition is tested in game. The **Steam edition** is tested up to Steam's sign-in window (install,
+> update, window, clean stop): this project has no Steam copy of the game, so please report back if you try it.
 
 Unofficial. Not affiliated with or endorsed by Microsoft, Xbox, Playground Games, Apple, CodeWeavers or NVIDIA.
 Forza Horizon and Xbox are trademarks of Microsoft. You need your own copy of the game on your Microsoft account.
@@ -33,6 +43,9 @@ Tested on one machine: MacBook Pro 16" M5 Pro (18-core CPU, 20-core GPU, 48 GB),
 | Frame pacing | ❌ About 36 fps average, with 6 freezes of 175–300 ms every 25 s. Top priority. |
 | Crash while the map loads | ⚠️ In Apple's Metal driver; so far only with the diagnostic inspector on. |
 | Launcher | ✅ MetalHorizon installs everything by itself (prototype, not notarized). |
+| Steam edition | ⚠️ Steam installs, updates and shows its sign-in window (DXMT, 32-bit engine, 7 November). The game runs through a silent Steam client, as in Highball; not tested in game here (no Steam copy). |
+| Controllers | ⚠️ GameInput (the API the game uses) implemented in the engine and tested in Wine; not yet tested with a pad in the game. |
+| Diagnosis | ✅ 30+ known problems recognized after each run, checks before Play, diagnostics export, MCP server for AI assistants. |
 
 Known issue: leave the in-game ray tracing options alone; changing them has crashed the game (FHE11).
 
@@ -58,21 +71,29 @@ online. Use it at your own risk.
 
 - Apple Silicon Mac, **macOS 27** or later. Memory use is high; only 48 GB has been tested so far.
 - About 160 GB free, outside iCloud-synced folders (the Desktop is a bad place for the game).
-- Forza Horizon 6, Xbox / Microsoft Store edition, on your Microsoft account. Game Pass is untested.
+- Forza Horizon 6, **Xbox / Microsoft Store** edition on your Microsoft account (Game Pass is untested), or the
+  **Steam** edition on your Steam account.
 - That's all. The MetalHorizon app downloads **Blackwell Engine** and **D3DMetal 4** by itself, then the game from the
-  Xbox servers. No CrossOver, no manual download.
+  Xbox servers, or Steam itself for the Steam edition. No CrossOver, no manual download.
 
 ## How it works
 
 ```
-forzahorizon6.exe          (decrypted in memory by xodus, never written back)
+forzahorizon6.exe          Xbox: decrypted in memory by xodus, never written back. Steam: started by Steam itself.
   └─ Blackwell Engine      Wine 11 from CrossOver 26.3's LGPL sources + Ferestre + Highball + this repo's patches,
-      │                    with its own GnuTLS, FreeType and MoltenVK (engine/)
+      │                    with its own GnuTLS, FreeType, MoltenVK and SDL2 (engine/). Steam variant: + 32-bit half,
+      │                    built with mingw-w64 gcc, + DXMT for Steam's own window
       ├─ xgameruntime      Xbox layer: tokens from xodus-service, PlayFab cloud saves
+      ├─ gameinput.dll     controllers for GDK games, on top of XInput (engine patch 0012)
+      ├─ winebus + SDL2    every pad macOS sees, mapped to an Xbox layout
       ├─ d3d12.dll shim    Highball's shim + this repo's shader fixes and inspector
       │   └─ D3DMetal 4    DirectX 12 → Metal (Apple's Game Porting Toolkit redist, unmodified)
       └─ Core Audio        surround mixed down for the Mac's speakers
 ```
+
+The app's MCP server (`MetalHorizon --mcp`, Help › Connect an AI Assistant) gives an assistant such as Claude 25
+tools: diagnose the last runs, explain a pasted error, read and search the logs, check the network, Steam, the
+controllers and the components, change settings with the user's agreement, and export the diagnostics.
 
 ## What gets compiled
 
@@ -138,7 +159,10 @@ code during online play.
 3. Crashes: map loading, online sessions.
 4. ~~A prebuilt engine without CrossOver~~: done, **Blackwell Engine** ([`engine/`](engine/README.md)).
 5. The **MetalHorizon app** installs everything by itself (done); next, signed and notarized.
-6. Other Xbox-edition games people ask for (Forza Horizon 5 and 4).
+6. ~~The Steam edition~~: done in 0.4 (to be confirmed in game by Steam players); controllers through GameInput (done,
+   to be confirmed with a pad in game).
+7. A native arm64 engine (Highball's FEX route): steadier frames without the Rosetta hitch.
+8. Other Xbox-edition games people ask for (Forza Horizon 5 and 4).
 
 ## Support the project
 
@@ -162,6 +186,9 @@ On the author's setup, playing is one line: `bash tools/jouer.sh`.
   [highball-engine](https://github.com/gauthierpiarrette/highball-engine), by Gauthier Piarrette (GPL-3.0):
   the DirectX 12 shim, Wine patches 0017–0025, the Forza recipe.
 - [Ferestre](https://github.com/icex/ferestre), by icex: Wine patches for the Xbox edition.
+- Highball's Steam method (window with DXMT and sync off, silent client for games, clean shutdown) and their
+  [DXMT build](https://github.com/gauthierpiarrette/dxmt); [DXMT](https://github.com/3Shain/dxmt) by 3Shain (MIT).
+- [SDL](https://github.com/libsdl-org/SDL) (zlib) for controllers; [mingw-w64](https://www.mingw-w64.org) for the Steam engine.
 - [xodus](https://github.com/xodus-gaming/xodus) (GPL-3.0): MSIXVC packages and Xbox sign-in.
 - Wine, and CodeWeavers for the CrossOver sources (LGPL-2.1-or-later).
 - Apple's D3DMetal (Game Porting Toolkit).

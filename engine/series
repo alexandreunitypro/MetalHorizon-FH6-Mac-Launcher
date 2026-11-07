@@ -11,6 +11,8 @@
 0007-audio-surround.patch
 0008-misc.patch
 0009-diag-msgbox.patch
+# GameInput (controllers in GDK games) on top of XInput; off unless WINE_GAMEINPUT=1. Source: src/gameinput/.
+0012-gameinput-xinput-backend.patch
 # Highball 0025 (closing async I/O no longer crashes) is NOT in the engine that runs the game today: only
 # its test half reached the dev tree. Turn it on after an in-game test.
 # ../../tools/forza-patches/0025-ntdll-threadpool-io-release-once.patch

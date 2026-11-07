@@ -37,8 +37,9 @@ d'installer quoi que ce soit.
 
 | Fichier | Rôle |
 |---|---|
-| [`inputs.json`](inputs.json) | Sources épinglées par SHA-256 : CrossOver 26.3.0, llvm-mingw 20260908, GMP, Nettle, GnuTLS, FreeType, MoltenVK |
-| [`series`](series), [`patches/`](patches/) | Les 9 patches, générés depuis l'arbre du moteur qui fait tourner le jeu |
+| [`inputs.json`](inputs.json) | Sources épinglées par SHA-256 : CrossOver 26.3.0, llvm-mingw 20260908, GMP, Nettle, GnuTLS, FreeType, SDL2, MoltenVK, DXMT ; les deux variantes |
+| [`series`](series), [`series-steam`](series-steam), [`patches/`](patches/) | 0001–0009 générés depuis l'arbre du moteur qui fait tourner le jeu ; 0010–0013 ajoutés pour Steam, GameInput et le 32 bits |
+| [`src/gameinput/`](src/gameinput/) | La source de GameInput (patch 0012) et `make-patch.sh` qui régénère le patch |
 | [`make-series.py`](make-series.py) | Régénère `patches/` depuis l'arbre de travail ; s'arrête si un fichier modifié n'a pas de groupe |
 | [`verify-series.sh`](verify-series.sh) | Prouve que source + série = l'arbre de travail (11 145 fichiers identiques) |
 | [`build-deps.sh`](build-deps.sh) | Construit GMP, Nettle, GnuTLS, FreeType en x86_64 et prend MoltenVK |
@@ -59,22 +60,37 @@ bash app/update-components.sh blackwell-engine-1.0 ~/BlackwellEngine-build/black
 Les deux tarballs vont dans la release GitHub `blackwell-engine-1.0`, puis `app/build-app.sh` construit l'app qui
 les connaît.
 
-## Variante Steam (expérimentale)
+## Deux variantes (1.1)
 
-MetalHorizon joue aussi l'édition **Steam** de Forza Horizon 6, avec un second moteur : les 9 patches ci-dessus,
-plus deux patches de Highball copiés tels quels ([`patches/ORIGIN-steam.md`](patches/ORIGIN-steam.md),
-LGPL-2.1-or-later) pour qu'une fenêtre de lanceur (celle de Steam) s'affiche au lieu de rester noire. Vérifiés
-sans conflit sur l'arbre de travail, mais **pas vérifiés en jeu** : ce projet n'a pas de copie Steam de FH6.
+| | Xbox (`--variant xbox`, défaut) | Steam (`--variant steam`) |
+|---|---|---|
+| Série | [`series`](series) : 0001–0009 + 0012 | [`series-steam`](series-steam) : 0001–0013 |
+| Architectures | x86_64 | i386 + x86_64 (Steam et son installeur sont 32 bits) |
+| Compilateur PE | llvm-mingw | mingw-w64 gcc, comme Highball (« llvm-mingw casse la connexion Steam ») |
+| Manettes | SDL2 + GameInput (0012) | idem |
+| Fenêtre de Steam | — | DXMT, build de Highball (`renderers/dxmt`) |
 
 ```sh
-bash engine/build.sh --series series-steam ~/BlackwellEngine-build-steam
-bash engine/package.sh steam-1.0 ~/BlackwellEngine-build-steam
+brew install bison pkgconf cmake mingw-w64
+bash engine/build.sh --variant xbox ~/BlackwellEngine-build
+bash engine/build.sh --variant steam ~/BlackwellEngine-build-steam
+bash engine/package.sh 1.1 ~/BlackwellEngine-build
+bash engine/package.sh steam-1.1 ~/BlackwellEngine-build-steam
 ```
 
-Produit `blackwell-engine-steam-<version>.tar.xz`, publié à côté de `blackwell-engine-<version>.tar.xz` dans la
-même release GitHub. L'app choisit ce moteur toute seule quand le dossier du jeu a l'air d'une installation
-Steam (`steam_appid.txt` ou `steam_api64.dll`), et lance le jeu via Steam lui-même (`steam.exe -applaunch`),
-pour que le client Steam tourne dans le même préfixe (sans ça, Highball note que le jeu se referme après ~12 s).
+- **0010, 0011** (Steam) : patches 0006 et 0007 de Highball, copiés tels quels ([`patches/ORIGIN-steam.md`](patches/ORIGIN-steam.md)).
+  0011 permet à la fenêtre d'un processus d'afficher le swapchain d'un autre (le GPU process du navigateur de Steam).
+- **0012** : GameInput, l'API de manettes des jeux GDK, sur XInput (v0, v1, v2), source dans [`src/gameinput/`](src/gameinput/).
+  Le gameinput.dll de Wine était un bouchon (E_NOTIMPL) : le jeu ne voyait aucune manette. Actif seulement avec
+  `WINE_GAMEINPUT=1` (l'app le met quand une manette est branchée) ; testé dans Wine avec `tools/gameinputprobe`.
+- **0013** : les diagnostics FH6 de 0005 lisent des registres x86_64 ; gardés hors de la moitié 32 bits.
+- **SDL2** 2.32.10 (zlib) : construit en x86_64 par `build-deps.sh`, `SONAME_LIBSDL2` dans config.h comme FreeType ;
+  winebus.sys lit alors les manettes PlayStation, Switch, 8BitDo, etc. avec une disposition Xbox.
+- **DXMT** : la release v0.80 refuse le swapchain inter-processus (`CreateSwapChain: cross-process swapchain not
+  supported yet`, fenêtre noire). Le build de Highball (fork `gauthierpiarrette/dxmt`, commit 331c552, MIT) l'accepte
+  derrière `DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN=1`. Mesuré le 7 novembre 2026 (M5 Pro, macOS 27.2) : Steam s'installe en
+  27 s, se met à jour et affiche sa fenêtre de connexion (700×440, sans « fond transparent » ni « 0×0 »).
+- `build.sh --resume` reprend la compilation après une correction à la main ; une release se construit sans.
 
 ## Encore à faire
 

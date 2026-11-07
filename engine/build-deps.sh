@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build the x86_64 libraries Blackwell Engine dlopens at run time, which used to come from CrossOver.app's lib64:
-# GnuTLS (with Nettle built in, as CrossOver ships it: it only needs GMP), GMP, FreeType, plus MoltenVK from its
-# official release. They go into <engine>/lib with @loader_path install names, so the engine needs nothing else.
+# GnuTLS (with Nettle built in, as CrossOver ships it: it only needs GMP), GMP, FreeType, SDL2 (controllers), plus
+# MoltenVK from its official release. They go into <engine>/lib with @loader_path install names, so the engine needs nothing else.
 #   bash engine/build-deps.sh [engine folder] [work folder, default ~/BlackwellEngine-build]
 # Without an engine folder (or with ""), only builds them into <work>/deps/prefix, where engine/build.sh links against
 # them. A finished build is kept (deps/prefix/.built) until engine/inputs.json changes.
 # Sources are pinned in engine/inputs.json ("deps"); files already in <work>/downloads are reused when their SHA-256 matches.
-# Needs pkg-config (brew install pkgconf) for GnuTLS's configure.
+# Needs pkg-config (brew install pkgconf) for GnuTLS's configure, and cmake (brew install cmake) for SDL2.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ENG="$REPO/engine"
@@ -64,6 +64,18 @@ build gnutls "$(unpack gnutls)" --enable-shared --disable-static --with-included
 build freetype "$(unpack freetype)" --enable-shared --disable-static --without-png --without-harfbuzz \
     --without-brotli --without-bzip2
 
+echo "== sdl2"
+# Joystick, game controller and haptics only: winebus.sys asks for nothing else. SDL's own HIDAPI drivers cover
+# Xbox, PlayStation and Switch pads; its IOKit and GameController backends cover the rest.
+SDL="$(unpack sdl2)"
+# cmake itself runs natively (Homebrew's is arm64); Apple's clang builds for x86_64 through CMAKE_OSX_ARCHITECTURES.
+( cd "$SDL" && env -u CC -u CXX cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
+    -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+    -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF \
+    -DSDL_AUDIO=OFF -DSDL_RENDER=OFF -DSDL_VULKAN=OFF -DSDL_METAL=OFF -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF \
+    && cmake --build build -j"$(sysctl -n hw.ncpu)" && cmake --install build ) \
+    > "$W/deps/sdl2.log" 2>&1 || { tail -30 "$W/deps/sdl2.log"; echo "STOP: sdl2 failed"; exit 1; }
+
 echo "== MoltenVK"
 MVK="$W/deps/moltenvk"; rm -rf "$MVK"; mkdir -p "$MVK"
 tar -xf "$(fetch moltenvk)" -C "$MVK" MoltenVK/LICENSE MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
@@ -74,7 +86,7 @@ fi
 MVK="$W/deps/moltenvk"
 
 echo "== into $ENGINE/lib"
-LIBS=(libgmp.10.dylib libgnutls.30.dylib libfreetype.6.dylib libMoltenVK.dylib)
+LIBS=(libgmp.10.dylib libgnutls.30.dylib libfreetype.6.dylib libMoltenVK.dylib libSDL2-2.0.0.dylib)
 mkdir -p "$ENGINE/lib" "$ENGINE/share/licenses"
 for l in "${LIBS[@]}"; do
     cp -L "$P/lib/$l" "$ENGINE/lib/$l"
@@ -91,6 +103,7 @@ cp "$W/deps/gnutls/LICENSE" "$ENGINE/share/licenses/GnuTLS-LICENSE" 2>/dev/null 
 cp "$W/deps/gmp/COPYING.LESSERv3" "$ENGINE/share/licenses/GMP-COPYING.LESSERv3" 2>/dev/null || true
 cp "$W/deps/nettle/COPYING.LESSERv3" "$ENGINE/share/licenses/Nettle-COPYING.LESSERv3" 2>/dev/null || true
 cp "$W/deps/freetype/LICENSE.TXT" "$ENGINE/share/licenses/FreeType-LICENSE.TXT" 2>/dev/null || true
+cp "$W/deps/sdl2/LICENSE.txt" "$ENGINE/share/licenses/SDL2-LICENSE.txt" 2>/dev/null || true
 
 echo "== checks"
 for l in "${LIBS[@]}"; do

@@ -1,0 +1,28 @@
+The FH6 diagnostics of 0005 (ntdll/exception.c) read x86_64 registers: keep them to the 64-bit build.
+Needed by the Steam variant, which also builds the 32-bit half (--enable-archs=i386,x86_64).
+
+diff -ruN a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+--- a/dlls/ntdll/exception.c	2026-11-07 10:22:13
++++ b/dlls/ntdll/exception.c	2026-11-07 10:22:13
+@@ -169,10 +169,13 @@
+         RtlFreeHeap( GetProcessHeap(), 0, to_free );
+         to_free = NULL;
+ 
++#ifdef __x86_64__
+         TRACE( "calling handler at %p code=%lx flags=%lx rip=%p rsp=%p\n",
+                func, rec->ExceptionCode, rec->ExceptionFlags,
+                (void *)context->Rip, (void *)context->Rsp );
++#endif
+         ret = func( &except_ptrs );
++#ifdef __x86_64__
+         TRACE( "handler at %p returned %lx rip=%p rsp=%p\n", func, ret,
+                (void *)context->Rip, (void *)context->Rsp );
+         /* fh6: bounded stack dump v2, only with +seh, never past the stack top */
+@@ -195,6 +198,7 @@
+             for (j = 0; j < 24 && sp + j < top; j++) TRACE( " %p", sp[j] );
+             TRACE( "\n" );
+         }
++#endif
+ 
+         RtlEnterCriticalSection( &vectored_handlers_section );
+         ptr = list_next( &vectored_exception_handlers, ptr );
