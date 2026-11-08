@@ -5,7 +5,7 @@ Blackwell Engine (Wine) + xodus or Steam + Apple's D3DMetal, open source, no Cro
 
 ## Download
 
-**[MetalHorizon 0.5 (early alpha)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
+**[MetalHorizon 1.0 (Final Beta)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
 right-click it → **Open** the first time (it is not notarized yet). From 0.4.0 on, the app updates itself: each time
 it opens, it checks these releases and installs a newer version once nothing is running, keeping your settings,
 sign-in, engines and game.
@@ -17,13 +17,29 @@ step**, and a line that shows how far along you are:
 - **Steam**: Install the Engine, Install Steam (in its own Wine prefix), Open Steam and sign in there; Steam's own
   install window for the game then opens by itself, click Install, then **Play** (the game starts through Steam).
 
+**New in 1.0: no more hitch every second.** On Apple silicon with macOS 27 and 24 GB or more, the Xbox edition runs
+on **Blackwell Engine Native**: Wine for arm64 with FEX and vkd3d-proton on KosmicKrisp (Metal 4), Highball's native
+route with MetalHorizon's Xbox patches. A steady 30 frames a second, where D3DMetal under Rosetta reaches up to 50
+with a short hitch about once a second. MetalHorizon picks the engine by itself (Settings › Graphics to choose).
+
+**PC Game Pass** works too: choose it when MetalHorizon first opens; Microsoft's licence server gives Game Pass
+members the game at every start, as the Xbox app does.
+
+**The Doctor**: MetalHorizon repairs itself. More than forty known problems (damaged components, the Xbox service,
+the network and the clock, a moved game folder, a full disk, memory, the Wine prefix...), each with treatments tried
+in order, automatically when it is safe, with one click when it touches your files.
+
+**The Autopilot** checks and repairs before every Play, reads every run, relaunches a failed start once, moves the
+game to the other engine after two failures, turns off an option that crashed it, and shows everything it did under
+*Fixed by MetalHorizon*. It never touches your saves, your sign-in or the game's files.
+
 MetalHorizon installs [Blackwell Engine](https://github.com/alexandreunitypro/blackwell-engine) and Apple's D3DMetal
 by itself (after you accept Apple's licence). No CrossOver, nothing to download by hand. Controllers (Xbox,
 PlayStation, Switch Pro, 8BitDo, generic pads) work through GameInput and SDL2. When something goes wrong, the
 window says what and how to fix it; the Activity panel shows the log, and **Export Diagnostics** writes a zip
 (secrets removed) for a GitHub issue.
 
-> **The Steam version just got released (0.4)!** **Prototype.** Tested on one Mac so far (M5 Pro, macOS 27). Known: stutter, black near foliage. The Xbox /
+> **1.0 Final Beta.** **Prototype.** Tested on one Mac so far (M5 Pro, macOS 27). Known: stutter, black near foliage. The Xbox /
 > Microsoft Store edition is tested in game. The **Steam edition** is tested up to Steam's sign-in window (install,
 > update, window, clean stop): this project has no Steam copy of the game, so please report back if you try it.
 

@@ -702,9 +702,10 @@ final class Updater: ObservableObject {
             Self.log("MetalHorizon \(update.version) downloaded and verified (SHA-256, bundle, signature)")
 
             // a menu command may have started something meanwhile: the swap waits for it to end
-            if model?.isBusy == true {
+            // the game itself too, even one started by an earlier MetalHorizon: its scripts must not change under it
+            if model?.isBusy == true || Self.gameRunning() {
                 progress(update.version, "Waiting for what runs to finish…", nil)
-                while model?.isBusy == true { try? await Task.sleep(nanoseconds: 1_000_000_000) }
+                while model?.isBusy == true || Self.gameRunning() { try? await Task.sleep(nanoseconds: 2_000_000_000) }
             }
             progress(update.version, "Restarting MetalHorizon…", nil)
             let script = folder.appendingPathComponent("update-helper.sh")
@@ -755,8 +756,14 @@ final class Updater: ObservableObject {
         state = newState
     }
 
+    /// Forza Horizon 6 or a MetalHorizon script running, whoever started it.
+    static func gameRunning() -> Bool {
+        NativeEngine.run("/usr/bin/pgrep", ["-f", "forzahorizon6\\.exe|metalhorizon-(play|steam)\\.sh"]).status == 0
+    }
+
     private var windowIsFree: Bool {
         if let model, model.isBusy || model.showWelcome || model.licenseText != nil { return false }
+        if Self.gameRunning() { return false }
         return NSApp.modalWindow == nil && !NSApp.windows.contains { $0.attachedSheet != nil }
     }
 

@@ -64,6 +64,15 @@ private struct GeneralSettings: View {
             }
             Section("Game") {
                 if model.edition == .xbox {
+                    Picker("You have the game", selection: $model.ownership) {
+                        ForEach(XboxOwnership.allCases) { Text($0.title).tag($0) }
+                    }
+                    if model.ownership == .gamePass {
+                        Text("Game Pass gives a licence at every start: the Mac needs the internet when you press Play, and the plan must include PC games (PC Game Pass or Ultimate).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     CheckRow(title: "Game folder", check: model.setup.gameCheck, button: "Choose…", action: model.chooseGameDirectory)
                 } else {
                     CheckRow(title: "Steam", check: model.setup.steamClientCheck)
@@ -110,6 +119,27 @@ private struct GraphicsSettings: View {
     var body: some View {
         Form {
             Section {
+                Picker("Engine", selection: $model.engineRoute) {
+                    ForEach(EngineRoute.allCases) { Text($0.title).tag($0) }
+                }
+                .disabled(model.isBusy || model.edition == .steam)
+                Text(model.edition == .steam
+                     ? "The Steam edition runs on D3DMetal in this version."
+                     : "Native Apple silicon: a steady 30 frames a second without the hitch every second (Highball's native route). D3DMetal: up to 50 frames a second with a short hitch about once a second. Automatic picks the native engine on a Mac with macOS 27 and 24 GB or more, and moves to D3DMetal by itself if the native engine stops the game twice in a day.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                LabeledContent("Next Play") {
+                    Text(model.routeDecision.route.title).foregroundStyle(.secondary)
+                }
+                .help(model.routeDecision.reason)
+                if RouteHealth.load().isBenched(.native) {
+                    LabeledContent(RouteHealth.load().native.benchReason ?? "The Autopilot keeps the native engine aside.") {
+                        Button("Use It Again") { model.clearNativeBench() }
+                    }
+                }
+            }
+            Section {
                 Toggle("Metal Performance HUD", isOn: $model.metalHUD)
                 Toggle("MetalFX upscaling", isOn: $model.metalFX)
                 Text("Turns DLSS on in the game's own settings, drawn by Apple's MetalFX.")
@@ -119,6 +149,9 @@ private struct GraphicsSettings: View {
                     Text("None").tag(0)
                     ForEach([30, 40, 45, 60], id: \.self) { Text("\($0) fps").tag($0) }
                 }
+                Text("On the native engine, None means its steady 30.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -169,7 +202,8 @@ private struct AdvancedSettings: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Relaunch after D3DMetal's start-up failure", isOn: $model.autoRetry)
+                Toggle("Relaunch the game by itself after a failed start", isOn: $model.autoRetry)
+                Toggle("Plain synchronization (instead of msync)", isOn: $model.plainSync)
                 Picker("Crash reports", selection: $model.crashReportMode) {
                     ForEach(CrashReportMode.allCases) { Text($0.title).tag($0) }
                 }

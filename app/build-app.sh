@@ -28,6 +28,7 @@ for script in metalhorizon-common.sh metalhorizon-play.sh metalhorizon-steam.sh 
 done
 [ -f components.json ] || { echo "STOP: no app/components.json (bash app/update-components.sh)"; exit 1; }
 cp components.json "$RES/components.json"
+cp Resources/fh6-native-UserConfigSelections.xml "$RES/"   # the native route's first-start graphics settings
 cp "$XODUS_CLI" "$RES/xodus-cli"; cp "$XODUS_SERVICE" "$RES/xodus-service"
 chmod 755 "$RES/xodus-cli" "$RES/xodus-service"
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -45,9 +46,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
 </dict>
 </plist>
 PLIST
+cp icon/AppIcon.icns "$RES/AppIcon.icns"   # the app's icon (icon/make-icon.swift makes it from icon/AppIcon-source.jpg)
 # Microsoft's sign-in page needs xodus-cli to run as an app of its own (it opens a web view).
 LOGIN="$RES/Xodus Login.app"
 mkdir -p "$LOGIN/Contents/MacOS"

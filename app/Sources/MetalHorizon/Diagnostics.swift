@@ -150,6 +150,32 @@ enum Diagnostics {
                    explanation: "Forza's servers say the profile the game tries to load is no longer available. It comes from the profile on Microsoft's side, not from the Mac: signing in again does not change it. A profile saved by a newer build of the game (played on an Xbox or a PC since) is one known reason.",
                    fix: "If you played on another device recently, update the game here first (Download the Game again: it only fetches what changed). Otherwise the game's own Try rollback to previous save loads your previous cloud save; the progress since that save may be lost.",
                    severity: .warning, edition: .xbox),
+        KnownIssue(id: "licence-not-entitled", title: "Microsoft gave no licence for this account",
+                   patterns: [#"not entitled to this content"#, #"satisfactionFailure"#],
+                   explanation: "Microsoft's licence server answered that the signed-in account has no licence for Forza Horizon 6: the game was not bought with this account, or its Game Pass plan does not include PC games (PC Game Pass or Game Pass Ultimate does; Essential and Premium do not include this game on PC), or the subscription has ended.",
+                   fix: "Check the account: account.microsoft.com/services shows the Game Pass plan and its renewal date. Sign in with the account that owns the game or has the plan (Settings › General › Sign In Again). After renewing a plan, Microsoft can take a few minutes: MetalHorizon asks again at the next Play.",
+                   edition: .xbox),
+        KnownIssue(id: "xodus-licence-timeout", title: "The Xbox licence request did not answer",
+                   patterns: [#"the Xbox licence request did not answer"#],
+                   explanation: "xodus asked Microsoft for the game's licence and got no answer for 3 minutes: the network was down or slow, or the Xbox service was stuck.",
+                   fix: "MetalHorizon restarts the Xbox service and tries once more by itself. If it keeps happening, check the network (System Settings › Network) and sign in again with Microsoft.",
+                   severity: .warning, edition: .xbox),
+        KnownIssue(id: "native-emulator-crash", title: "The native engine's x86-64 emulator stopped",
+                   patterns: [#"xtajit64\.dll\+0x"#, #"xtajit\.dll\+0x"#, #"libarm64ecfex"#, #"FEX.*(abort|SIGILL|unhandled)"#],
+                   explanation: "FEX, which runs the game's x86-64 code on the native engine, stopped the game. Highball's FEX patches cover the copy protection's rewriting; a crash here is new.",
+                   fix: "MetalHorizon relaunches the game once, and after two stops in a day runs it on D3DMetal for three days. Send the diagnostics (Activity › Export Diagnostics) so the engine can be fixed."),
+        KnownIssue(id: "native-device-lost", title: "The graphics device was lost (native engine)",
+                   patterns: [#"VK_ERROR_DEVICE_LOST"#, #"DXGI_ERROR_DEVICE_REMOVED"#, #"[Dd]evice lost"#],
+                   explanation: "vkd3d-proton lost its Vulkan device on KosmicKrisp (Metal 4): the GPU stopped a command buffer.",
+                   fix: "MetalHorizon relaunches the game once. If it keeps happening, lower the graphics preset in the game; the Autopilot moves the game to D3DMetal after two stops."),
+        KnownIssue(id: "native-vulkan-driver", title: "The native engine found no Vulkan driver",
+                   patterns: [#"vkCreateInstance failed"#, #"Failed to create Vulkan instance"#, #"No Vulkan device"#, #"kosmickrisp_icd\.json"#, #"Failed to load (the )?Vulkan"#],
+                   explanation: "The native engine draws through KosmicKrisp, Mesa's Vulkan driver on Metal 4; Vulkan did not start, so Direct3D 12 had no device.",
+                   fix: "MetalHorizon reinstalls the native engine by itself when its files are incomplete; meanwhile D3DMetal runs the game."),
+        KnownIssue(id: "native-loader", title: "The native engine's signed loader did not start",
+                   patterns: [#"the native engine's (signed loader is missing|loader is not linked)"#, #"Bad CPU type in executable"#, #"cross-architecture"#],
+                   explanation: "A Wine that runs natively on Apple silicon needs Highball's signed loader (WineLoader.app), which carries Apple's cross-architecture entitlement. It was missing, moved or not linked.",
+                   fix: "MetalHorizon relinks or reinstalls the loader before the next Play, and runs the game on D3DMetal meanwhile."),
         KnownIssue(id: "page-fault", title: "A program crashed (page fault)",
                    patterns: [#"Unhandled page fault"#, #"Unhandled exception"#],
                    explanation: "A Windows program crashed inside Wine. The line names the program and the address.",
@@ -170,10 +196,11 @@ enum Diagnostics {
                    patterns: [#"Cloud save synchronization failed"#],
                    explanation: "The game could not reach Xbox Live through xodus-service.",
                    fix: "Sign in again in MetalHorizon and keep 'Always Allow' for the Keychain item. Then Play.", edition: .xbox),
-        KnownIssue(id: "keychain-denied", title: "The Keychain refused xodus-service",
-                   patterns: [#"errSecInteractionNotAllowed"#, #"User interaction is not allowed"#, #"errSecAuthFailed"#],
-                   explanation: "macOS did not let xodus-service read the saved Xbox sign-in (the request was denied or the Keychain is locked).",
-                   fix: "Unlock the Mac, Sign In Again…, and answer Always Allow.", edition: .xbox),
+        KnownIssue(id: "keychain-denied", title: "The Keychain refused xodus the Xbox sign-in",
+                   patterns: [#"errSecInteractionNotAllowed"#, #"User interaction is not allowed"#, #"errSecAuthFailed"#,
+                              #"Keychain\(PlatformFailure"#, #"User canceled the operation"#],
+                   explanation: "macOS did not let xodus read the saved Xbox sign-in: its Keychain window was answered Deny or Cancel (or closed), or the Keychain is locked. xodus then stops at once (exit 101).",
+                   fix: "Press Play again and answer Always Allow when macOS asks; if it does not ask any more, Sign In Again (Settings › General).", edition: .xbox),
         KnownIssue(id: "broken-game-link", title: "The game folder points to a game that is gone",
                    patterns: [#"is a link to .*which is gone"#],
                    explanation: "forzahorizon6.exe in the game folder is a link to a folder that was moved or deleted.",
@@ -349,7 +376,18 @@ enum Diagnostics {
             "preflight": preflight(setup).map { row($0.title, $0.check) },
             "components": Component.all().map { ["id": $0.id, "version": $0.version, "installed": $0.installedVersion ?? "no"] },
             "options": ["metal_hud": setup.metalHUD, "controllers": setup.controllerMode.rawValue, "metalfx": setup.metalFX,
-                        "max_fps": setup.maxFPS, "auto_retry": setup.autoRetry],
+                        "max_fps": setup.maxFPS, "auto_retry": setup.autoRetry, "engine_route": setup.engineRoute.rawValue,
+                        "plain_sync": setup.plainSync],
+            "engine": {
+                let facts = MachineFacts.current
+                let health = RouteHealth.load()
+                let decision = setup.routeDecision(facts: facts, health: health)
+                let native = NativeEngine.check(facts: facts)
+                return ["next_play": decision.route.rawValue, "reason": decision.reason,
+                        "native": ["ok": native.ok, "detail": native.text, "loader_linked": NativeEngine.linked],
+                        "native_kept_aside": health.isBenched(.native), "native_failures_last_day": health.recentFailures(.native),
+                        "d3dmetal_failures_last_day": health.recentFailures(.d3dmetal)] as [String: Any]
+            }(),
             "recent_sessions": LogStore.sessions().prefix(8).map { s -> [String: Any] in
                 ["id": s.id, "kind": s.kind, "exit_code": s.exitCode as Any? ?? NSNull(), "findings": s.findings]
             }
@@ -390,7 +428,8 @@ enum Diagnostics {
                 copyRedacted(session.directory.appendingPathComponent(file), as: "\(session.id)-\(file)")
             }
         }
-        for name in ["xodus-service.log", "steam-window.log", "steam-install.log", "steam-prefix.log", "updater.log"] {
+        for name in ["xodus-service.log", "steam-window.log", "steam-install.log", "steam-prefix.log", "updater.log",
+                     "repairs.log", "repairs.json"] {
             copyRedacted(logDirectory.appendingPathComponent(name), as: name)
         }
         let crashes = MCPServer.recentCrashSummaries(limit: 3)

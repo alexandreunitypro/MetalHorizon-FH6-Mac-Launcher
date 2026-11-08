@@ -30,6 +30,27 @@
       "folder": "D3DMetal",
       "root": "D3DMetal",
       "license": "License.rtf"
+    },
+    {
+      "id": "wineloader",
+      "name": "Highball's signed Wine loader",
+      "version": "highball-0.10.26",
+      "url": "https://github.com/gauthierpiarrette/highball/releases/download/v0.10.26/Highball-0.10.26.zip",
+      "sha256": "87e24fa5e9dd0e6521470e9fa88d2dc00fd2210e288c6dc33e814e0c10d0f768",
+      "size": 9028820,
+      "folder": "WineLoader.app",
+      "root": "Highball.app/Contents/Helpers/WineLoader.app",
+      "signedBy": "B95M7DARU4"
+    },
+    {
+      "id": "engine-native",
+      "name": "Blackwell Engine Native",
+      "version": "1.0",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-native-1.0/blackwell-engine-native-1.0.tar.xz",
+      "sha256": "650f549088192bfce7c6377b1aaeede2034ca29b8518ab5d4385c13e735f504e",
+      "size": 259581292,
+      "folder": "Blackwell Engine Native",
+      "root": "Blackwell Engine Native"
     }
   ]
 }

@@ -116,4 +116,37 @@ final class InstallerTests: XCTestCase {
         XCTAssertTrue(setup.engineCheck.ok, setup.engineCheck.text)
         XCTAssertNil(setup.engineCheck.fix, setup.engineCheck.fix ?? "")
     }
+
+    /// The native engine as users get it: Highball's release zip (its signed WineLoader.app, signature checked) and the
+    /// Blackwell Engine Native bundle, then the loader link. Uses the archives already on this Mac; skipped elsewhere.
+    func testInstallTheNativeEngineAndLinkItsLoader() async throws {
+        let all = try components()
+        let loader = try XCTUnwrap(all["wineloader"]), native = try XCTUnwrap(all["engine-native"])
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let sources = [home.appendingPathComponent("BlackwellEngine-build/arm64-inputs/Highball-0.10.26.zip"),
+                       home.appendingPathComponent("BlackwellEngine-build/native-out/blackwell-engine-native-1.0.tar.xz")]
+        guard sources.allSatisfy({ fileExists($0.path) }) else { throw XCTSkip("the native archives are not on this Mac") }
+        for source in sources {
+            let cached = downloadCache.appendingPathComponent(source.lastPathComponent)
+            if !fileExists(cached.path) { try FileManager.default.copyItem(at: source, to: cached) }
+        }
+        try await Installer.install(loader, confirm: { _ in false }, progress: { _, _ in })
+        XCTAssertTrue(loader.isInstalled)
+        XCTAssertTrue(NativeEngine.loaderSignatureValid(), "Highball's signed loader keeps its signature once installed")
+        XCTAssertFalse(fileExists(wineLoaderAppDirectory + "/.metalhorizon-component.json"), "nothing is written inside the signed bundle")
+
+        try await Installer.install(native, confirm: { _ in false }, progress: { _, _ in })
+        XCTAssertTrue(native.isInstalled)
+        XCTAssertTrue(NativeEngine.filesPresent)
+        XCTAssertTrue(NativeEngine.linked, "the installer links the engine's wine to the signed loader")
+        XCTAssertTrue(NativeEngine.check(facts: MachineFacts(appleSilicon: true, macOSMajor: 27, macOSMinor: 2, memoryGB: 48)).ok)
+
+        // a loader that moved is relinked
+        try FileManager.default.removeItem(atPath: NativeEngine.unixLoaderLink)
+        try FileManager.default.createSymbolicLink(atPath: NativeEngine.unixLoaderLink, withDestinationPath: "/nowhere/wine")
+        XCTAssertFalse(NativeEngine.linked)
+        let repairs = Autopilot.beforePlay(setup: Setup(edition: .xbox, gameDirectory: "/nonexistent"), route: .native)
+        XCTAssertTrue(NativeEngine.linked)
+        XCTAssertTrue(repairs.contains { $0.title.contains("loader link repaired") })
+    }
 }

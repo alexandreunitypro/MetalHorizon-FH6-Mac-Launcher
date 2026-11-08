@@ -139,7 +139,11 @@ struct MetalHorizonApp: App {
     private var thanks: [(name: String, url: String)] {
         [
             ("Highball, by Gauthier Piarrette", "https://github.com/gauthierpiarrette/highball"),
-            ("highball-engine", "https://github.com/gauthierpiarrette/highball-engine"),
+            ("highball-engine (the native arm64 route)", "https://github.com/gauthierpiarrette/highball-engine"),
+            ("FEX", "https://github.com/FEX-Emu/FEX"),
+            ("KosmicKrisp (Mesa)", "https://gitlab.freedesktop.org/mesa/mesa"),
+            ("vkd3d-proton", "https://github.com/HansKristian-Work/vkd3d-proton"),
+            ("DXVK", "https://github.com/doitsujin/dxvk"),
             ("highball-db", "https://github.com/gauthierpiarrette/highball-db"),
             ("Ferestre, by icex", "https://github.com/icex/ferestre"),
             ("xodus", "https://github.com/xodus-gaming/xodus"),
@@ -157,15 +161,16 @@ struct MetalHorizonApp: App {
 
     private func showAbout() {
         let credits = NSAttributedString(string: """
-            Prototype. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
-            Built on Highball, Ferestre, xodus, Wine, DXMT, SDL and Apple's D3DMetal: see the Thanks menu.
+            1.0 Final Beta. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
+            Built on Highball (its native arm64 route, FEX patches and signed loader), Ferestre, xodus, Wine, FEX, KosmicKrisp, \
+            vkd3d-proton, DXVK, DXMT, SDL and Apple's D3DMetal: see the Thanks menu.
             """, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
         NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
         NSApp.activate(ignoringOtherApps: true)
     }
 }
 
-enum Activity { case idle, signIn, install, download, game, steam }
+enum Activity { case idle, signIn, install, download, game, steam, preparing }
 
 enum LogView: String, CaseIterable, Identifiable {
     case activity, game
@@ -208,6 +213,24 @@ final class LauncherModel: ObservableObject {
     @Published var maxFPS = 0 {
         didSet { settingsStore().set(maxFPS, forKey: SettingKey.maxFPS) }
     }
+    @Published var ownership = XboxOwnership.purchase {
+        didSet { settingsStore().set(ownership.rawValue, forKey: SettingKey.ownership) }
+    }
+    @Published var plainSync = false {
+        didSet { settingsStore().set(plainSync, forKey: SettingKey.plainSync) }
+    }
+    @Published var engineRoute = EngineRoute.automatic {
+        didSet { settingsStore().set(engineRoute.rawValue, forKey: SettingKey.engineRoute); refreshChecks() }
+    }
+    /// The engine the next Play uses and why (RouteDecision), recomputed by refreshChecks and after each run.
+    @Published var routeDecision = RouteDecision(route: .d3dmetal, reason: "")
+    /// What the Autopilot did in the last day (RepairLog).
+    @Published var recentRepairs: [Repair] = []
+    /// What the Doctor can fix with the player's click (moving a folder, quitting an app, a password).
+    @Published var pendingFixes: [PendingFix] = []
+    private var doctorState = DoctorState.load()
+    private var doctorTimer: Timer?
+    private var examining = false
     @Published var autoRetry = true {
         didSet { settingsStore().set(autoRetry, forKey: SettingKey.autoRetry) }
     }
@@ -246,6 +269,8 @@ final class LauncherModel: ObservableObject {
     private let outputTail = LogTail()
     private let gameTail = LogTail()
     private var runOutputTimer: Timer?
+    private var lastNote: String?
+    private var checksGeneration = 0
     private var steamTimer: Timer?
     private var steamInstallOffered = false
     private var loginApplication: NSRunningApplication?
@@ -275,6 +300,9 @@ final class LauncherModel: ObservableObject {
         metalFX = saved.metalFX
         maxFPS = saved.maxFPS
         autoRetry = saved.autoRetry
+        engineRoute = saved.engineRoute
+        plainSync = saved.plainSync
+        ownership = saved.ownership
         loginObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
@@ -294,9 +322,21 @@ final class LauncherModel: ObservableObject {
             offerCrashReport(pending)
         }
         startSteamPolling()
-        // Blackwell Engine and D3DMetal install by themselves (D3DMetal after Apple's licence is accepted).
+        // Blackwell Engine and D3DMetal install by themselves (D3DMetal after Apple's licence is accepted); then the
+        // Doctor looks at everything once, and again every quarter of an hour while nothing runs.
         if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil && !showWelcome {
-            Task { await self.installComponents() }
+            Task {
+                await self.installComponents()
+                await self.examine(.launch)
+            }
+        }
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil {
+            doctorTimer = Timer.scheduledTimer(withTimeInterval: 900, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, !self.isBusy else { return }
+                    await self.examine(.idle)
+                }
+            }
         }
     }
 
@@ -309,8 +349,19 @@ final class LauncherModel: ObservableObject {
 
     func openSupportPage() { NSWorkspace.shared.open(supportURL) }
 
+    /// Settings › Graphics › Use It Again: the native engine is back in the automatic choice.
+    func clearNativeBench() {
+        var health = RouteHealth.load()
+        health.clearBench(.native)
+        health.save()
+        nativeInstallFailed = false
+        RepairLog.record(Repair(title: "Native engine back in use", detail: "Chosen in Settings › Graphics.", kind: .note))
+        refreshChecks()
+    }
+
     private func editionChanged() {
         refreshChecks()
+        showLastSession()
         startSteamPolling()
         guard ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil, !showWelcome else { return }
         Task { await installComponents() }
@@ -321,7 +372,8 @@ final class LauncherModel: ObservableObject {
     var setup: Setup {
         Setup(edition: edition, gameDirectory: gameDirectory, steamPrefix: steamPrefix, engineDirectory: engineDirectory,
               d3dmetalDirectory: d3dmetalDirectory, metalHUD: metalHUD, controllerMode: controllerMode,
-              metalFX: metalFX, maxFPS: maxFPS, autoRetry: autoRetry)
+              metalFX: metalFX, maxFPS: maxFPS, autoRetry: autoRetry, engineRoute: engineRoute, plainSync: plainSync,
+              ownership: ownership)
     }
     var isBusy: Bool { activity != .idle }
     var canDownload: Bool { !isBusy && !gameDirectory.isEmpty && edition == .xbox }
@@ -338,9 +390,20 @@ final class LauncherModel: ObservableObject {
             status = note
         }
         let current = setup
+        // Only the newest round counts: rounds run in parallel, and one started before the game folder was known (at
+        // launch) could finish last and bring back stale warnings ("The download needs about 160 GB" for an installed game).
+        checksGeneration += 1
+        let generation = checksGeneration
         Task.detached(priority: .utility) {
             let items = Diagnostics.preflight(current)
-            await MainActor.run { self.preflight = items }
+            let decision = current.routeDecision()
+            let repairs = RepairLog.recent()
+            await MainActor.run {
+                guard generation == self.checksGeneration else { return }
+                self.preflight = items
+                if self.routeDecision != decision { self.routeDecision = decision }
+                if self.recentRepairs != repairs { self.recentRepairs = repairs }
+            }
         }
         objectWillChange.send()
     }
@@ -400,41 +463,192 @@ final class LauncherModel: ObservableObject {
 
     /// Installs what the edition is missing (its Blackwell Engine, then D3DMetal once Apple's licence is accepted) and
     /// assembles the shim from that engine.
+    // MARK: - The Doctor
+
+    /// Looks at everything the Doctor knows at a moment, applies what it may by itself, and shows what needs a click.
+    @discardableResult
+    func examine(_ moment: DoctorMoment) async -> Examination {
+        guard !examining else { return Examination() }
+        examining = true
+        defer { examining = false }
+        let current = setup
+        let account = accountSaved
+        let patient = await Task.detached(priority: .userInitiated) { () -> Patient in
+            let edition = current.edition
+            let runs = LogStore.sessions().filter { s in
+                edition == .steam ? s.kind.hasPrefix("steam") : !s.kind.hasPrefix("steam")
+            }.prefix(12).map(RunRecord.init)
+            let location = Diagnostics.appLocation
+            let needsNetwork = (moment == .beforePlay || moment == .afterAction) && edition == .xbox
+            let net = needsNetwork ? Sys.reachMicrosoft() : (online: true, skew: nil)
+            return Patient(setup: current, facts: .current, moment: moment, runs: Array(runs),
+                           gameRunning: Sys.pgrep("forzahorizon6\\.exe"),
+                           serviceRunning: Sys.pgrep("xodus-service"),
+                           serviceSocket: fileExists("/private/tmp/xodus-runtime-test/xodus.sock"),
+                           accountSaved: account, rosetta: Diagnostics.rosettaInstalled,
+                           freeBytes: Diagnostics.freeSpace(at: edition == .steam ? current.steamPrefixPath : current.gameDirectory),
+                           appTranslocated: location.translocated, appQuarantined: location.quarantined,
+                           appPath: Bundle.main.bundlePath,
+                           online: needsNetwork ? net.online : nil, clockSkew: net.skew,
+                           steamNativeRunning: edition == .steam && Diagnostics.nativeSteamRunning())
+        }.value
+        var state = doctorState
+        let exam = await Doctor.examine(patient, actions: doctorActions, state: &state)
+        doctorState = state
+        state.save()
+        exam.repairs.forEach(RepairLog.record)
+        recentRepairs = RepairLog.recent()
+        // the one-click fixes: those of the ailments looked at now are replaced, the others stay until their moment
+        let lookedAt = Set(Doctor.catalogue.filter { $0.moments.contains(moment) }.map(\.id))
+        pendingFixes = pendingFixes.filter { !lookedAt.contains($0.id) } + exam.pending
+        if let last = exam.repairs.last, !isBusy { status = "MetalHorizon: \(last.title)." }
+        refreshChecks()
+        var result = exam
+        if patient.online == false { result.blocker = "offline" }
+        return result
+    }
+
+    /// Runs a one-click fix, then looks again.
+    func applyFix(_ fix: PendingFix) {
+        Task {
+            status = "\(fix.button)…"
+            let outcome = await fix.action()
+            status = outcome
+            pendingFixes.removeAll { $0.id == fix.id }
+            await examine(.idle)
+        }
+    }
+
+    /// What the Doctor may do, through the model so the window follows.
+    private var doctorActions: DoctorActions {
+        DoctorActions(
+            installComponent: { [weak self] id in try await self?.installComponent(id) },
+            setMetalFX: { [weak self] v in self?.metalFX = v },
+            setPlainSync: { [weak self] v in self?.plainSync = v },
+            setMaxFPS: { [weak self] v in self?.maxFPS = v },
+            setHUD: { [weak self] v in self?.metalHUD = v },
+            setControllerMode: { [weak self] v in self?.controllerMode = v },
+            setGameDirectory: { [weak self] v in self?.gameDirectory = v },
+            setEngineRoute: { [weak self] v in self?.engineRoute = v },
+            signInAgain: { [weak self] in self?.connectMicrosoft() },
+            startDownload: { [weak self] in self?.download() },
+            openURL: { NSWorkspace.shared.open($0) },
+            relaunchApp: { [weak self] path in self?.moveToApplications(from: path) })
+    }
+
+    /// One component, installed (or installed again) on its own, with the licence and progress of a normal install.
+    func installComponent(_ id: String) async throws {
+        guard let component = Component.named(id) else { return }
+        try await Installer.install(component, confirm: { [weak self] license in
+            await self?.askLicense(license) ?? false
+        }, progress: { [weak self] fraction, text in
+            Task { @MainActor in self?.installFraction = fraction; self?.status = text }
+        })
+        installFraction = nil
+        if NativeEngine.filesPresent && NativeEngine.loaderPresent && !NativeEngine.linked { try NativeEngine.linkLoader() }
+        let current = setup
+        if id != "engine-native" && id != "wineloader",
+           fileExists(current.engine + "/renderers/tsshim/x86_64-windows/d3d12.dll"), fileExists(current.d3dmetal + "/wine/x86_64-windows/d3d12.dll") {
+            try Installer.prepareShim(engine: current.engine, d3dmetal: current.d3dmetal)
+        }
+    }
+
+    /// Moves MetalHorizon from where macOS translocated it (or Downloads) to /Applications and opens it there.
+    func moveToApplications(from path: String) {
+        let original = Diagnostics.appLocation.path   // the real location behind a translocated copy
+        let source = fileExists(original) ? original : path
+        let target = "/Applications/MetalHorizon.app"
+        do {
+            if fileExists(target) { try FileManager.default.trashItem(at: URL(fileURLWithPath: target), resultingItemURL: nil) }
+            try FileManager.default.moveItem(atPath: source, toPath: target)
+            Sys.removeQuarantine(target)
+            RepairLog.record(Repair(title: "MetalHorizon moved to Applications", detail: "From \(Setup.tildePath(source)).", kind: .fixed))
+            let config = NSWorkspace.OpenConfiguration()
+            config.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: target), configuration: config) { _, _ in
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+        } catch {
+            status = "MetalHorizon could not be moved to Applications: \(error). Move it in the Finder."
+        }
+    }
+
+    /// Whether this Mac's next Play may use the native engine, so its pieces are worth installing now.
+    private var wantsNative: Bool {
+        guard edition == .xbox, !nativeInstallFailed else { return false }
+        switch engineRoute {
+        case .d3dmetal: return false
+        case .native: return MachineFacts.current.nativeSupported
+        case .automatic: return MachineFacts.current.nativeRecommended && !RouteHealth.load().isBenched(.native)
+        }
+    }
+    /// A native piece that would not install: not tried again until the next launch, D3DMetal runs the game.
+    private var nativeInstallFailed = false
+
+    /// Installs what the edition is missing (its Blackwell Engine, then D3DMetal once Apple's licence is accepted, and
+    /// on a Mac that can run it the native engine with Highball's signed loader) and assembles the shim from that
+    /// engine. D3DMetal is always installed: it is what the game falls back to.
     func installComponents() async {
         guard !isBusy else { return }
         let steam = edition == .steam
+        let native = wantsNative
+        let order = ["engine": 0, "engine-steam": 0, "d3dmetal": 1, "wineloader": 2, "engine-native": 3]
         let missing = Component.all().filter { component in
             guard !component.isInstalled else { return false }
             switch component.id {
             case "engine": return !steam && engineDirectory.isEmpty
             case "engine-steam": return steam && engineDirectory.isEmpty
-            default: return d3dmetalDirectory.isEmpty
+            case "d3dmetal": return d3dmetalDirectory.isEmpty
+            case "wineloader", "engine-native": return native
+            default: return false
             }
-        }
+        }.sorted { (order[$0.id] ?? 9) < (order[$1.id] ?? 9) }
         let shimFrom = setup.engine + "/renderers/tsshim/x86_64-windows/d3d12.dll"
         let shimStale = (try? FileManager.default.contentsEqual(atPath: shimFrom, andPath: shimDirectory + "/x86_64-windows/d3d12.dll")) == false
-        if missing.isEmpty && setup.shimReady && !shimStale { return }
+        let relink = native && NativeEngine.filesPresent && NativeEngine.loaderPresent && !NativeEngine.linked
+        if missing.isEmpty && setup.shimReady && !shimStale && !relink { return }
         activity = .install
         defer { activity = .idle; installFraction = nil; refreshChecks() }
-        do {
-            for component in missing {
+        var failure: String?
+        for component in missing {
+            do {
                 try await Installer.install(component, confirm: { [weak self] license in
                     await self?.askLicense(license) ?? false
                 }, progress: { [weak self] fraction, text in
                     Task { @MainActor in self?.installFraction = fraction; self?.status = text }
                 })
+            } catch {
+                if component.id == "engine-native" || component.id == "wineloader" {
+                    // never a reason not to play: D3DMetal runs the game, and the next launch tries again
+                    nativeInstallFailed = true
+                    var health = RouteHealth.load()
+                    health.bench(.native, for: 6 * 3600, reason: "The native engine could not be installed (\(error)); D3DMetal runs the game.")
+                    health.save()
+                    RepairLog.record(Repair(title: "Native engine postponed", detail: "\(component.name) could not be installed: \(error). D3DMetal runs the game; MetalHorizon tries again later.", kind: .switchedEngine))
+                    continue
+                }
+                failure = "\(error)"
+                break
             }
+        }
+        do {
+            if relink || (NativeEngine.filesPresent && NativeEngine.loaderPresent && !NativeEngine.linked) { try NativeEngine.linkLoader() }
             let current = setup
             if fileExists(current.engine + "/renderers/tsshim/x86_64-windows/d3d12.dll"),
                fileExists(current.d3dmetal + "/wine/x86_64-windows/d3d12.dll") {
                 try Installer.prepareShim(engine: current.engine, d3dmetal: current.d3dmetal)
             }
-            status = current.componentsReady
-                ? (current.edition == .xbox ? (current.gameCheck.ok ? "Ready." : "Blackwell Engine and D3DMetal are installed. Download the game.")
-                   : (current.steamClientCheck.ok ? "Ready." : "Blackwell Engine Steam and D3DMetal are installed. Install Steam."))
-                : "Some components are missing; see the red lines."
         } catch {
-            status = "\(error)"
+            failure = failure ?? "\(error)"
+        }
+        let current = setup
+        if let failure {
+            status = failure
+        } else {
+            status = current.componentsReady
+                ? (current.edition == .xbox ? (current.gameCheck.ok ? "Ready." : "The engines are installed. Download the game.")
+                   : (current.steamClientCheck.ok ? "Ready." : "Blackwell Engine Steam and D3DMetal are installed. Install Steam."))
+                : "Some components are missing; see what needs attention."
         }
     }
 
@@ -541,6 +755,7 @@ final class LauncherModel: ObservableObject {
             try? stop.run()
         }
         refreshSavedAccountStatus(continueAfterSignIn: connected)
+        if !connected { Task { await examine(.afterAction) } }   // a wrong clock or no network fails a sign-in too
     }
 
     /// The helper's end states: the sign-in is over whether or not its window is still open.
@@ -676,7 +891,8 @@ final class LauncherModel: ObservableObject {
     // MARK: - Download and Play
 
     func download() {
-        guard canDownload, let cli = Bundle.main.resourceURL?.appendingPathComponent("xodus-cli") else { return }
+        guard canDownload, let resources = Bundle.main.resourceURL else { return }
+        let cli = Setup.xodusCLI(resources: resources)
         // xodus checks the licence on the signed-in account: only an owned game downloads.
         run(executable: cli, arguments: ["streaming", storeProductID, gameDirectory], environment: ["RUST_BACKTRACE": "1"],
             activity: .download, statusText: "Downloading Forza Horizon 6 from the Xbox servers…", logName: "download") { code in
@@ -684,36 +900,84 @@ final class LauncherModel: ObservableObject {
         }
     }
 
+    /// The engine the running game uses (nil when nothing runs), the Play click's one automatic relaunch, and
+    /// whether the player stopped the run (then nothing about it counts as a failure).
+    private var runRoute: ResolvedRoute?
+    private var relaunchedThisPlay = false
+    private var userStoppedRun = false
+
     func play() {
         guard canPlay else { return }
-        if !setup.readyToPlay {
-            Task {
+        relaunchedThisPlay = false
+        Task {
+            // what the next run needs, installed first (the native engine's pieces when this Mac takes it)
+            let wanted = setup.routeDecision().route
+            if !setup.componentsReady(for: wanted) || !setup.componentsReady || (edition == .steam && !setup.readyToPlay) {
                 await installComponents()
-                if setup.readyToPlay { startGame() }
-                else if edition == .steam && !setup.steamGameCheck.ok {
-                    status = setup.steamGameCheck.fix ?? "Install Forza Horizon 6 in Steam first."
+            }
+            if edition == .steam {
+                guard setup.readyToPlay else {
+                    status = setup.steamGameCheck.ok ? (setup.steamClientCheck.fix ?? "Install Steam first.")
+                                                     : (setup.steamGameCheck.fix ?? "Install Forza Horizon 6 in Steam first.")
+                    return
+                }
+                startGame(route: .d3dmetal)
+                return
+            }
+            // The Doctor before Play: what it can repair, repaired; and the network, which the licence needs at
+            // every start (a Game Pass lease even more): a minute of waiting for it rather than a failed start.
+            activity = .preparing
+            let exam = await examine(.beforePlay)
+            if exam.blocker == "offline" {
+                var online = false
+                for second in stride(from: 60, to: 0, by: -5) {
+                    status = "Waiting for the network (\(second) s): Microsoft checks the game's licence at every start."
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    online = await Task.detached { Sys.reachMicrosoft().online }.value
+                    if online { break }
+                }
+                if !online {
+                    activity = .idle
+                    status = "No connection to Microsoft's licence server, so the game cannot start. Connect to the internet and press Play."
+                    return
                 }
             }
-            return
+            activity = .idle
+            var route = setup.routeDecision().route
+            if route == .native && !setup.componentsReady(for: .native) { route = .d3dmetal }
+            guard setup.gameCheck.ok, setup.componentsReady(for: route) else {
+                status = setup.gameCheck.ok ? "Some components are missing; see what needs attention." : (setup.gameCheck.fix ?? "Download the game first.")
+                return
+            }
+            startGame(route: route)
         }
-        startGame()
     }
 
-    private func startGame() {
+    private func startGame(route: ResolvedRoute) {
         guard let resources = Bundle.main.resourceURL else { return }
         let connected = Controllers.connected()
         let gameInput = Controllers.gameInputEnabled(mode: controllerMode, connected: connected)
+        userStoppedRun = false
         if edition == .steam {
+            runRoute = .d3dmetal
             runSteam("play", activity: .game, statusText: "Playing through Steam. Quit from the game's own menu; Steam stays open in the background.") { code in
                 code == 0 ? "Game closed." : "The game did not start or stopped (error \(code)). What to do shows under the button."
             }
             return
         }
+        // what can be repaired without asking, repaired now and written down
+        for repair in Autopilot.beforePlay(setup: setup, route: route) { RepairLog.record(repair) }
+        recentRepairs = RepairLog.recent()
+        runRoute = route
+        let first = route == .native && !fileExists(setup.nativePrefix + "/system.reg")
+        let playing = route == .native
+            ? (first ? "First start on the native engine: the game spends about 10 minutes on Optimizing for your PC, once."
+                     : "Playing on the native engine\(gameInput ? " (controllers on)" : ""). Quit from the game's menu; the cloud save uploads as it closes.")
+            : "Playing\(gameInput ? " (controllers on)" : ""). Quit from the game's menu; the cloud save uploads as it closes."
         run(executable: URL(fileURLWithPath: "/bin/bash"),
             arguments: [resources.appendingPathComponent("metalhorizon-play.sh").path],
-            environment: setup.playEnvironment(resources: resources, gameInput: gameInput),
-            activity: .game, statusText: "Playing\(gameInput ? " (controllers on)" : ""). Quit from the game's menu; the cloud save uploads as it closes.",
-            logName: "play") { code in
+            environment: setup.playEnvironment(resources: resources, gameInput: gameInput, route: route),
+            activity: .game, statusText: playing, logName: "play") { code in
             code == 0 ? "Game closed." : "The game stopped (error \(code)). What to do shows under the button."
         }
     }
@@ -722,6 +986,7 @@ final class LauncherModel: ObservableObject {
     /// only, Steam stays).
     func stop() {
         if activity == .game {
+            userStoppedRun = true
             if edition == .steam {
                 let kill = Process()
                 kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
@@ -730,10 +995,14 @@ final class LauncherModel: ObservableObject {
                 status = "Force-quitting the game (Steam stays open)…"
                 return
             }
+            let native = runRoute == .native
+            let engine = native ? NativeEngine.engine : setup.engine
             let kill = Process()
-            kill.executableURL = URL(fileURLWithPath: setup.engine + "/bin/wineserver")
+            kill.executableURL = URL(fileURLWithPath: engine + "/bin/wineserver")
             kill.arguments = ["-k"]
-            kill.environment = ProcessInfo.processInfo.environment.merging([
+            kill.environment = ProcessInfo.processInfo.environment.merging(native ? [
+                "WINEPREFIX": setup.nativePrefix
+            ] : [
                 "WINEPREFIX": setup.prefix,
                 "CX_ROOT": setup.engine,
                 "DYLD_LIBRARY_PATH": setup.engine + "/lib"
@@ -810,15 +1079,53 @@ final class LauncherModel: ObservableObject {
                 self.activity = .idle
                 self.process = nil
                 let code = done.terminationStatus
-                self.findings = newSession.finish(exitCode: code)
+                let duration = Date().timeIntervalSince(newSession.started)
+                let route = self.runRoute
+                self.findings = newSession.finish(exitCode: code, extra: [
+                    "route": route?.rawValue ?? "", "user_stopped": self.userStoppedRun, "edition": self.edition.rawValue
+                ])
                 self.status = finished(code)
                 if let first = self.findings.first, first.issue.severity >= .warning, code != 0 || first.issue.severity == .error {
                     self.status += " Diagnosis: \(first.issue.title)."
                 }
                 self.session = nil
-                self.signInExpired = fileExists(signInExpiredMarker.path)
-                if logName == "play" && code == 87 {
-                    self.status = "Xbox no longer accepts the saved sign-in, so the game was stopped before it touched your save. Sign in again, then Play."
+                // The Autopilot reads the run: it records how the engine fared, changes what it must, and may start
+                // the game again once, on the engine the next Play would use.
+                var relaunch: ResolvedRoute?
+                if logName == "play", let route {
+                    let outcome = RunOutcome(route: route, exitCode: code, duration: duration, findings: self.findings,
+                                             userStopped: self.userStoppedRun, options: (self.metalFX, self.maxFPS))
+                    var health = RouteHealth.load()
+                    let decision = Autopilot.afterRun(outcome, health: &health,
+                                                      nativeAvailable: NativeEngine.filesPresent && NativeEngine.loaderPresent,
+                                                      facts: .current, preference: self.engineRoute,
+                                                      alreadyRelaunched: self.relaunchedThisPlay)
+                    health.save()
+                    decision.repairs.forEach(RepairLog.record)
+                    if decision.disableMetalFX { self.metalFX = false }
+                    if decision.syncOff { self.plainSync = true }
+                    if decision.restartXboxService {
+                        NativeEngine.run("/usr/bin/pkill", ["-f", "xodus-service"])
+                    }
+                    if decision.reassembleShim {
+                        try? Installer.prepareShim(engine: self.setup.engine, d3dmetal: self.setup.d3dmetal)
+                    }
+                    relaunch = self.autoRetry ? decision.relaunch : nil
+                    if let last = decision.repairs.last, relaunch == nil { self.status += " MetalHorizon: \(last.title)." }
+                }
+                self.runRoute = nil
+                // the Doctor reads the run too (caches, memory, the prefix, the service...), before any relaunch
+                let failedAction = logName != "play" && logName != "steam-play" && code != 0
+                if logName == "play" || logName == "steam-play" || failedAction {
+                    Task { await self.examine(failedAction ? .afterAction : .afterRun) }
+                }
+                if let next = relaunch {
+                    self.relaunchedThisPlay = true
+                    self.status = "The game stopped early; MetalHorizon starts it again\(next == route ? "" : " on the \(next.title) engine")…"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                        guard let self, !self.isBusy else { return }
+                        self.startGame(route: next)
+                    }
                 } else if logName == "play" || logName == "steam-play",
                    let info = LogStore.sessions().first(where: { $0.id == newSession.id }),
                    let report = CrashReport.make(info, edition: self.edition) {
@@ -844,7 +1151,11 @@ final class LauncherModel: ObservableObject {
 
     /// The last session's logs and findings, when the app opens.
     private func showLastSession() {
-        guard let last = LogStore.sessions().first else { return }
+        // the last run of this edition: a Steam run's problems do not belong under the Xbox edition, nor the reverse
+        let mine = LogStore.sessions().first { session in
+            edition == .steam ? session.kind.hasPrefix("steam") : !session.kind.hasPrefix("steam")
+        }
+        guard let last = mine else { lastSessionURLs = nil; findings = []; outputTail.reset(nil); gameTail.reset(nil); logLines = []; return }
         let output = last.directory.appendingPathComponent("output.log")
         let game = last.directory.appendingPathComponent("game.log")
         lastSessionURLs = (output, game)
@@ -858,6 +1169,11 @@ final class LauncherModel: ObservableObject {
         let changed = logView == .activity ? outputTail.poll() : gameTail.poll()
         if logView == .activity { gameTail.poll() } else { outputTail.poll() }
         if changed || logLines.isEmpty { reloadLogView() }
+        // A script's NOTE line is something the player has to do now (a macOS dialog waiting): it becomes the status.
+        if isBusy, let note = outputTail.lines.last(where: { $0.hasPrefix("NOTE: ") }), note != lastNote {
+            lastNote = note
+            status = String(note.dropFirst(6))
+        }
     }
 
     private func reloadLogView() {

@@ -148,7 +148,9 @@ enum MCPServer {
     static let instructions = """
     MetalHorizon runs the user's own copy of Forza Horizon 6 on an Apple silicon Mac, from either edition:
     - Xbox / Microsoft Store: Wine (Blackwell Engine) + xodus (Xbox sign-in, download, licence) + Apple's D3DMetal 4 \
-    behind Highball's DirectX 12 shim.
+    behind Highball's DirectX 12 shim; or, on Apple silicon with macOS 27, Blackwell Engine Native: Wine 11.18 for \
+    arm64 with FEX for the game's x86-64 code and vkd3d-proton on KosmicKrisp (Metal 4), Highball's native route, a \
+    steady 30 frames a second without the hitch every second. Automatic picks the engine; engine_route says which and why.
     - Steam: the same graphics stack on Blackwell Engine Steam (32-bit half, DXMT for Steam's own window), with Steam \
     itself in a prefix MetalHorizon manages; the game is launched by a silent Steam client (steam.exe -silent -applaunch).
     The app installs the engines and D3DMetal by itself (D3DMetal after the user accepts Apple's licence). \
@@ -166,6 +168,9 @@ enum MCPServer {
     - Network problems (downloads, sign-in, Steam's installer): network_check.
     - Settings: get_settings, then set_setting only after the user agrees. MetalHorizon must be reopened to show a \
     changed setting. show_play_environment shows what Play would run, without starting anything.
+    - MetalHorizon's Autopilot repairs what it can by itself (links, the Xbox service, settings that crashed a run, \
+    the engine after two failures) and relaunches a failed start once: autopilot_repairs lists what it did. Prefer \
+    explaining those to the user over undoing them; reset_engine_health brings the native engine back when asked.
     - For a GitHub issue, export_diagnostics writes a zip with secrets removed; tell the user to attach it.
     - Answer in the user's language, in plain words, one step at a time; the user may be a beginner.
 
@@ -183,7 +188,7 @@ enum MCPServer {
     // MARK: - Tools
 
     private static let settingKeys = ["edition", "gameDirectory", "steamPrefix", "engineDirectory", "d3dmetalDirectory",
-                                      "metalHUD", "controllerMode", "metalFX", "maxFPS", "autoRetry"]
+                                      "metalHUD", "controllerMode", "metalFX", "maxFPS", "autoRetry", "engineRoute", "plainSync"]
 
     private static let tools: [Tool] = [
         Tool(name: "check_setup", title: "Check the setup",
@@ -309,6 +314,28 @@ enum MCPServer {
                  if let note = Setup.repairXboxPackage(in: setup.gameDirectory) { return note }
                  return "Nothing to do: \(redact(setup.xboxGameCheck.text))\(setup.xboxGameCheck.fix.map { ". " + $0 } ?? "")"
              }),
+        Tool(name: "engine_route", title: "Which engine Play uses",
+             description: "The engine the next Play uses (native Apple silicon: steady 30 fps without the hitch every second; or D3DMetal under Rosetta: faster with a hitch), why, this Mac's facts (Apple silicon, macOS, memory), the native engine's state (files, Highball's signed loader, link) and how each engine fared lately (failures, last success, whether the Autopilot keeps one aside).",
+             handler: { _ in engineRoute() }),
+        Tool(name: "autopilot_repairs", title: "What MetalHorizon fixed by itself",
+             description: "The Autopilot's log: what it saw and what it did before Play and after each run (repaired a link, restarted the Xbox service, turned off MetalFX after a crash, switched engines after two failures, relaunched the game once). Newest first.",
+             properties: ["days": ["type": "integer", "description": "How many days back (default 7)"]],
+             handler: { args in
+                 let days = (args["days"] as? Int) ?? 7
+                 let list = RepairLog.recent(within: Double(max(1, min(days, 90))) * 86_400)
+                 if list.isEmpty { return "The Autopilot has not had to do anything in the last \(days) days." }
+                 return list.map { "\(ISO8601DateFormatter().string(from: $0.date)) [\($0.kind.rawValue)] \($0.title): \(redact($0.detail))" }
+                     .joined(separator: "\n")
+             }),
+        Tool(name: "reset_engine_health", title: "Give the native engine another try",
+             description: "Clears the Autopilot's record that keeps the native engine aside after it failed, so Automatic may pick it again at the next Play. Ask the user first.",
+             readOnly: false, handler: { _ in
+                 var health = RouteHealth.load()
+                 health.clearBench(.native)
+                 health.save()
+                 RepairLog.record(Repair(title: "Native engine back in use", detail: "Asked through an AI assistant.", kind: .note))
+                 return "Done: Automatic may use the native engine again at the next Play."
+             }),
         Tool(name: "xodus_service", title: "xodus-service",
              description: "Xbox edition: status, start or stop of xodus-service, the helper that holds the Xbox sign-in and gives the game its tokens. Without it: 'Cloud save synchronization failed' and no online play. Do not stop it while the game runs.",
              properties: ["action": ["type": "string", "enum": ["status", "start", "stop"]]],
@@ -316,6 +343,31 @@ enum MCPServer {
     ]
 
     // MARK: Setup and checks
+
+    private static func engineRoute() -> String {
+        let setup = Setup.load()
+        let facts = MachineFacts.current
+        let health = RouteHealth.load()
+        let decision = setup.routeDecision(facts: facts, health: health)
+        let native = NativeEngine.check(facts: facts)
+        func record(_ r: RouteHealth.Record) -> [String: Any] {
+            var out: [String: Any] = ["failures_last_day": r.failures.filter { Date().timeIntervalSince($0) < 86_400 }.count]
+            if let s = r.lastSuccess { out["last_success"] = ISO8601DateFormatter().string(from: s) }
+            if let b = r.benchedUntil, b > Date() { out["kept_aside_until"] = ISO8601DateFormatter().string(from: b); out["why"] = r.benchReason ?? "" }
+            return out
+        }
+        let info: [String: Any] = [
+            "preference": setup.engineRoute.rawValue,
+            "next_play": decision.route.rawValue,
+            "reason": decision.reason,
+            "mac": ["apple_silicon": facts.appleSilicon, "macos": "\(facts.macOSMajor).\(facts.macOSMinor)", "memory_gb": facts.memoryGB,
+                    "native_supported": facts.nativeSupported, "native_recommended": facts.nativeRecommended],
+            "native_engine": ["status": native.ok ? "ok" : "problem", "detail": native.text, "fix": native.fix ?? "",
+                              "loader_present": NativeEngine.loaderPresent, "loader_linked": NativeEngine.linked],
+            "health": ["native": record(health.native), "d3dmetal": record(health.d3dmetal)]
+        ]
+        return json(info)
+    }
 
     private static func row(_ item: String, _ check: Check) -> [String: Any] {
         var r: [String: Any] = ["item": item, "status": !check.ok ? "problem" : (check.fix == nil ? "ok" : "warning"),
@@ -806,6 +858,11 @@ enum MCPServer {
         case "metalHUD": return try bool(SettingKey.metalHUD)
         case "metalFX": return try bool(SettingKey.metalFX)
         case "autoRetry": return try bool(SettingKey.autoRetry)
+        case "plainSync": return try bool(SettingKey.plainSync)
+        case "engineRoute":
+            guard let route = EngineRoute(rawValue: raw) else { throw ToolError(message: "engineRoute is automatic, native or d3dmetal") }
+            store.set(route.rawValue, forKey: SettingKey.engineRoute)
+            return "engineRoute = \(route.rawValue). Reopen MetalHorizon to see it."
         case "edition":
             guard let edition = Edition(rawValue: raw.lowercased()) else { throw ToolError(message: "edition is xbox or steam") }
             store.set(edition.rawValue, forKey: SettingKey.edition)

@@ -21,6 +21,21 @@ enum SettingKey {
     static let autoRetry = "metalhorizon.autoRetry"
     static let appleLicenseAccepted = "metalhorizon.appleLicenseAccepted"   // the D3DMetal version accepted
     static let welcomeShown = "metalhorizon.welcomeShown"
+    static let engineRoute = "metalhorizon.engineRoute"
+    static let plainSync = "metalhorizon.plainSync"
+    static let ownership = "metalhorizon.xboxOwnership"
+}
+
+/// How the player has the Xbox / Microsoft Store edition: bought, or through a Game Pass subscription. Technically the
+/// same copy (product 9NR1R1XWLCNB, the same package and the same xodus path): at every start Microsoft's licence server
+/// hands xodus a licence for a purchase, or a lease for a PC Game Pass or Ultimate member. What differs is what can go
+/// wrong (a subscription that lapsed or does not include PC games, a lease that needs the internet at each start) and
+/// how MetalHorizon explains and handles it.
+enum XboxOwnership: String, CaseIterable, Identifiable {
+    case purchase, gamePass
+    var id: String { rawValue }
+    var title: String { self == .purchase ? "Bought on the Microsoft Store or Xbox" : "PC Game Pass or Game Pass Ultimate" }
+    var shortTitle: String { self == .purchase ? "Xbox" : "Game Pass" }
 }
 
 /// Which copy of the game: the Xbox / Microsoft Store one (xodus signs in and downloads it) or the Steam one
@@ -91,6 +106,9 @@ struct Setup {
     var metalFX = false
     var maxFPS = 0
     var autoRetry = true
+    var engineRoute = EngineRoute.automatic
+    var plainSync = false           // Wine's plain synchronization instead of msync (the Autopilot sets it after an msync failure)
+    var ownership = XboxOwnership.purchase
 
     static func load() -> Setup {
         let defaults = settingsStore()
@@ -105,6 +123,9 @@ struct Setup {
         setup.metalFX = defaults.bool(forKey: SettingKey.metalFX)
         setup.maxFPS = defaults.integer(forKey: SettingKey.maxFPS)
         setup.autoRetry = defaults.object(forKey: SettingKey.autoRetry) as? Bool ?? true
+        setup.engineRoute = EngineRoute(rawValue: defaults.string(forKey: SettingKey.engineRoute) ?? "") ?? .automatic
+        setup.plainSync = defaults.bool(forKey: SettingKey.plainSync)
+        setup.ownership = XboxOwnership(rawValue: defaults.string(forKey: SettingKey.ownership) ?? "") ?? .purchase
         return setup
     }
 
@@ -327,6 +348,33 @@ struct Setup {
         return fileExists(gameDirectory + "/.blackwell-wine") ? gameDirectory + "/.blackwell-wine" : gameDirectory + "/.metalhorizon-wine"
     }
 
+    /// The native engine's own prefix: an environment never moves between the Rosetta engine and the native one.
+    var nativePrefix: String { gameDirectory + "/.metalhorizon-native" }
+
+    /// The engine the next Play uses (RouteDecision), from this Mac, the choice in Settings and the last runs.
+    func routeDecision(facts: MachineFacts = .current, health: RouteHealth = .load()) -> RouteDecision {
+        RouteDecision.decide(preference: engineRoute, edition: edition, facts: facts, health: health,
+                             nativeAvailable: (NativeEngine.filesPresent && NativeEngine.loaderPresent)
+                                || Component.named("engine-native") != nil)
+    }
+
+    /// Whether the pieces a route needs are on disk.
+    func componentsReady(for route: ResolvedRoute) -> Bool {
+        switch route {
+        case .d3dmetal: return componentsReady
+        case .native: return NativeEngine.filesPresent && NativeEngine.loaderPresent
+        }
+    }
+
+    /// The xodus program that runs and downloads the game: the one inside Xodus Login.app when it is there. The
+    /// sign-in's Keychain items trust the program that made them, which is that one; Resources/xodus-cli, the same
+    /// program signed apart, made macOS ask "xodus-cli wants to use your confidential information" after every sign-in,
+    /// and the run waited on that window, often hidden behind the game's.
+    static func xodusCLI(resources: URL) -> URL {
+        let login = resources.appendingPathComponent("Xodus Login.app/Contents/MacOS/xodus-login")
+        return FileManager.default.isExecutableFile(atPath: login.path) ? login : resources.appendingPathComponent("xodus-cli")
+    }
+
     /// The options every script reads (metalhorizon-common.sh).
     func optionsEnvironment(gameInput: Bool) -> [String: String] {
         [
@@ -338,15 +386,23 @@ struct Setup {
             "MH_METALFX": metalFX ? "1" : "0",
             "MH_MAX_FPS": String(maxFPS),
             "MH_RETRIES": autoRetry ? "2" : "0",
+            "MH_SYNC": plainSync ? "plain" : "msync",
             "MH_LOGS": logDirectory.path
         ]
     }
 
     /// What metalhorizon-play.sh reads (the MCP server's show_play_environment passes the same).
-    func playEnvironment(resources: URL, gameInput: Bool = false, gameLog: URL? = nil) -> [String: String] {
+    func playEnvironment(resources: URL, gameInput: Bool = false, gameLog: URL? = nil,
+                         route: ResolvedRoute = .d3dmetal) -> [String: String] {
         var env = optionsEnvironment(gameInput: gameInput)
+        env["MH_ROUTE"] = route.rawValue
+        if route == .native {
+            env["MH_NATIVE"] = NativeEngine.directory
+            env["MH_PREFIX"] = nativePrefix
+            env["MH_NATIVE_SETTINGS"] = resources.appendingPathComponent("fh6-native-UserConfigSelections.xml").path
+        }
         env["MH_GAME"] = gameDirectory
-        env["MH_XODUS_CLI"] = resources.appendingPathComponent("xodus-cli").path
+        env["MH_XODUS_CLI"] = Setup.xodusCLI(resources: resources).path
         env["MH_XODUS_SERVICE"] = resources.appendingPathComponent("xodus-service").path
         if let gameLog { env["MH_GAME_LOG"] = gameLog.path }
         return env

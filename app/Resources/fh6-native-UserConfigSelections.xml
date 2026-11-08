@@ -1,0 +1,107 @@
+<UserConfig Version="52" HardwareHash="0">
+  <settings>
+    <PresentInterval value="2"/>
+    <MonitorRefreshPeriod value="0.016667"/>
+    <CollidableShadows isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <UIScale value="1.000000"/>
+    <CarSpecularCubemapResolution isDynamic="1" dynamicValue="Low"/>
+    <GlobalSpecularCubemapResolution isDynamic="0" dynamicValue="Default" name="Default" value="128"/>
+    <CarSpecularCubemapMSAA isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <CubemapDrawDistanceScalar isDynamic="0" dynamicValue="Default" name="Default" value="1.000000"/>
+    <CubemapMeshSizeThresholdScalar isDynamic="0" dynamicValue="Default" name="Default" value="1.000000"/>
+    <ParticleRateScale isDynamic="0" dynamicValue="" name="Default" value="1.000000"/>
+    <EnvMapFrequencyScale isDynamic="1" dynamicValue="Off"/>
+    <CarReflectionLOD isDynamic="1" dynamicValue="VeryLow"/>
+    <TilingScenario isDynamic="0" dynamicValue="" name="Default" value="0"/>
+    <CollidablesInMirror isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <MaxCarsInMirror isDynamic="0" dynamicValue="Default" name="Default" value="3"/>
+    <LOD3CarsInMirror isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <HalfRateMirror isDynamic="0" dynamicValue="Default" name="Default" value="1"/>
+    <ParticlesInMirror isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <CarFocusLODMinMax isDynamic="1" dynamicValue="VeryLow"/>
+    <CarNonFocusLODMinMax isDynamic="0" dynamicValue="Default" name="Default" min="3" max="5"/>
+    <ShadowMapUpdateRateWhenReduced isDynamic="0" dynamicValue="" name="Default" value="1.000000"/>
+    <AllowScreenTearing isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <EnableWindshieldReflections isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <WindshieldReflectionResolution isDynamic="0" dynamicValue="Default" name="Default" value="1"/>
+    <MirrorResolution isDynamic="0" dynamicValue="Default" name="Default" value="160"/>
+    <MirrorFarDistance isDynamic="0" dynamicValue="Default" name="Default" value="500"/>
+    <ResolutionWidth value="1920"/>
+    <ResolutionHeight value="1080"/>
+    <Fullscreen value="1"/>
+    <ShowFPS isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <UseDynamicOptimization value="1"/>
+    <DeformableSnowQuality isDynamic="0" dynamicValue="" Active="1" TessellationLOD0Dist="12.000000" TessellationLOD0EdgeLength="0.250000" TessellationLOD1Dist="20.000000" TessellationLOD1EdgeLength="1.000000" TessellationLOD2Dist="35.000000" TessellationLOD2EdgeLength="2.000000" VertexModifyMinDist="20.000000" VertexModifyMaxDist="35.000000"/>
+    <MasterVolume value="1.000000"/>
+    <StreamerMode value="0"/>
+    <ParticlesQuality isDynamic="0" dynamicValue="" name="Default" value="Medium"/>
+    <UIHUDGlassCaptureEnabled isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <MegaTextureLowSpeedBudget isDynamic="0" dynamicValue="" name="Default" value="0.025000"/>
+    <MegaTextureHighSpeedBudget isDynamic="0" dynamicValue="" name="Default" value="0.003000"/>
+    <FollowLowFOV value="48.500000"/>
+    <FollowHighFOV value="58.000000"/>
+    <DriverFOV value="48.000000"/>
+    <DriverNoWheelFOV value="48.000000"/>
+    <HoodFOV value="66.000000"/>
+    <BumperHighFOV value="58.000000"/>
+    <DepthPrePass isDynamic="0" dynamicValue="" TrackCullDistanceDefault="0.000000" TrackCullDistanceReduced="200.000000"/>
+    <ScreenAreaTestsMain isDynamic="0" dynamicValue="Default" MainScene="70.000000" Depth="10.000000" Cinematic="50.000000" GroundReflection="23.000000"/>
+    <ScreenAreaTestsShadow isDynamic="0" dynamicValue="Default" name="Default" value="0.000000"/>
+    <ScreenAreaTestsCubemap isDynamic="0" dynamicValue="Default" name="Default" value="0.000000"/>
+    <ScreenAreaTestsMirror isDynamic="0" dynamicValue="Default" name="Default" value="3.000000"/>
+    <FWDPlusQuality isDynamic="1" dynamicValue="VeryLow"/>
+    <KeepCarsClean isDynamic="0" dynamicValue="" name="Default" value="0"/>
+    <EnablePCHDR isDynamic="0" dynamicValue="Default" name="Default" value="0"/>
+    <UseLowQualityAIDrivers isDynamic="0" dynamicValue="Default" name="Default" value="1"/>
+    <TAASharpness value="0.500000"/>
+    <CASSharpness value="0.500000"/>
+    <DLAASharpness value="0.500000"/>
+    <DLSSSharpness value="0.500000"/>
+    <XeSSSharpness value="0.500000"/>
+    <XeSSAASharpness value="0.500000"/>
+    <DLC1FollowLowFOV value="65.000000"/>
+    <DLC1FollowHighFOV value="65.000000"/>
+    <DLC1DriverFOV value="45.000000"/>
+    <DLC1DriverNoWheelFOV value="45.000000"/>
+    <DLC1HoodFOV value="53.000000"/>
+    <DLC1BumperHighFOV value="53.000000"/>
+    <FSR3Sharpness value="0.500000"/>
+    <FSR3AASharpness value="0.500000"/>
+  </settings>
+  <selections>
+    <option id="UseDynamicOptimization" value="0"/>
+    <option id="FrameRate" value="3"/>
+    <option id="VSync" value="1"/>
+    <option id="EnableHDR" value="0"/>
+    <option id="MotionBlurAmount" value="1"/>
+    <option id="ShowFPS" value="0"/>
+    <option id="ResolutionScaling" value="0"/>
+    <option id="DLSSMode" value="0"/>
+    <option id="DLSSGMode" value="0"/>
+    <option id="FSR3Mode" value="1"/>
+    <option id="XeSSMode" value="0"/>
+    <option id="REFLEXMode" value="0"/>
+    <option id="NVIDIATech" value="0"/>
+    <option id="CarLOD" value="0"/>
+    <option id="EnvStreamingTex" value="0"/>
+    <option id="GeometryQuality" value="0"/>
+    <option id="ReflectionQuality" value="0"/>
+    <option id="SSRQuality" value="0"/>
+    <option id="RTReflectionQuality" value="0"/>
+    <option id="ShadowQuality" value="0"/>
+    <option id="NightShadows" value="0"/>
+    <option id="SSGIQuality" value="0"/>
+    <option id="RTGIQuality" value="0"/>
+    <option id="ShaderQuality" value="0"/>
+    <option id="AudioQuality" value="0"/>
+    <option id="DeformableSnowQuality" value="0"/>
+    <option id="ParticlesSettings" value="0"/>
+    <option id="VolumetricFogQuality" value="0"/>
+    <option id="LensEffects" value="0"/>
+    <option id="MotionBlurQuality" value="0"/>
+    <option id="TAA" value="0"/>
+    <option id="DLAA" value="0"/>
+    <option id="FSR3AA" value="0"/>
+    <option id="XeSSAA" value="0"/>
+  </selections>
+</UserConfig>

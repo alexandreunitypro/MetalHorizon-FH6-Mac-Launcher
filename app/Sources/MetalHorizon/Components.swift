@@ -7,7 +7,7 @@ import Foundation
 // a local folder instead (testing); a matching file in ~/Library/Application Support/MetalHorizon/Downloads is used first.
 
 struct Component: Decodable {
-    var id: String          // "engine" or "d3dmetal"
+    var id: String          // "engine", "engine-steam", "d3dmetal", "engine-native" or "wineloader"
     var name: String
     var version: String
     var url: String
@@ -16,9 +16,14 @@ struct Component: Decodable {
     var folder: String      // the folder it becomes in ~/Library/Application Support/MetalHorizon
     var root: String        // the top folder inside the tarball
     var license: String?    // a file inside the tarball to show and have accepted before installing
+    var signedBy: String?   // an app bundle's Developer ID team: the install is refused unless its signature checks out
 
     var destination: String { supportDirectory.appendingPathComponent(folder).path }
-    private var marker: String { destination + "/.metalhorizon-component.json" }
+    /// Beside a signed bundle, never inside it: a file added to a sealed bundle breaks its signature.
+    private var marker: String {
+        signedBy == nil ? destination + "/.metalhorizon-component.json"
+            : supportDirectory.appendingPathComponent(".\(folder).metalhorizon-component.json").path
+    }
 
     static func all() -> [Component] {
         guard let url = Bundle.main.url(forResource: "components", withExtension: "json"),
@@ -55,6 +60,12 @@ enum InstallError: Error, CustomStringConvertible {
     }
 }
 
+/// A download error worth another try: the network, or a server error (GitHub's release host answers 502 and 504
+/// for minutes at a time; measured 2026-11-05 by Highball and 2026-11-08 here).
+struct RetryableDownloadError: Error, CustomStringConvertible {
+    var description: String
+}
+
 /// Downloads with progress (URLSession's async download gives none).
 private final class Download: NSObject, URLSessionDownloadDelegate {
     private var continuation: CheckedContinuation<URL, Error>?
@@ -62,12 +73,35 @@ private final class Download: NSObject, URLSessionDownloadDelegate {
     init(progress: @escaping (Double) -> Void) { self.progress = progress }
 
     func fetch(_ url: URL) async throws -> URL {
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 60
+        configuration.waitsForConnectivity = true
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         return try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             session.downloadTask(with: url).resume()
         }
+    }
+
+    /// Up to five tries, waiting longer each time, on a network error or a 5xx; a 404 fails at once.
+    static func fetchWithRetries(_ url: URL, attempts: Int = 5, progress: @escaping (Double) -> Void,
+                                 note: @escaping (String) -> Void) async throws -> URL {
+        var lastError: Error = RetryableDownloadError(description: "no attempt")
+        for attempt in 1...attempts {
+            do {
+                return try await Download(progress: progress).fetch(url)
+            } catch let error as RetryableDownloadError {
+                lastError = error
+            } catch let error as URLError where error.code != .cancelled {
+                lastError = error
+            }
+            guard attempt < attempts else { break }
+            let wait = [5, 15, 30, 60][min(attempt - 1, 3)]
+            note("The download server did not answer (\(lastError)); trying again in \(wait) s (\(attempt + 1) of \(attempts))…")
+            try await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000_000)
+        }
+        throw lastError
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
@@ -80,7 +114,11 @@ private final class Download: NSObject, URLSessionDownloadDelegate {
         let kept = FileManager.default.temporaryDirectory.appendingPathComponent("metalhorizon-\(UUID().uuidString)")
         do {
             if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
-                throw InstallError.tool("The server answered \(http.statusCode) for \(downloadTask.originalRequest?.url?.absoluteString ?? "?").")
+                let url = downloadTask.originalRequest?.url?.absoluteString ?? "?"
+                if http.statusCode >= 500 || http.statusCode == 429 {
+                    throw RetryableDownloadError(description: "the server answered \(http.statusCode)")
+                }
+                throw InstallError.tool("The server answered \(http.statusCode) for \(url).")
             }
             try FileManager.default.moveItem(at: location, to: kept)
             continuation?.resume(returning: kept)
@@ -119,8 +157,9 @@ enum Installer {
             progress(nil, "Using \(archive.lastPathComponent) from \(local)…")
         } else {
             progress(0, "Downloading \(component.name) \(component.version)…")
-            let fetched = try await Download { progress($0, "Downloading \(component.name) \(component.version)…") }
-                .fetch(URL(string: component.url)!)
+            let fetched = try await Download.fetchWithRetries(URL(string: component.url)!, progress: {
+                progress($0, "Downloading \(component.name) \(component.version)…")
+            }, note: { progress(nil, $0) })
             // kept in the cache for a reinstall; removed below if the checksum is wrong
             try? FileManager.default.removeItem(at: cached)
             try FileManager.default.moveItem(at: fetched, to: cached)
@@ -146,10 +185,17 @@ enum Installer {
             guard await confirm(unpacked.appendingPathComponent(license)) else { throw InstallError.declined }
             settingsStore().set(component.version, forKey: SettingKey.appleLicenseAccepted)
         }
+        if let team = component.signedBy, !NativeEngine.loaderSignatureValid(at: unpacked.path) {
+            throw InstallError.tool("\(component.name): its signature is not the Developer ID team \(team)'s; it was not installed.")
+        }
         let destination = URL(fileURLWithPath: component.destination)
-        try? FileManager.default.removeItem(at: destination)
+        try? FileManager.default.removeItem(at: destination)   // a downloaded component, not the player's data
         try FileManager.default.moveItem(at: unpacked, to: destination)
+        try? run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", destination.path])
         try component.writeMarker()
+        if component.id == "engine-native" || component.id == "wineloader", NativeEngine.filesPresent, NativeEngine.loaderPresent {
+            try NativeEngine.linkLoader()
+        }
         progress(1, "\(component.name) \(component.version) installed.")
     }
 

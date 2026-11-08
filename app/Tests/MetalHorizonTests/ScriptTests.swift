@@ -144,6 +144,67 @@ final class ScriptTests: XCTestCase {
     }
 
     /// mh_run_game relaunches once after the Neural Engine failure, then stops on the clean run.
+    /// The native route: Highball's FH6 environment, its own prefix, the 30 cap unless the player chose one.
+    func testNativeDryRunCarriesTheRoute() throws {
+        try touch("native/engine/bin/wine", executable: true, contents: "#!/bin/bash\necho fake native wine\n")
+        try touch("native/engine/lib/libgnutls.30.dylib")
+        try touch("native/renderers/vkd3d/wine/aarch64-windows/d3d12.dll")
+        try touch("native/renderers/kosmickrisp/kosmickrisp_icd.json", contents: "{}")
+        try touch("game/forzahorizon6.exe")
+        try touch("game/.xodus-streaming.msixvc")
+        var env = ["MH_ROUTE": "native", "MH_NATIVE": root.appendingPathComponent("native").path,
+                   "MH_GAME": root.appendingPathComponent("game").path, "MH_XODUS_CLI": "/usr/bin/true",
+                   "MH_XODUS_SERVICE": "/usr/bin/true", "MH_LOGS": root.appendingPathComponent("logs").path, "MH_DRY_RUN": "1"]
+        var (code, out) = try run("metalhorizon-play.sh", env: env)
+        XCTAssertEqual(code, 0, out)
+        XCTAssertTrue(out.contains("WINEPREFIX=\"\(root.appendingPathComponent("game").path)/.metalhorizon-native\""), out)
+        XCTAssertTrue(out.contains("VKD3D_FEATURE_LEVEL=\"12_1\""), out)
+        XCTAssertTrue(out.contains("DXVK_FRAME_RATE=\"30\""), out)
+        XCTAssertTrue(out.contains("HB_PRESENT_PACE_FPS=\"30\""), out)
+        XCTAssertTrue(out.contains("FEX_SMCCHECKS=\"mtrack\""), out)
+        XCTAssertTrue(out.contains("dxgi,d3d11,d3d10core,d3d12,d3d12core=n,b"), out)
+        XCTAssertTrue(out.contains("customVendorId=8086"), out)
+        XCTAssertFalse(out.contains("CX_GRAPHICS_BACKEND"), "no D3DMetal on the native route: \(out)")
+        env["MH_MAX_FPS"] = "45"
+        (code, out) = try run("metalhorizon-play.sh", env: env)
+        XCTAssertTrue(out.contains("DXVK_FRAME_RATE=\"45\""), out)
+        XCTAssertFalse(out.contains("HB_PRESENT_PACE_FPS"), "45 does not divide 60 Hz: no pacing slot")
+        // a native route without its loader stops with the line the diagnosis knows
+        try FileManager.default.removeItem(at: root.appendingPathComponent("native/engine/bin/wine"))
+        env.removeValue(forKey: "MH_DRY_RUN")
+        (code, out) = try run("metalhorizon-play.sh", env: env)
+        XCTAssertNotEqual(code, 0)
+        XCTAssertTrue(Diagnostics.scan(text: out, source: "t").contains { $0.id == "native-loader" }, out)
+    }
+
+    /// A licence request nobody answers ends the run with the line the diagnosis knows, and stops the xodus process.
+    func testLicenceRequestThatNeverAnswersIsStopped() throws {
+        let log = root.appendingPathComponent("game.log")
+        try "Requesting the Forza Horizon 6 package license…\n".write(to: log, atomically: true, encoding: .utf8)
+        let marker = "mh-test-xodus-\(UUID().uuidString.prefix(8))"
+        let sleeper = Process()
+        sleeper.executableURL = URL(fileURLWithPath: "/bin/bash")
+        sleeper.arguments = ["-c", "exec -a \(marker) sleep 60"]
+        try sleeper.run()
+        let script = ". '\(resources.appendingPathComponent("metalhorizon-common.sh").path)'; mh_keychain_watch '\(log.path)' '\(marker)'"
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        task.arguments = ["-c", script]
+        task.environment = ["PATH": "/usr/bin:/bin", "MH_WATCH_STEP": "1", "MH_LICENCE_SLOW": "2", "MH_LICENCE_TIMEOUT": "4"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        try task.run()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        task.waitUntilExit()
+        sleeper.waitUntilExit()
+        if !out.contains("Keychain") {   // a real Keychain dialog on this Mac would make the watch wait for the player
+            XCTAssertTrue(out.contains("NOTE: the Xbox licence servers have not answered"), out)
+            XCTAssertTrue(out.contains("STOP: the Xbox licence request did not answer"), out)
+            XCTAssertTrue(Diagnostics.scan(text: out, source: "t").contains { $0.id == "xodus-licence-timeout" })
+            XCTAssertNotEqual(sleeper.terminationStatus, 0, "the stuck xodus process is stopped")
+        }
+    }
+
     func testInvalidProfileIsRecognized() {
         XCTAssertTrue(Diagnostics.scan(text: "Code d'erreur : E:43-1b-4", source: "t").contains { $0.id == "forza-invalid-profile" })
     }

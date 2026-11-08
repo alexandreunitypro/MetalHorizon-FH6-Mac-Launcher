@@ -1,0 +1,47 @@
+{
+  "note": "Everything Blackwell Engine Native 1.0 is built from, pinned. Order: extract wine, apply highball patches-arm64 (all, sorted), apply patches-arm64-xbox/0100, run engine/build-native.sh, then engine/package-native.sh with the three Highball archives below.",
+  "wine": {
+    "url": "https://dl.winehq.org/wine/source/11.x/wine-11.18.tar.xz",
+    "sha256": "c6282f6d4daecf11f3ab9f9a2b6c598f67be7e28c363ba2cae8a3c44b611e7a4"
+  },
+  "highball-patches-arm64": {
+    "repo": "https://github.com/gauthierpiarrette/highball-engine",
+    "branch": "arm64-games",
+    "commit": "ed5796c",
+    "folder": "patches-arm64",
+    "count": 36
+  },
+  "blackwell-xbox-patch": {
+    "file": "engine/patches-arm64-xbox/0100-blackwell-xbox-on-wine-11.18-arm64.patch",
+    "from": "engine/patches 0001, 0002, 0004, 0006 to 0009 and 0012, ported to Wine 11.18; 0003 (macOS %gs TEB slots) and 0005 (x86-64 exception traces) are x86-64 only and left out; 0008's concrt140 hunks are upstream in 11.18"
+  },
+  "llvm-mingw": {
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz",
+    "sha256": "52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3"
+  },
+  "highball-engine-r4": {
+    "url": "https://github.com/gauthierpiarrette/highball-engine/releases/download/engine-arm64-wine-11.18-20261104T130327Z-arm64-games-0053-0054/engine-arm64-wine-11.18-20261104T130327Z-arm64-games-0053-0054.tar.gz",
+    "sha256": "a4c16fbb2e1e527a2b0cc543a3e92bb1b7135ad5eacc0da1f863f625a6b38a39",
+    "takes": "FEX (xtajit64.dll, xtajit.dll, lib*fex.so), winegstreamer, engine/lib host libraries, Wine Mono and Gecko, frameworks/"
+  },
+  "kosmickrisp": {
+    "url": "https://github.com/gauthierpiarrette/highball-engine/releases/download/kosmickrisp-arm64-20261104T165852Z-push/kosmickrisp-arm64-20261104T165852Z-push.tar.gz",
+    "sha256": "c88f1067802569b6db055b83884d62bd178c11b778977501a545ed724520ecae"
+  },
+  "renderers": {
+    "url": "https://github.com/gauthierpiarrette/highball-engine/releases/download/renderers-arm64-20261031T230303Z-manual/renderers-arm64-20261031T230303Z-manual.tar.gz",
+    "sha256": "1b101d93ad23ec72a89216388f250afcbd9b64babb49f21cc5feccea05fbac37"
+  },
+  "loader": {
+    "url": "https://github.com/gauthierpiarrette/highball/releases/download/v0.10.26/Highball-0.10.26.zip",
+    "sha256": "87e24fa5e9dd0e6521470e9fa88d2dc00fd2210e288c6dc33e814e0c10d0f768",
+    "path": "Highball.app/Contents/Helpers/WineLoader.app",
+    "team": "B95M7DARU4",
+    "note": "Not in the bundle: MetalHorizon installs it from Highball's release and checks its signature (components.json, wineloader)."
+  },
+  "output": {
+    "file": "blackwell-engine-native-1.0.tar.xz",
+    "sha256": "650f549088192bfce7c6377b1aaeede2034ca29b8518ab5d4385c13e735f504e",
+    "size": 259581292
+  }
+}

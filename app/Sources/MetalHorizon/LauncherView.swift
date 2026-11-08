@@ -43,9 +43,17 @@ struct LauncherView: View {
                     .padding(.top, 32)
                 stage
                     .padding(.top, 40)
+                if !model.pendingFixes.isEmpty {
+                    FixesList(fixes: model.pendingFixes, busy: model.isBusy, apply: model.applyFix)
+                        .padding(.top, 40)
+                }
                 if !model.attention.isEmpty {
                     AttentionList(items: model.attention, copyRosetta: model.copyRosettaCommand, report: model.reportIssue)
-                        .padding(.top, 40)
+                        .padding(.top, model.pendingFixes.isEmpty ? 40 : 16)
+                }
+                if !model.recentRepairs.isEmpty {
+                    RepairsList(repairs: model.recentRepairs)
+                        .padding(.top, model.attention.isEmpty ? 40 : 16)
                 }
                 Spacer(minLength: 32)
                 footer
@@ -96,7 +104,8 @@ struct LauncherView: View {
                 .font(.system(size: Theme.titleSize, weight: .bold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
-            Text(model.edition == .xbox ? "Your Xbox copy, on this Mac." : "Your Steam copy, on this Mac.")
+            Text(model.edition == .steam ? "Your Steam copy, on this Mac."
+                 : model.ownership == .gamePass ? "Your Game Pass copy, on this Mac." : "Your Xbox copy, on this Mac.")
                 .font(.title3)
                 .foregroundStyle(.secondary)
         }
@@ -145,6 +154,10 @@ struct LauncherView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
                 .animation(nil, value: model.status)
+
+            if model.edition == .xbox && !model.routeDecision.reason.isEmpty {
+                EngineLine(decision: model.routeDecision)
+            }
         }
     }
 
@@ -418,6 +431,116 @@ struct AttentionList: View {
     }
 }
 
+// MARK: - The engine and the Autopilot
+
+/// Which engine the next Play uses, in one line; the reason in the tooltip and in Settings › Graphics.
+struct EngineLine: View {
+    let decision: RouteDecision
+
+    var body: some View {
+        SettingsLink {
+            Label {
+                Text("\(decision.route.title) engine. ").fontWeight(.medium) + Text(decision.route.shortExplanation)
+            } icon: {
+                Image(systemName: decision.route == .native ? "cpu" : "cube.transparent")
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .help(decision.reason + " Change it in Settings › Graphics.")
+    }
+}
+
+/// What the Doctor found and can fix with one click: what it saw, what the click does, and the button.
+struct FixesList: View {
+    let fixes: [PendingFix]
+    let busy: Bool
+    var apply: (PendingFix) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("MetalHorizon can fix this")
+                .font(.headline)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+            ForEach(Array(fixes.enumerated()), id: \.element.id) { index, fix in
+                if index > 0 { Divider().padding(.leading, 44) }
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Image(systemName: "wand.and.stars")
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(fix.title).fontWeight(.semibold)
+                        Text(fix.detail)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button(fix.button) { apply(fix) }
+                        .disabled(busy)
+                }
+                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+            }
+        }
+        .padding(.bottom, 4)
+        .glassPanel()
+    }
+}
+
+/// What the Autopilot did in the last day: what it saw and what it changed, newest first.
+struct RepairsList: View {
+    let repairs: [Repair]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Fixed by MetalHorizon")
+                .font(.headline)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+            ForEach(Array(repairs.prefix(4).enumerated()), id: \.element.id) { index, repair in
+                if index > 0 { Divider().padding(.leading, 44) }
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Image(systemName: symbol(repair.kind))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(repair.title).fontWeight(.semibold)
+                            Spacer(minLength: 8)
+                            Text(repair.date, style: .relative).font(.caption).foregroundStyle(.tertiary)
+                        }
+                        Text(repair.detail)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(.vertical, 10)
+                .padding(.horizontal, 12)
+            }
+        }
+        .padding(.bottom, 4)
+        .glassPanel()
+        .accessibilityElement(children: .contain)
+    }
+
+    private func symbol(_ kind: Repair.Kind) -> String {
+        switch kind {
+        case .fixed: return "wrench.and.screwdriver"
+        case .reconfigured: return "slider.horizontal.3"
+        case .relaunched: return "arrow.clockwise"
+        case .switchedEngine: return "arrow.triangle.swap"
+        case .note: return "info.circle"
+        }
+    }
+}
+
 // MARK: - The activity log
 
 struct ActivityInspector: View {
@@ -494,8 +617,9 @@ struct WelcomeSheet: View {
                 .padding(.top, 6)
 
             HStack(spacing: 12) {
-                tile(.xbox, detail: "MetalHorizon downloads it from your Xbox account.")
-                tile(.steam, detail: "Steam runs on this Mac, in a space of its own.")
+                tile(.xbox, ownership: .purchase, title: "Xbox / Microsoft Store", detail: "Bought with your Microsoft account. MetalHorizon downloads it.")
+                tile(.xbox, ownership: .gamePass, title: "PC Game Pass", detail: "Or Game Pass Ultimate, on your Microsoft account. MetalHorizon downloads it.")
+                tile(.steam, ownership: nil, title: "Steam", detail: "Steam runs on this Mac, in a space of its own.")
             }
             .padding(.top, 24)
 
@@ -504,7 +628,7 @@ struct WelcomeSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 20)
 
-            Text("Early alpha. Unofficial, not affiliated with Microsoft, Valve or Apple. You need your own copy of the game.")
+            Text("1.0 Final Beta. Unofficial, not affiliated with Microsoft, Valve or Apple. You need your own copy of the game, or a Game Pass plan that includes it.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -521,19 +645,22 @@ struct WelcomeSheet: View {
             .padding(.top, 24)
         }
         .padding(32)
-        .frame(width: 560)
+        .frame(width: 660)
         .background(HorizonBackdrop())
         .tint(Theme.accent)
     }
 
-    private func tile(_ edition: Edition, detail: String) -> some View {
-        let selected = model.edition == edition
-        return Button { model.edition = edition } label: {
+    private func tile(_ edition: Edition, ownership: XboxOwnership?, title: String, detail: String) -> some View {
+        let selected = model.edition == edition && (ownership == nil || model.ownership == ownership)
+        return Button {
+            model.edition = edition
+            if let ownership { model.ownership = ownership }
+        } label: {
             VStack(alignment: .leading, spacing: 6) {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                     .font(.title2)
                     .foregroundStyle(selected ? Theme.accent : Color.secondary)
-                Text(edition.title).font(.headline)
+                Text(title).font(.headline)
                 Text(detail)
                     .font(.callout)
                     .foregroundStyle(.secondary)

@@ -11,6 +11,8 @@
 #   MH_RETRIES=<n>    relaunches after D3DMetal's Neural Engine start-up failure (default 2, 0 to turn off)
 #   MH_WINEDEBUG      Wine channels for a debug run (default -all)
 #   MH_DRY_RUN=1      print the environment and the command, start nothing
+#   MH_ROUTE=native   the native Apple silicon engine instead of D3DMetal (Blackwell Engine Native, MH_NATIVE)
+#   MH_NATIVE         the native bundle: engine/ (Wine 11.18 arm64 + FEX), frameworks/, renderers/ (vkd3d, kosmickrisp)
 
 mh_fail() { echo "STOP: $1"; exit 1; }
 
@@ -31,7 +33,8 @@ mh_game_env() {
     [ "${MH_HUD:-1}" != "0" ] && export MTL_HUD_ENABLED=1
     # GPU reported to the game: D3DMetal says AMD by default and FH6 then crashes in its AMD-only code (FHE21).
     export D3DM_VENDOR_ID=4318 D3DM_DEVICE_ID=10118 D3DM_DEVICE_DESCRIPTION="NVIDIA GeForce RTX 4070"
-    export WINEMSYNC=1 WINEESYNC=0
+    # msync, unless the Autopilot switched to Wine's plain synchronization after msync failed to start (MH_SYNC=plain)
+    if [ "${MH_SYNC:-msync}" = plain ]; then export WINEMSYNC=0 WINEESYNC=0; else export WINEMSYNC=1 WINEESYNC=0; fi
     # Microsoft's own C++ runtime: Wine's concrt140 hands out concurrent_vector memory too early (the game's update of
     # 3 November 2026 crashes on it, highball-db), and the Steam overlay's renderer is off.
     export WINEDLLOVERRIDES="concrt140,msvcp140,msvcp140_1,msvcp140_2,msvcp140_atomic_wait,msvcp140_codecvt_ids,vccorlib140,vcomp140,vcruntime140,vcruntime140_1=n,b;gameoverlayrenderer64,gameoverlayrenderer=d;$WINEDLLOVERRIDES"
@@ -47,11 +50,113 @@ mh_game_env() {
     return 0
 }
 
+# The native engine (MH_ROUTE=native): what every Wine process gets. Highball's arm64 line (engine manifest
+# arm64-kk-wine11.18-r4, baseEnv): the frameworks folder holds GStreamer and the host libraries the Unix side links
+# (the signed loader allows DYLD variables), and Vulkan is KosmicKrisp, Mesa's driver on Metal 4, through the Khronos
+# loader the engine ships as libMoltenVK.dylib.
+mh_native_engine_env() {
+    NATIVE="${MH_NATIVE:?}"
+    ENGINE="$NATIVE/engine"
+    export WINEDEBUG="${MH_WINEDEBUG:--all}"
+    export DYLD_FALLBACK_LIBRARY_PATH="$NATIVE/frameworks"
+    export GST_PLUGIN_PATH="$NATIVE/frameworks/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0"
+    export VK_DRIVER_FILES="$NATIVE/renderers/kosmickrisp/kosmickrisp_icd.json" VK_LOADER_LAYERS_DISABLE='~implicit~'
+    export MESA_SHADER_CACHE_MAX_SIZE=4G DXVK_RELAX_FEATURES=1
+    unset WINEMSYNC WINEESYNC CX_ROOT CX_GRAPHICS_BACKEND
+    export WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+}
+
+# The game on the native engine: Highball's Forza Horizon 6 route (highball-db recipes/games/forza-horizon-6.json,
+# previewRoute, measured on an M4 at an even 30 frames a second with no hitch over 150 ms). Direct3D 12 through
+# vkd3d-proton with DXVK's DXGI, both from the renderers overlay; FEX's switches for a program whose copy protection
+# keeps rewriting its code (that rewriting is the hitch under Rosetta); the GPU the game is told it has.
+mh_native_game_env() {
+    [ -d "$NATIVE/renderers/vkd3d/wine" ] || mh_fail "the native engine's vkd3d-proton is missing ($NATIVE/renderers/vkd3d)"
+    [ -f "$NATIVE/renderers/kosmickrisp/kosmickrisp_icd.json" ] || mh_fail "the native engine's Vulkan driver is missing ($NATIVE/renderers/kosmickrisp)"
+    export WINEDLLPATH_PREPEND="$NATIVE/renderers/vkd3d/wine"
+    export WINEDLLOVERRIDES="dxgi,d3d11,d3d10core,d3d12,d3d12core=n,b;concrt140,msvcp140,msvcp140_1,msvcp140_2,msvcp140_atomic_wait,msvcp140_codecvt_ids,vccorlib140,vcomp140,vcruntime140,vcruntime140_1=n,b;gameoverlayrenderer64,gameoverlayrenderer=d;$WINEDLLOVERRIDES"
+    export VKD3D_RELAX_DEVICE_CAPS=1 VKD3D_FEATURE_LEVEL=12_1 VKD3D_SHADER_MODEL=6_6 VKD3D_CONFIG=no_staggered_submit
+    export VKD3D_DEBUG=err DXVK_LOG_LEVEL=warn HB_KK_NO_UBO_ROBUST=1
+    # vkd3d-proton's pipeline cache, in the prefix: the folder must exist or every start compiles everything again
+    # ("Failed to open stream archive"). One folder per engine build, as Highball does.
+    export VKD3D_SHADER_CACHE_PATH='C:\metalhorizon\cache\vkd3d\native-1'
+    mkdir -p "$PREFIX/drive_c/metalhorizon/cache/vkd3d/native-1" "$PREFIX/.mesa-cache" 2>/dev/null
+    export MESA_SHADER_CACHE_DIR="$PREFIX/.mesa-cache"
+    # FEX: keep the translations of code the protection rewrites (Highball's FEX 0020, 0023, 0033, 0034)
+    export HB_FEX_FAST_LEGACY_UD=1 HB_FEX_FAST_PREFIX_UD=1 HB_FEX_DIRECT_SIGILL=1 HB_FEX_SMC_GRAVE_SETS=16384
+    export HB_FEX_SMC_INLINE=1 HB_FEX_SMC_INLINE_MS=10000 HB_FEX_SMC_INLINE_RETIRE_PROT=1 HB_FEX_SMC_INLINE_RETIRE_FREE=1
+    export HB_FEX_SMC_INLINE_RETIRE_UNMAP=1 HB_FEX_SMC_INLINE_KEEP_READ=1 HB_FEX_SMC_INLINE_BLOCK_REMOVE=1
+    export HB_FEX_PRIVATE_CHURN=20000 HB_DIRECT_CONTINUE=1 HB_FEX_MAPJIT=1 HB_FEX_SMC_RETIRE=1 HB_FEX_SMC_REINSTATE=1
+    export HB_FEX_SMC_RETIRE_FAULTS=1 HB_FEX_CALLRET_EPOCH=1 HB_FEX_SMC_CACHE_FILTER=1 HB_FEX_SMC_REPLAY=0
+    export FEX_SMCCHECKS=mtrack FEX_DISKCACHE=0
+    # The GPU the game sees through DXGI, and DXVK's memory budget (three eighths of the Mac's memory).
+    local mem_mb=$(( $(sysctl -n hw.memsize) / 1048576 ))
+    export DXVK_CONFIG="dxgi.maxVideoMemoryBudget=$(( mem_mb * 3 / 8 ));dxgi.maxDeviceMemory=8192;dxgi.maxSharedMemory=8192;dxgi.customVendorId=8086;dxgi.customDeviceId=56a1;dxgi.customDeviceDesc=\"Intel(R) Arc(TM) A750 Graphics\""
+    # The frame cap: the route's 30 unless the player chose one. Metal holds each frame for its vsync slot when the cap
+    # divides 60 and 120 Hz (Highball's present pacing), which is what makes 30 even rather than 30 on average.
+    local cap="${MH_MAX_FPS:-0}"; [ "$cap" -gt 0 ] 2>/dev/null || cap=30
+    export DXVK_FRAME_RATE="$cap" VKD3D_FRAME_RATE="$cap"
+    [ $(( 60 % cap )) -eq 0 ] && export HB_PRESENT_PACE_FPS="$cap"
+    [ "${MH_HUD:-1}" != "0" ] && export MTL_HUD_ENABLED=1
+    [ "${MH_GAMEINPUT:-0}" = "1" ] && export WINE_GAMEINPUT=1
+    return 0
+}
+
+# The route's graphics settings for the game's first start on the native engine (1920x1080, Very Low, FSR Quality),
+# the ones it was measured on. Written once: what the player changes in the game afterwards stays.
+mh_native_first_settings() {
+    local src="${MH_NATIVE_SETTINGS:-}" user dest
+    [ -f "$src" ] || return 0
+    for user in "$PREFIX"/drive_c/users/*/; do
+        case "$(basename "$user")" in Public|public) continue ;; esac
+        dest="${user}AppData/Local/ForzaHorizon6/LocalStorage_Shared/ForzaUserConfigSelections/UserConfigSelections"
+        [ -f "$dest" ] && continue
+        mkdir -p "$(dirname "$dest")" && cp "$src" "$dest" && echo "== the native engine's graphics settings for the first start (1080p, Very Low, FSR Quality): change them in the game"
+    done
+    return 0
+}
+
+# mh_keychain_watch <game log> [xodus pid pattern]: while xodus asks for the game's licence, two things can hold it:
+# - macOS's Keychain dialog ("xodus wants to use your confidential information stored in Xodus Service"), after a
+#   new sign-in or when the binary changed; it can open behind other windows. Said once (the app shows NOTE lines),
+#   and waited for: it is the player's to answer.
+# - nothing at all: the network or the Xbox licence servers do not answer. Said after 45 s; after 3 minutes the
+#   request is stopped with a line the diagnosis knows, so the run ends instead of waiting for ever (the Autopilot
+#   then restarts the Xbox service and tries once more).
+mh_keychain_watch() {
+    local log="$1" pattern="${2:-xodus-(cli|login) run}" said_dialog=0 said_slow=0 waited=0 before=0
+    local step="${MH_WATCH_STEP:-3}" slow="${MH_LICENCE_SLOW:-45}" limit="${MH_LICENCE_TIMEOUT:-180}"
+    while sleep "$step"; do
+        if ! tail -n 1 "$log" 2>/dev/null | grep -q "Requesting the Forza Horizon 6 package license"; then
+            [ $waited -gt 0 ] && return 0              # the request was answered: the game goes on
+            before=$((before + step)); [ $before -ge 90 ] && return 0
+            continue
+        fi
+        waited=$((waited + step))
+        if pgrep -qx SecurityAgent; then
+            if [ $said_dialog = 0 ] && [ $waited -ge $((step * 3)) ]; then
+                echo "NOTE: macOS is asking to let xodus use your Xbox sign-in (a Keychain window, maybe behind this one): choose Always Allow. The game starts right after."
+                said_dialog=1
+            fi
+            [ $waited -lt 900 ] && continue      # the player's dialog: up to 15 minutes
+        fi
+        if [ $said_slow = 0 ] && [ $waited -ge "$slow" ]; then
+            echo "NOTE: the Xbox licence servers have not answered for 45 s: check the network. MetalHorizon keeps waiting up to 3 minutes."
+            said_slow=1
+        fi
+        if [ $waited -ge "$limit" ]; then
+            echo "STOP: the Xbox licence request did not answer in 3 minutes (network, or the Xbox service): stopping it."
+            pkill -f "$pattern" 2>/dev/null
+            return 0
+        fi
+    done
+}
+
 # The settings that decide which stack a process got, for the top of every log. An allowlist on purpose: logs end
 # up in public GitHub issues and the full environment can hold personal paths or tokens.
 mh_print_env() {
     export -p | sed -n 's/^declare -x //p' \
-        | grep -E '^(CX_GRAPHICS_BACKEND|WINEMSYNC|WINEESYNC|WINEDEBUG|WINEDLLOVERRIDES|WINE_GAMEINPUT|D3DM_|MTL_HUD|HB_TSSHIM|MVK_CONFIG_LOG_LEVEL)=' \
+        | grep -E '^(MH_ROUTE|CX_GRAPHICS_BACKEND|WINEMSYNC|WINEESYNC|WINEDEBUG|WINEDLLOVERRIDES|WINE_GAMEINPUT|D3DM_|MTL_HUD|HB_TSSHIM|MVK_CONFIG_LOG_LEVEL|VKD3D_(FEATURE_LEVEL|SHADER_MODEL|CONFIG)|DXVK_FRAME_RATE|HB_PRESENT_PACE_FPS|FEX_SMCCHECKS)=' \
         | sort | sed 's/^/  /'
 }
 

@@ -31,15 +31,16 @@ struct LogSession {
 
     /// Writes summary.json once the run is over, with what Diagnostics recognizes in its logs.
     @discardableResult
-    func finish(exitCode: Int32) -> [Finding] {
+    func finish(exitCode: Int32, extra: [String: Any] = [:]) -> [Finding] {
         let findings = Diagnostics.scan(files: [output, game])
-        let info: [String: Any] = [
+        var info: [String: Any] = [
             "kind": kind,
             "started": ISO8601DateFormatter().string(from: started),
             "duration_seconds": Int(Date().timeIntervalSince(started)),
             "exit_code": Int(exitCode),
             "findings": findings.map { ["id": $0.issue.id, "title": $0.issue.title, "evidence": $0.evidence] }
         ]
+        info.merge(extra) { _, new in new }
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: summary)
         }
@@ -55,6 +56,10 @@ struct SessionInfo: Identifiable {
     let bytes: Int64
     let exitCode: Int?
     let findings: [String]
+    var duration: Int? = nil        // seconds (summary.json)
+    var route: String? = nil        // "native" or "d3dmetal" for a Play run
+    var userStopped = false         // Stop or Force Quit
+    var evidence: [String: String] = [:]   // finding id -> the line that showed it
 }
 
 enum LogStore {
@@ -88,12 +93,21 @@ enum LogStore {
             }
             var exitCode: Int?
             var findings: [String] = []
+            var info = SessionInfo(id: name, directory: dir, kind: kind, date: date, bytes: bytes, exitCode: nil, findings: [])
             if let data = fm.contents(atPath: dir.appendingPathComponent("summary.json").path),
                let summary = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 exitCode = summary["exit_code"] as? Int
-                findings = (summary["findings"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
+                let list = summary["findings"] as? [[String: Any]] ?? []
+                findings = list.compactMap { $0["id"] as? String }
+                info = SessionInfo(id: name, directory: dir, kind: kind, date: date, bytes: bytes, exitCode: exitCode, findings: findings,
+                                   duration: summary["duration_seconds"] as? Int,
+                                   route: (summary["route"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                                   userStopped: summary["user_stopped"] as? Bool ?? false,
+                                   evidence: Dictionary(list.compactMap { item in
+                                       (item["id"] as? String).map { ($0, item["evidence"] as? String ?? "") }
+                                   }, uniquingKeysWith: { a, _ in a }))
             }
-            return SessionInfo(id: name, directory: dir, kind: kind, date: date, bytes: bytes, exitCode: exitCode, findings: findings)
+            return info
         }.sorted { $0.date > $1.date }
     }
 

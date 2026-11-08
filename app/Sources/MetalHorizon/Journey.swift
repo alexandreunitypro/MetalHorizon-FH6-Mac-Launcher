@@ -23,7 +23,10 @@ struct NextStep {
 }
 
 extension LauncherModel {
-    private var componentsDone: Bool { setup.componentsReady }
+    /// The engine the next Play uses is installed (the native one, or Blackwell Engine with D3DMetal and the shim).
+    private var componentsDone: Bool {
+        edition == .xbox && routeDecision.route == .native ? setup.componentsReady(for: .native) : setup.componentsReady
+    }
 
     /// Steam is signed in once and the game is in its library, fully downloaded.
     private var steamLibraryDone: Bool { setup.steam.signedInOnce && setup.steamGameCheck.ok }
@@ -65,11 +68,15 @@ extension LauncherModel {
             }
             if !accountSaved {
                 return NextStep(action: .signIn, title: "Sign In with Microsoft", symbol: "person.crop.circle",
-                                hint: "On Microsoft's own page. MetalHorizon never sees your password.")
+                                hint: ownership == .gamePass
+                                    ? "With the account that has PC Game Pass or Game Pass Ultimate, on Microsoft's own page. MetalHorizon never sees your password."
+                                    : "On Microsoft's own page. MetalHorizon never sees your password.")
             }
             if !setup.gameCheck.ok {
                 return NextStep(action: .download, title: "Download the Game", symbol: "icloud.and.arrow.down",
-                                hint: "About 160 GB into \(Setup.tildePath(gameDirectory)). Your account must own the game.")
+                                hint: ownership == .gamePass
+                                    ? "About 160 GB into \(Setup.tildePath(gameDirectory)). Your Game Pass plan must include PC games."
+                                    : "About 160 GB into \(Setup.tildePath(gameDirectory)). Your account must own the game.")
             }
         case .steam:
             if !setup.steam.installed {
@@ -112,6 +119,7 @@ extension LauncherModel {
         case .download: return "Downloading…"
         case .game: return "Playing"
         case .steam: return "Steam Is Working…"
+        case .preparing: return "Getting Ready…"
         }
     }
 
