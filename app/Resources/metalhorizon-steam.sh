@@ -349,7 +349,14 @@ cmd_play() {
             stop_client
             end_leftovers msync
         fi
+        local direct_from; : >> "$GAME_LOG"; direct_from=$(mh_size "$GAME_LOG")
         play_direct && echo direct > "$STRATEGY_FILE"
+        # started directly, the game got no Steam ticket (E:0-0-L-8, "Initialization failed", its own sign-in prompt):
+        # this way is not kept; the next Play goes through Steam again (-applaunch), which hands the ticket
+        if tail -c +"$((direct_from + 1))" "$GAME_LOG" 2>/dev/null | grep -a -q -E 'E:0-0-L-8|Initialization failed'; then
+            echo "== the game started this way got no Steam ticket (E:0-0-L-8): the next Play goes through Steam again"
+            rm -f "$STRATEGY_FILE"
+        fi
     fi
     while [ -n "$(game_pids)" ]; do sleep 2; done
     mh_tail_errors "$GAME_LOG"

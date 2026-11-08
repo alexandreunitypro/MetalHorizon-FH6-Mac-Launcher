@@ -74,6 +74,7 @@ struct MetalHorizonApp: App {
                 .frame(minWidth: 680, minHeight: 560)
                 .sheet(isPresented: $showAssistant) { AssistantSheet() }
                 .appUpdates(updater, model: model)
+                .tint(Theme.accent)
         }
         .defaultSize(width: 980, height: 680)
         .windowToolbarStyle(.unified)
@@ -131,6 +132,7 @@ struct MetalHorizonApp: App {
         }
         Settings {
             SettingsView(model: model)
+                .tint(Theme.accent)
         }
     }
 
@@ -982,11 +984,13 @@ struct CrashReportSheet: View {
                     .disabled(sending)
                 Button("Send to the Developer", action: send)
                     .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
                     .disabled(sending)
             }
         }
         .padding(20)
         .frame(width: 560)
+        .tint(Theme.accent)
     }
 }
 
@@ -1016,10 +1020,12 @@ struct LicenseSheet: View {
                 Button("Decline") { answer(false) }
                 Button("Accept") { answer(true) }
                     .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
             }
         }
         .padding(20)
         .frame(width: 600)
+        .tint(Theme.accent)
     }
 }
 
@@ -1067,10 +1073,12 @@ struct AssistantSheet: View {
                 Spacer()
                 Button("OK") { dismiss() }
                     .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
             }
         }
         .padding(20)
         .frame(width: 560)
+        .tint(Theme.accent)
     }
 
     private func snippet(_ text: String) -> some View {

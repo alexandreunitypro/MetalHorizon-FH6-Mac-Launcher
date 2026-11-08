@@ -845,6 +845,7 @@ struct UpdateSheet: View {
                     }
                     Button(page == nil && !retry ? "OK" : "Continue") { updater.dismiss() }
                         .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
                 }
             }
         }
