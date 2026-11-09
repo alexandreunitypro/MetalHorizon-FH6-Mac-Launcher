@@ -96,12 +96,29 @@ private final class Download: NSObject, URLSessionDownloadDelegate {
             } catch let error as URLError where error.code != .cancelled {
                 lastError = error
             }
-            guard attempt < attempts else { break }
+            guard attempt < attempts else {
+                // Last resort: macOS's curl, which resumes and retries on its own (issue #10: the release host kept
+                // answering 504 to the app while a browser got the file).
+                note("Trying another way to download…")
+                if let file = curl(url) { return file }
+                break
+            }
             let wait = [5, 15, 30, 60][min(attempt - 1, 3)]
             note("The download server did not answer (\(lastError)); trying again in \(wait) s (\(attempt + 1) of \(attempts))…")
             try await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000_000)
         }
         throw lastError
+    }
+
+    static func curl(_ url: URL) -> URL? {
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("metalhorizon-\(UUID().uuidString)")
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        task.arguments = ["-fsSL", "--retry", "8", "--retry-all-errors", "--retry-delay", "10", "--connect-timeout", "30",
+                          "-C", "-", "-o", out.path, url.absoluteString]
+        guard (try? task.run()) != nil else { return nil }
+        task.waitUntilExit()
+        return task.terminationStatus == 0 && fileExists(out.path) ? out : nil
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,

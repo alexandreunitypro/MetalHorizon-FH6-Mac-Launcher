@@ -26,6 +26,7 @@ if [ "$ROUTE" = native ]; then
 fi
 [ -x "$ENGINE/bin/wine" ] || mh_fail "Blackwell Engine is not installed ($ENGINE)"
 [ -f "$ENGINE/lib/libgnutls.30.dylib" ] || mh_fail "this engine has no GnuTLS of its own ($ENGINE/lib)"
+[ -e "$SOURCE" ] || mh_fail "the game folder is not there any more: $SOURCE (moved or renamed: MetalHorizon looks for it by itself)"
 [ -d "$SOURCE" ] && [ ! -L "$SOURCE" ] || mh_fail "the game folder must be a real folder, not a link: $SOURCE"
 if [ -L "$SOURCE/forzahorizon6.exe" ] && [ ! -e "$SOURCE/forzahorizon6.exe" ]; then
     mh_fail "forzahorizon6.exe in $SOURCE is a link to $(readlink "$SOURCE/forzahorizon6.exe"), which is gone: choose the folder the game is really in"

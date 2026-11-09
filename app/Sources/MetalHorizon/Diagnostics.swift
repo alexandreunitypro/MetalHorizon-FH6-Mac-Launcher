@@ -77,7 +77,7 @@ enum Diagnostics {
                    fix: "Click Open Steam, answer the dialog (start the game once from Steam's Library if needed), then use Play again.",
                    severity: .warning, edition: .steam),
         KnownIssue(id: "steam-auth", title: "The game got no sign-in (E:0-0-L-8)",
-                   patterns: [#"E:0-0-L-8"#, #"Initialization failed"#, #"初始化失败"#],
+                   patterns: [#"E:0-0-L-8"#, #"Initialization failed"#, #"初始化失败"#, #"Steam has to start it"#],
                    explanation: "The game started without receiving its account: on Steam, the ticket the Steam client hands it; on Xbox, the session xodus-service passes on. It then shows its own sign-in prompt and fails with E:0-0-L-8, or stays on 'Welcome, Player'.",
                    fix: "Start it with Play in MetalHorizon. Steam: when a run started the game beside Steam gets this, MetalHorizon goes back to letting Steam start it at the next Play; sign in once in Steam's window first. Xbox: sign in again with Microsoft. If it stays, send the diagnostics (Activity › Export Diagnostics)."),
         KnownIssue(id: "steam-unresponsive", title: "Steam's web helper hung",

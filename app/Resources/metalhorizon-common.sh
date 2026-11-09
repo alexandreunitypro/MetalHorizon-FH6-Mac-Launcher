@@ -184,7 +184,7 @@ mh_run_game() {
         "$@" >> "$log" 2>&1; code=$?
         elapsed=$(( $(date +%s) - start ))
         echo "== exit $code after ${elapsed}s"
-        if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 150 ] && mh_ane_failure "$log" "$offset"; then
+        if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 30 ] && mh_ane_failure "$log" "$offset"; then
             echo "== D3DMetal stopped while preparing the Neural Engine (com.apple.appleneuralengine Code=26): relaunching"
             "$ENGINE/bin/wineserver" -k 2>/dev/null
             mh_mark_retried "$log"
@@ -192,7 +192,7 @@ mh_run_game() {
             continue
         fi
         # the game went on past the message: it was not what stopped it
-        [ "$elapsed" -ge 150 ] && mh_ane_failure "$log" "$offset" && mh_mark_retried "$log" harmless
+        [ "$elapsed" -ge 30 ] && mh_ane_failure "$log" "$offset" && mh_mark_retried "$log" harmless
         return "$code"
     done
 }

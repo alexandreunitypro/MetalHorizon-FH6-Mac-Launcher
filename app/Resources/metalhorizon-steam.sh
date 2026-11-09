@@ -243,11 +243,13 @@ game_finished() {
     while [ -n "$(game_pids)" ]; do sleep 2; done
     elapsed=$(( $(date +%s) - start ))
     echo "== game closed after ${elapsed}s"
-    if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 150 ] && mh_ane_failure "$GAME_LOG" "$offset"; then
+    # D3DMetal's Neural Engine abort happens in the first seconds; past 30 s its line is only the harmless message every
+    # start prints, and the game closed for another reason (issues #11 and #12: relaunched for nothing at 117 s)
+    if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 30 ] && mh_ane_failure "$GAME_LOG" "$offset"; then
         echo "== D3DMetal stopped while preparing the Neural Engine (com.apple.appleneuralengine Code=26): relaunching"
         mh_mark_retried "$GAME_LOG"; sleep 3; return 3
     fi
-    [ "$elapsed" -ge 150 ] && mh_ane_failure "$GAME_LOG" "$offset" && mh_mark_retried "$GAME_LOG" harmless
+    [ "$elapsed" -ge 30 ] && mh_ane_failure "$GAME_LOG" "$offset" && mh_mark_retried "$GAME_LOG" harmless
     return 0
 }
 
@@ -341,7 +343,11 @@ cmd_play() {
         end_leftovers msync
         mh_crash_to_log
         local strategy
-        strategy="${MH_STEAM_STRATEGY:-$(cat "$STRATEGY_FILE" 2>/dev/null)}"
+        # Steam starts the game every time: only it hands the game its ticket. The second way (MetalHorizon starts the
+        # game beside Steam) is a fallback for this Play only and is never remembered: remembered, it ran every later
+        # Play without a ticket, and the game closed after about two minutes (issues #11 and #12).
+        rm -f "$STRATEGY_FILE"
+        strategy="${MH_STEAM_STRATEGY:-applaunch}"
         [ "$strategy" = direct ] || strategy=applaunch
         if [ "$strategy" = applaunch ]; then
             if play_applaunch; then echo applaunch > "$STRATEGY_FILE"; mh_tail_errors "$GAME_LOG"; return 0; fi
@@ -350,7 +356,11 @@ cmd_play() {
             end_leftovers msync
         fi
         local direct_from; : >> "$GAME_LOG"; direct_from=$(mh_size "$GAME_LOG")
-        play_direct && echo direct > "$STRATEGY_FILE"
+        local direct_start; direct_start=$(date +%s)
+        play_direct
+        if [ $(( $(date +%s) - direct_start )) -lt 300 ]; then
+            echo "STOP: started beside Steam, the game closed within minutes: Steam has to start it. Open Steam, check you are signed in and the game is installed, then Play."
+        fi
         # started directly, the game got no Steam ticket (E:0-0-L-8, "Initialization failed", its own sign-in prompt):
         # this way is not kept; the next Play goes through Steam again (-applaunch), which hands the ticket
         if tail -c +"$((direct_from + 1))" "$GAME_LOG" 2>/dev/null | grep -a -q -E 'E:0-0-L-8|Initialization failed'; then
