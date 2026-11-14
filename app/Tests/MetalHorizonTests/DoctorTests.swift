@@ -150,4 +150,35 @@ final class DoctorTests: XCTestCase {
         let line = "called `Result::unwrap()` on an `Err` value: Keychain(PlatformFailure(Error { code: -128, message: \"User canceled the operation.\" }))"
         XCTAssertTrue(Diagnostics.scan(text: line, source: "t").contains { $0.id == "keychain-denied" })
     }
+
+    /// The account tried before Play: a refusal offers a new sign-in and nothing else; an accepted account shows nothing.
+    func testARefusedAccountOffersANewSignIn() async {
+        var signedIn = false
+        var actions = DoctorActions()
+        actions.signInAgain = { signedIn = true }
+        var p = patient(.beforePlay, online: true)
+        p.account = .refused("the Xbox user token: HTTP status client error (400 Bad Request)")
+        var state = DoctorState()
+        let exam = await Doctor.examine(p, actions: actions, catalogue: Doctor.xbox, state: &state)
+        let fix = exam.pending.first { $0.id == "xbox-account-refused" }
+        XCTAssertEqual(fix?.button, "Sign In Again")
+        XCTAssertTrue(fix?.detail.contains("400") == true)
+        _ = await fix?.action()
+        XCTAssertTrue(signedIn)
+
+        p.account = .accepted
+        var state2 = DoctorState()
+        let ok = await Doctor.examine(p, actions: actions, catalogue: Doctor.xbox, state: &state2)
+        XCTAssertFalse(ok.pending.contains { $0.id == "xbox-account-refused" || $0.id == "xbox-no-sign-in" })
+
+        p.account = .noSignIn
+        var state3 = DoctorState()
+        let none = await Doctor.examine(p, actions: actions, catalogue: Doctor.xbox, state: &state3)
+        XCTAssertEqual(none.pending.first { $0.id == "xbox-no-sign-in" }?.button, "Sign In")
+    }
+
+    /// A service without the check (or missing) gives no verdict rather than a false alarm.
+    func testNoServiceGivesNoVerdict() {
+        XCTAssertNil(AccountCheck.run(resources: URL(fileURLWithPath: "/nonexistent")))
+    }
 }

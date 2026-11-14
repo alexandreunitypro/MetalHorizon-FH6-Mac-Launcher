@@ -59,6 +59,9 @@ struct Patient {
     var online: Bool?                     // nil when not checked
     var clockSkew: TimeInterval?          // seconds between this Mac and Microsoft's servers, when checked
     var steamNativeRunning: Bool
+    /// The Xbox account, tried for real by `xodus-service --check` (nil when not tried): accepted, refused (with what
+    /// Xbox or Microsoft answered), no sign-in saved, or waiting on macOS's Keychain window.
+    var account: AccountCheck? = nil
     var now = Date()
 
     var plays: [RunRecord] { runs.filter { $0.kind == "play" || $0.kind == "steam-play" } }
@@ -79,6 +82,34 @@ struct Patient {
         }), now.timeIntervalSince(newest.date) < 6 * 3600 else { return 0 }
         return Sys.count(of: pattern, in: newest.directory.appendingPathComponent("output.log"))
             + Sys.count(of: pattern, in: newest.directory.appendingPathComponent("game.log"))
+    }
+}
+
+/// The result of trying the Xbox sign-in without the game.
+enum AccountCheck: Equatable {
+    case accepted
+    case refused(String)        // Xbox or Microsoft said no: the reason, no secret in it
+    case unreachable(String)    // the network, not the account
+    case noSignIn
+    case keychainWaiting        // macOS is asking to let xodus-service read the sign-in
+
+    /// Runs the bundled service's check (at most 40 s). Nothing of the account is printed or kept.
+    static func run(resources: URL?) -> AccountCheck? {
+        guard let service = resources?.appendingPathComponent("xodus-service"), fileExists(service.path) else { return nil }
+        let (code, out, timedOut) = Sys.capture(service.path, ["--check"], timeout: 40)
+        if timedOut { return Sys.pgrep("SecurityAgent") ? .keychainWaiting : .unreachable("the check did not answer in 40 s") }
+        let line = out.split(separator: "\n").last { $0.hasPrefix("CHECK ") }.map(String.init) ?? ""
+        switch code {
+        case 0: return .accepted
+        case 3: return .noSignIn
+        case 2:
+            let reason = String(line.dropFirst("CHECK failed: ".count))
+            let network = ["error sending request", "dns error", "timed out", "connection", "lookup"].contains { reason.lowercased().contains($0) }
+            return network ? .unreachable(reason) : .refused(reason)
+        default:
+            // an older service without --check, or one that stopped: no verdict
+            return nil
+        }
     }
 }
 
@@ -345,6 +376,20 @@ enum Doctor {
     // MARK: Xbox account, licence and service
 
     static var xbox: [Ailment] {[
+        Ailment(id: "xbox-account-refused", title: "Xbox does not accept the saved sign-in", moments: [.beforePlay, .afterAction],
+                detect: { p in
+                    guard case .refused(let why)? = p.account else { return nil }
+                    return "MetalHorizon tried the account before starting the game: \(why)."
+                },
+                treatments: { _, a in [.oneClick(button: "Sign In Again",
+                                                 detail: "A new sign-in on Microsoft's page gives Xbox a fresh ticket; the game is not started until the account is accepted.") {
+                    a.signInAgain(); return "Microsoft's sign-in is opening."
+                }] }),
+        Ailment(id: "xbox-no-sign-in", title: "No Microsoft sign-in is saved", moments: [.beforePlay, .afterAction],
+                detect: { p in p.account == .noSignIn ? "The Keychain holds no sign-in for xodus (it was removed, or never finished)." : nil },
+                treatments: { _, a in [.oneClick(button: "Sign In", detail: "On Microsoft's own page.") {
+                    a.signInAgain(); return "Microsoft's sign-in is opening."
+                }] }),
         Ailment(id: "xodus-service-stale", title: "The Xbox service is stuck", moments: [.launch, .idle, .beforePlay],
                 detect: { p in
                     p.setup.edition == .xbox && p.serviceRunning && !p.serviceSocket && !p.gameRunning
@@ -654,6 +699,25 @@ enum Sys {
         while task.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
         if task.isRunning { task.terminate() }
         return task.terminationStatus
+    }
+
+    /// As `run`, keeping what the program printed; `timedOut` when it was stopped at the deadline.
+    static func capture(_ path: String, _ args: [String], timeout: TimeInterval) -> (status: Int32, output: String, timedOut: Bool) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: path)
+        task.arguments = args
+        task.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        guard (try? task.run()) != nil else { return (-1, "", false) }
+        let deadline = Date().addingTimeInterval(timeout)
+        while task.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+        let timedOut = task.isRunning
+        if timedOut { task.terminate() }
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (task.terminationStatus, String(decoding: data, as: UTF8.self), timedOut)
     }
 
     static func pgrep(_ pattern: String) -> Bool { run("/usr/bin/pgrep", ["-f", pattern]) == 0 }

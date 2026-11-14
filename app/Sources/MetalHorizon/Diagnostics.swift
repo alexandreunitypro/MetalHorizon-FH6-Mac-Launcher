@@ -155,6 +155,11 @@ enum Diagnostics {
                    explanation: "Microsoft's licence server answered that the signed-in account has no licence for Forza Horizon 6: the game was not bought with this account, or its Game Pass plan does not include PC games (PC Game Pass or Game Pass Ultimate does; Essential and Premium do not include this game on PC), or the subscription has ended.",
                    fix: "Check the account: account.microsoft.com/services shows the Game Pass plan and its renewal date. Sign in with the account that owns the game or has the plan (Settings › General › Sign In Again). After renewing a plan, Microsoft can take a few minutes: MetalHorizon asks again at the next Play.",
                    edition: .xbox),
+        KnownIssue(id: "xbox-user-token-400", title: "Xbox refused the account's ticket (Initialization Failed)",
+                   patterns: [#"Failed to authenticate Xbox user"#, #"E:0-c2-4"#],
+                   explanation: "The Xbox service sent Microsoft's sign-in ticket in the old form and Xbox Live answered 400, so the game got no Xbox identity: Initialization Failed (E:0-c2-4), E:0-0-L-8, or \"Welcome back, Player\" with no save. The service in MetalHorizon 1.0.2 sends the ticket in the right form.",
+                   fix: "Update MetalHorizon (1.0.2 or later; it updates itself when it opens), then press Play: the Xbox service restarts by itself. No new sign-in is needed.",
+                   edition: .xbox),
         KnownIssue(id: "xodus-licence-timeout", title: "The Xbox licence request did not answer",
                    patterns: [#"the Xbox licence request did not answer"#],
                    explanation: "xodus asked Microsoft for the game's licence and got no answer for 3 minutes: the network was down or slow, or the Xbox service was stuck.",
@@ -188,7 +193,7 @@ enum Diagnostics {
 
         // Xbox edition
         KnownIssue(id: "xodus-service-down", title: "xodus-service did not start",
-                   patterns: [#"xodus-service did not start"#],
+                   patterns: [#"xodus-service did not start"#, #"xodus-service\) did not start"#],
                    explanation: "xodus-service holds the Xbox sign-in and gives the game its tokens. Without it the game cannot sign in, and it may close right away.",
                    fix: "Click Sign In Again…; when macOS asks to let xodus-service use the 'Xodus Service' Keychain item, choose Always Allow. If the app runs from Downloads, move it to Applications first.",
                    edition: .xbox),

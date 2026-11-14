@@ -228,6 +228,7 @@ final class LauncherModel: ObservableObject {
     @Published var recentRepairs: [Repair] = []
     /// What the Doctor can fix with the player's click (moving a folder, quitting an app, a password).
     @Published var pendingFixes: [PendingFix] = []
+    private var lastAccountProblem = ""
     private var doctorState = DoctorState.load()
     private var doctorTimer: Timer?
     private var examining = false
@@ -481,7 +482,9 @@ final class LauncherModel: ObservableObject {
             let location = Diagnostics.appLocation
             let needsNetwork = (moment == .beforePlay || moment == .afterAction) && edition == .xbox
             let net = needsNetwork ? Sys.reachMicrosoft() : (online: true, skew: nil)
-            return Patient(setup: current, facts: .current, moment: moment, runs: Array(runs),
+            // the account itself, tried for real, when the network is there and a sign-in is saved
+            let check = needsNetwork && net.online && account ? AccountCheck.run(resources: Bundle.main.resourceURL) : nil
+            var patient = Patient(setup: current, facts: .current, moment: moment, runs: Array(runs),
                            gameRunning: Sys.pgrep("forzahorizon6\\.exe"),
                            serviceRunning: Sys.pgrep("xodus-service"),
                            serviceSocket: fileExists("/private/tmp/xodus-runtime-test/xodus.sock"),
@@ -491,6 +494,8 @@ final class LauncherModel: ObservableObject {
                            appPath: Bundle.main.bundlePath,
                            online: needsNetwork ? net.online : nil, clockSkew: net.skew,
                            steamNativeRunning: edition == .steam && Diagnostics.nativeSteamRunning())
+            patient.account = check
+            return patient
         }.value
         var state = doctorState
         let exam = await Doctor.examine(patient, actions: doctorActions, state: &state)
@@ -505,6 +510,13 @@ final class LauncherModel: ObservableObject {
         refreshChecks()
         var result = exam
         if patient.online == false { result.blocker = "offline" }
+        switch patient.account {
+        case .refused(let why)?: result.blocker = "account"; lastAccountProblem = "Xbox does not accept the saved sign-in (\(why)). Sign in again, then Play."
+        case .noSignIn?: result.blocker = "account"; lastAccountProblem = "No Microsoft sign-in is saved. Sign in, then Play."; accountSaved = false
+        case .keychainWaiting?: status = "macOS is asking to let xodus-service use your Xbox sign-in (a Keychain window, maybe behind this one): choose Always Allow."
+        case .accepted?: signInExpired = false
+        default: break
+        }
         return result
     }
 
@@ -755,7 +767,8 @@ final class LauncherModel: ObservableObject {
             try? stop.run()
         }
         refreshSavedAccountStatus(continueAfterSignIn: connected)
-        if !connected { Task { await examine(.afterAction) } }   // a wrong clock or no network fails a sign-in too
+        // after a sign-in, the account is tried for real (and a failed sign-in looked at: clock, network)
+        Task { await examine(.afterAction) }   // a wrong clock or no network fails a sign-in too
     }
 
     /// The helper's end states: the sign-in is over whether or not its window is still open.
@@ -941,6 +954,13 @@ final class LauncherModel: ObservableObject {
                     status = "No connection to Microsoft's licence server, so the game cannot start. Connect to the internet and press Play."
                     return
                 }
+            }
+            if exam.blocker == "account" {
+                // the game would only say Initialization Failed: stop here, with the way out under the button
+                activity = .idle
+                signInExpired = true
+                status = lastAccountProblem
+                return
             }
             activity = .idle
             var route = setup.routeDecision().route

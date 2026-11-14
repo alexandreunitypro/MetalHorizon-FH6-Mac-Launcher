@@ -75,17 +75,40 @@ mkdir -p "$PREFIX/drive_c/highball/logs" "$LOGS" "$(dirname "$GAME_LOG")" 2>/dev
 # xodus-service holds the Microsoft account and answers the game's Xbox token requests; without it the game
 # says "Cloud save synchronization failed". `xodus-cli run` does not start it.
 RT="$XODUS_RUNTIME_DIR"
+# A service left running by an older MetalHorizon keeps its bugs (the 400 on Xbox user tokens before 1.0.2), and one
+# whose log already shows that refusal keeps the refused ticket: either is replaced by a fresh one from this app.
+if pgrep -qf xodus-service && ! pgrep -qf 'forzahorizon6\.exe'; then
+    if [ "$XSERVICE" -nt "$RT/xodus.sock" ] || grep -q "Failed to authenticate Xbox user" "$LOGS/xodus-service.log" 2>/dev/null; then
+        echo "restarting the Xbox service (an older one, or one Xbox had refused, was still running)"
+        pkill -f xodus-service 2>/dev/null; sleep 1; rm -f "$RT/xodus.sock"
+    fi
+fi
 if [ -S "$RT/xodus.sock" ] && pgrep -qf xodus-service; then
     echo "xodus-service already running"
 else
     mkdir -p "$RT" && chmod 700 "$RT"; rm -f "$RT/xodus.sock"
     echo "starting xodus-service (if macOS asks to let it use the 'Xodus Service' Keychain item, choose Always Allow)"
     ( cd /tmp && XODUS_RUNTIME_DIR="$RT" XODUS_LOG=info nohup "$XSERVICE" > "$LOGS/xodus-service.log" 2>&1 & )
-    for _ in $(seq 60); do [ -S "$RT/xodus.sock" ] && break; sleep 1; done
+    # The service reads the sign-in from the Keychain before it opens its socket. After an update its program is new
+    # to the Keychain, and macOS asks ("xodus-service wants to use your confidential information stored in Xodus
+    # Service"), sometimes behind other windows: the service waits on that answer, so Play does too (up to 10 minutes)
+    # and says so, instead of starting a game that would have no Xbox account (Initialization Failed).
+    waited=0; said=0
+    until [ -S "$RT/xodus.sock" ]; do
+        sleep 1; waited=$((waited + 1))
+        pgrep -qf xodus-service || break
+        if pgrep -qx SecurityAgent; then
+            [ $said = 0 ] && [ $waited -ge 4 ] && { echo "NOTE: macOS is asking to let xodus-service use your Xbox sign-in (a Keychain window, maybe behind this one): choose Always Allow, for each window it shows. The game starts right after."; said=1; }
+            [ $waited -ge 600 ] && break
+        else
+            [ $waited -ge 60 ] && break
+        fi
+    done
     if [ ! -S "$RT/xodus.sock" ]; then
-        echo "WARN: xodus-service did not start; no Xbox sign-in. Its last lines:"
+        echo "The Xbox service's last lines:"
         tail -15 "$LOGS/xodus-service.log" 2>/dev/null | sed 's/^/  | /'
-        pgrep -qf xodus-service || echo "  (it is not running: macOS may have blocked it, see Diagnosis)"
+        pkill -f xodus-service 2>/dev/null
+        mh_fail "the Xbox service (xodus-service) did not start, so the game would have no Xbox account. If macOS showed a Keychain window, press Play again and choose Always Allow; otherwise Sign In Again in Settings › General"
     fi
 fi
 "$ENGINE/bin/wineserver" -k 2>/dev/null || true

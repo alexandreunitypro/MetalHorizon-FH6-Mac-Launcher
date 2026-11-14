@@ -10,7 +10,10 @@ cd "$(dirname "$0")"
 VERSION="${1:-0.1.0}"
 WORK="${WORK:-/Users/alexandre/Documents/Codex/2026-10-19/goal-reprend-son-travail-on-invente/work}"
 XODUS_CLI="${XODUS_CLI:-$WORK/xodus/target/release/xodus-cli}"
-XODUS_SERVICE="${XODUS_SERVICE:-$WORK/xodus/target/release/xodus-service}"
+# The service is built from the Ferestre tree (its source below), with patches/xodus-cli/0003 (compact JWE tickets as
+# t=): without it every Xbox user token request got 400 and the game said Initialization Failed (issues #1, #9, #13).
+XODUS_SERVICE="${XODUS_SERVICE:-$WORK/xodus-ferestre/target/release/xodus-service}"
+[ "$XODUS_SERVICE" -nt "$WORK/xodus-ferestre/crates/xodus/src/models/secrets.rs" ] || [ -n "${XODUS_SERVICE_ANY:-}" ] || { echo "STOP: xodus-service is older than its JWE fix: rebuild it (cargo build --release -p xodus-service)"; exit 1; }
 XODUS_CLI_SRC="${XODUS_CLI_SRC:-$WORK/xodus}"
 XODUS_SERVICE_SRC="${XODUS_SERVICE_SRC:-$WORK/xodus-ferestre}"   # see the header of patches/xodus-cli/0002
 for f in "$XODUS_CLI" "$XODUS_SERVICE"; do [ -x "$f" ] || { echo "STOP: $f not found"; exit 1; }; done
