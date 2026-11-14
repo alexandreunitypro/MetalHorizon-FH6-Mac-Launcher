@@ -63,8 +63,13 @@ struct RunOutcome {
     var options: (metalFX: Bool, maxFPS: Int)
 
     /// A run that lasted, or ended cleanly after the game had time to start.
-    var succeeded: Bool { !userStopped && (duration >= 300 || (exitCode == 0 && duration >= 90)) }
-    var failed: Bool { !userStopped && !succeeded && (exitCode != 0 || duration < 90) }
+    /// The log shows the game itself crashed. Its exit code says nothing: Wine's debugger and the game's own crash
+    /// window (FHE01) end with exit 0 (issue #14: five crashes in a row, none seen as a failure).
+    var crashed: Bool {
+        has("wine-unimplemented", "page-fault", "macos-abort", "native-emulator-crash", "native-device-lost", "native-vulkan-driver", "killed-9")
+    }
+    var succeeded: Bool { !userStopped && !crashed && (duration >= 300 || (exitCode == 0 && duration >= 90)) }
+    var failed: Bool { !userStopped && !succeeded && (crashed || exitCode != 0 || duration < 90) }
 
     func has(_ ids: String...) -> Bool { findings.contains { ids.contains($0.id) } }
 
@@ -74,7 +79,7 @@ struct RunOutcome {
         guard failed else { return false }
         if has("xodus-package-missing", "xbox-not-downloaded", "forza-invalid-profile", "steam-auth", "stop-message",
                "xodus-service-down", "xodus-license") { return false }
-        return has("page-fault", "macos-abort", "native-emulator-crash", "native-device-lost", "native-vulkan-driver",
+        return has("wine-unimplemented", "page-fault", "macos-abort", "native-emulator-crash", "native-device-lost", "native-vulkan-driver",
                    "gpu-unsupported", "fhe21-amd", "concrt-crash") || (exitCode != 0 && duration < 120)
     }
 }
@@ -158,7 +163,7 @@ enum Autopilot {
         }
         // One automatic relaunch per Play, on the engine the next Play would use, when the game stopped before it
         // got going: most early stops are timing, and the player should not have to click again.
-        if !alreadyRelaunched && run.duration < 180 {
+        if !alreadyRelaunched && (run.duration < 180 || (run.crashed && run.duration < 600)) {
             let next: ResolvedRoute = health.isBenched(run.route, now: now) && otherUsable ? other : run.route
             decision.relaunch = next
             decision.repairs.append(Repair(title: "Game started again\(next == run.route ? "" : " on \(next.title)")",

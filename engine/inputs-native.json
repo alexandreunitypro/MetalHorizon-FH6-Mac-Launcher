@@ -13,7 +13,7 @@
   },
   "blackwell-xbox-patch": {
     "file": "engine/patches-arm64-xbox/0100-blackwell-xbox-on-wine-11.18-arm64.patch",
-    "from": "engine/patches 0001, 0002, 0004, 0006 to 0009 and 0012, ported to Wine 11.18; 0003 (macOS %gs TEB slots) and 0005 (x86-64 exception traces) are x86-64 only and left out; 0008's concrt140 hunks are upstream in 11.18"
+    "from": "engine/patches 0001, 0002, 0004, 0006 to 0009 and 0012, ported to Wine 11.18; 0003 (macOS %gs TEB slots) and 0005 (x86-64 exception traces) are x86-64 only and left out; 0008's concurrent_vector hunks are upstream in 11.18; its concurrent queue iterator (which Forza Horizon 6 calls: FHE01 without it, issue #14) is ported since Native 1.1"
   },
   "llvm-mingw": {
     "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz",
@@ -40,8 +40,8 @@
     "note": "Not in the bundle: MetalHorizon installs it from Highball's release and checks its signature (components.json, wineloader)."
   },
   "output": {
-    "file": "blackwell-engine-native-1.0.tar.xz",
-    "sha256": "650f549088192bfce7c6377b1aaeede2034ca29b8518ab5d4385c13e735f504e",
-    "size": 259581292
+    "file": "blackwell-engine-native-1.1.tar.xz",
+    "sha256": "23dc39dd2a6e7e0b4084f6a3381da5b1365e00f8804def1a8912439d844a204b",
+    "size": 259589544
   }
 }

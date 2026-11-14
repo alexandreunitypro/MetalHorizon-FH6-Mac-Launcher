@@ -351,6 +351,16 @@ cmd_play() {
         [ "$strategy" = direct ] || strategy=applaunch
         if [ "$strategy" = applaunch ]; then
             if play_applaunch; then echo applaunch > "$STRATEGY_FILE"; mh_tail_errors "$GAME_LOG"; return 0; fi
+            # The silent client stopped or never started the game (issue #16). What it said goes in the run's log, and
+            # it gets one more try from a clean state (a client that updated itself, or a stale one, is the usual
+            # reason) before MetalHorizon starts the game itself, which gives the game no Steam ticket.
+            echo "== Steam's last lines:"
+            tail -c 6000 "$GAME_LOG" 2>/dev/null | grep -a -v '^[[:space:]]*$' | tail -12 | cut -c1-300 | sed 's/^/  | /'
+            echo "== trying Steam once more, from a clean start"
+            stop_client
+            end_leftovers msync
+            sleep 3
+            if play_applaunch; then echo applaunch > "$STRATEGY_FILE"; mh_tail_errors "$GAME_LOG"; return 0; fi
             echo "== Steam could not start the game itself: MetalHorizon starts it, with Steam running beside it"
             stop_client
             end_leftovers msync

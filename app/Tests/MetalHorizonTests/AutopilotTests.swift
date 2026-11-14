@@ -124,4 +124,19 @@ final class AutopilotTests: XCTestCase {
         XCTAssertTrue(Diagnostics.scan(text: "vkd3d: VK_ERROR_DEVICE_LOST", source: "t").contains { $0.id == "native-device-lost" })
         XCTAssertTrue(Diagnostics.scan(text: "STOP: the native engine's signed loader is missing (WineLoader.app)", source: "t").contains { $0.id == "native-loader" })
     }
+
+    /// Issue #14: the game's own crash window ends with exit 0 after two minutes; the log shows the crash.
+    func testACrashWithExitZeroIsStillAFailure() {
+        var health = RouteHealth()
+        let line = "wine: Unimplemented function concrt140.dll.??0_Concurrent_queue_iterator_base_v4@details@Concurrency@@IEAA@AEBV_Concurrent_queue_base_v4@12@@Z called at address 00006FFFFFAE2B98 (thread 0218), starting debugger..."
+        let run = outcome(.native, exit: 0, after: 148, log: line)
+        XCTAssertTrue(run.crashed)
+        XCTAssertTrue(run.failed)
+        XCTAssertTrue(run.engineFailure)
+        var d = Autopilot.afterRun(run, health: &health, nativeAvailable: true, facts: m5, preference: .automatic, alreadyRelaunched: false)
+        XCTAssertEqual(d.relaunch, .native)
+        d = Autopilot.afterRun(run, health: &health, nativeAvailable: true, facts: m5, preference: .automatic, alreadyRelaunched: true)
+        XCTAssertTrue(health.isBenched(.native), "two crashes in a day move the game to D3DMetal")
+        XCTAssertTrue(d.repairs.contains { $0.kind == .switchedEngine })
+    }
 }
