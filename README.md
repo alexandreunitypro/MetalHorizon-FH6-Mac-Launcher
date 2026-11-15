@@ -2,7 +2,7 @@
 
 **Run your own copy of Forza Horizon 6 on an Apple Silicon Mac: Xbox / Microsoft Store AND STEAM!**
 Blackwell Engine (Wine) + xodus or Steam + Apple's D3DMetal, open source, no CrossOver, no DRM bypass.
-
+The best tool in the world to run Forza Horizon 6 on a Mac: the most stable solution, offering exclusive features like multiplayer and significantly better graphics and work with Xbox copy of the game even game pass!.
 ## Download
 
 **[MetalHorizon 1.0 (Final Beta)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
