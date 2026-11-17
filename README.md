@@ -57,8 +57,6 @@ Tested on one machine: MacBook Pro 16" M5 Pro (18-core CPU, 20-core GPU, 48 GB),
 | Engine sound on Mac speakers | ✅ Fixed (7.1 / 7.1.4 streams were played as front left/right only). |
 | Online (Horizon Play matchmaking) | ✅ Connects to the game's dedicated servers (24 October). Crashes still happen in online sessions. |
 | Missing objects (pipelines D3DMetal skipped) | ✅ 221 → 0 in game, fixed in the DirectX 12 shim. |
-| Black near foliage | ❌ Open. Cause narrowed down (see [Rendering notes](#rendering-notes)). |
-| Frame pacing | ❌ About 36 fps average, with 6 freezes of 175–300 ms every 25 s. Top priority. |
 | Crash while the map loads | ⚠️ In Apple's Metal driver; so far only with the diagnostic inspector on. |
 | Launcher | ✅ MetalHorizon installs everything by itself (prototype, not notarized). |
 | Steam edition | ⚠️ Steam installs, updates and shows its sign-in window (DXMT, 32-bit engine, 7 November). The game runs through a silent Steam client, as in Highball; not tested in game here (no Steam copy). |
