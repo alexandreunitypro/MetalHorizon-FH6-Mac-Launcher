@@ -62,6 +62,8 @@ struct Patient {
     /// The Xbox account, tried for real by `xodus-service --check` (nil when not tried): accepted, refused (with what
     /// Xbox or Microsoft answered), no sign-in saved, or waiting on macOS's Keychain window.
     var account: AccountCheck? = nil
+    /// The installed game against the version Microsoft publishes (nil: current, or not known).
+    var gameUpdate: GameUpdate? = nil
     var now = Date()
 
     var plays: [RunRecord] { runs.filter { $0.kind == "play" || $0.kind == "steam-play" } }
@@ -96,14 +98,16 @@ enum AccountCheck: Equatable {
     /// Runs the bundled service's check (at most 40 s). Nothing of the account is printed or kept.
     static func run(resources: URL?) -> AccountCheck? {
         guard let service = resources?.appendingPathComponent("xodus-service"), fileExists(service.path) else { return nil }
-        let (code, out, timedOut) = Sys.capture(service.path, ["--check"], timeout: 40)
+        // with what the service writes to its error output: Xbox's own answer to a refusal, its XErr code (XboxRefusal)
+        let (code, out, timedOut) = Sys.capture(service.path, ["--check"], timeout: 40, withErrors: true)
         if timedOut { return Sys.pgrep("SecurityAgent") ? .keychainWaiting : .unreachable("the check did not answer in 40 s") }
         let line = out.split(separator: "\n").last { $0.hasPrefix("CHECK ") }.map(String.init) ?? ""
         switch code {
         case 0: return .accepted
         case 3: return .noSignIn
         case 2:
-            let reason = String(line.dropFirst("CHECK failed: ".count))
+            var reason = String(line.dropFirst("CHECK failed: ".count))
+            if let refusal = XboxRefusal.from(out) { reason += " (Xbox: XErr \(refusal.code), \(refusal.title.lowercased()))" }
             let network = ["error sending request", "dns error", "timed out", "connection", "lookup"].contains { reason.lowercased().contains($0) }
             return network ? .unreachable(reason) : .refused(reason)
         default:
@@ -379,12 +383,33 @@ enum Doctor {
         Ailment(id: "xbox-account-refused", title: "Xbox does not accept the saved sign-in", moments: [.beforePlay, .afterAction],
                 detect: { p in
                     guard case .refused(let why)? = p.account else { return nil }
+                    if let refusal = XboxRefusal.from(why) { return "\(refusal.title). \(refusal.detail)" }
                     return "MetalHorizon tried the account before starting the game: \(why)."
                 },
-                treatments: { _, a in [.oneClick(button: "Sign In Again",
-                                                 detail: "A new sign-in on Microsoft's page gives Xbox a fresh ticket; the game is not started until the account is accepted.") {
-                    a.signInAgain(); return "Microsoft's sign-in is opening."
-                }] }),
+                treatments: { p, a in
+                    // An account Xbox refuses for what it is (no profile, terms, family, region) gains nothing from a
+                    // new sign-in: the page that fixes it opens instead, and Sign In Again comes after.
+                    if case .refused(let why)? = p.account, let refusal = XboxRefusal.from(why) {
+                        return [.oneClick(button: refusal.button, detail: refusal.detail) {
+                            a.openURL(refusal.url); return "\(refusal.url.host ?? "The page") is opening; Sign In Again once it is done."
+                        }, .oneClick(button: "Sign In Again", detail: "Once the account is ready on Microsoft's side.") {
+                            a.signInAgain(); return "Microsoft's sign-in is opening."
+                        }]
+                    }
+                    return [.oneClick(button: "Sign In Again",
+                                      detail: "A new sign-in on Microsoft's page gives Xbox a fresh ticket; the game is not started until the account is accepted.") {
+                        a.signInAgain(); return "Microsoft's sign-in is opening."
+                    }]
+                }),
+        Ailment(id: "game-outdated", title: "A newer version of the game is out", moments: [.beforePlay, .afterAction],
+                detect: { p in
+                    guard p.setup.edition == .xbox, let update = p.gameUpdate else { return nil }
+                    return "Microsoft publishes Forza Horizon 6 \(update.latest); this Mac has \(update.installed). An outdated game finds no online session, and once your cloud profile was saved by the newer one (on an Xbox, a PC or in the cloud) it says Invalid Profile (E:43-1b-4)."
+                },
+                treatments: { _, a in [.oneClick(button: "Update the Game",
+                                                 detail: "Downloads what changed since your version, into the same folder; your saves are in the cloud and stay.") {
+                    GameVersion.forget(); a.startDownload(); return "The update is downloading."
+                }, .explain] }),
         Ailment(id: "xbox-no-sign-in", title: "No Microsoft sign-in is saved", moments: [.beforePlay, .afterAction],
                 detect: { p in p.account == .noSignIn ? "The Keychain holds no sign-in for xodus (it was removed, or never finished)." : nil },
                 treatments: { _, a in [.oneClick(button: "Sign In", detail: "On Microsoft's own page.") {
@@ -702,14 +727,15 @@ enum Sys {
     }
 
     /// As `run`, keeping what the program printed; `timedOut` when it was stopped at the deadline.
-    static func capture(_ path: String, _ args: [String], timeout: TimeInterval) -> (status: Int32, output: String, timedOut: Bool) {
+    static func capture(_ path: String, _ args: [String], timeout: TimeInterval,
+                        withErrors: Bool = false) -> (status: Int32, output: String, timedOut: Bool) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = args
         task.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
         let pipe = Pipe()
         task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
+        task.standardError = withErrors ? pipe : FileHandle.nullDevice
         guard (try? task.run()) != nil else { return (-1, "", false) }
         let deadline = Date().addingTimeInterval(timeout)
         while task.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }

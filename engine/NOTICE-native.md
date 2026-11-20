@@ -11,7 +11,13 @@ The native Apple silicon engine MetalHorizon 1.0 uses for Forza Horizon 6 (Xbox 
     contributors named in that folder's README;
   - Blackwell Engine's Xbox patches ported to Wine 11.18 (`engine/patches-arm64-xbox/` in
     https://github.com/alexandreunitypro/MetalHorizon-FH6-Mac-Launcher): the Xbox game runtime
-    (xgameruntime, from xodus), Xbox app packages, msixvc images, network, audio and GameInput.
+    (xgameruntime, from xodus), Xbox app packages, msixvc images, network, audio and GameInput;
+  - since 1.2, prsloan's dual-stack socket fix from highball-engine pull request #40 (their arm64 0059, here
+    `0101-ntdll-dualstack-ipv4-options.patch`, LGPL-2.1-or-later): the IPv4 options Forza Horizon 6 sets on its
+    IPv6 game socket before matchmaking (`IP_DONTFRAGMENT`, `IP_TTL`), which macOS refuses, are set as their IPv6
+    counterparts, so the game keeps its UDP socket and joins online sessions;
+  - since 1.2, `0102-gameinput-xinput-pads-as-xbox.patch`: every pad GameInput reports through XInput is an Xbox One
+    controller to the game, so a PlayStation or third-party pad is read as a gamepad (issue #15).
 - **From Highball's engine release** `engine-arm64-wine-11.18-20261104T130327Z-arm64-games-0053-0054` (unchanged):
   FEX 2610 with Highball's FEX patches (MIT) as `xtajit64.dll` / `xtajit.dll` and its Darwin helper; GStreamer 1.28.7
   and winegstreamer (LGPL-2.1); the host libraries Wine opens by name (FreeType, GnuTLS, SDL and what they link);
@@ -32,5 +38,6 @@ No game files, no DRM or licence bypass: the Xbox game runs from your own copy, 
 
 ## Thanks
 
-Gauthier Piarrette and Highball's contributors (ineshd for FEX 0034, steamac for KosmicKrisp), the Wine, FEX,
+Gauthier Piarrette and Highball's contributors (ineshd for FEX 0034, steamac for KosmicKrisp, prsloan for the
+online fix), the Wine, FEX,
 Mesa, vkd3d-proton, DXVK and GStreamer projects, and xodus.

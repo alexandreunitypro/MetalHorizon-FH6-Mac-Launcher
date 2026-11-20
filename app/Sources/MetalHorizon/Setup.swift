@@ -413,6 +413,8 @@ struct Setup {
         var env = optionsEnvironment(gameInput: gameInput)
         env["MH_PREFIX"] = steamPrefixPath
         env["MH_STEAM_APPID"] = steamAppID
+        // the app itself, which records Steam's pre-launch notices as seen before a cold start (--steam-notices-seen)
+        if let binary = Bundle.main.executablePath { env["MH_APP_BINARY"] = binary }
         if let gameLog { env["MH_GAME_LOG"] = gameLog.path }
         return env
     }

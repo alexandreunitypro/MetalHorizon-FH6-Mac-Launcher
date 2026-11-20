@@ -13,6 +13,14 @@
 0009-diag-msgbox.patch
 # GameInput (controllers in GDK games) on top of XInput; off unless WINE_GAMEINPUT=1. Source: src/gameinput/.
 0012-gameinput-xinput-backend.patch
+# Online play (Forza Horizon 6, since engine 1.2): the IPv4 options the game sets on its IPv6 game socket before
+# matchmaking, which macOS refuses, are set as their IPv6 counterparts. prsloan's fix from highball-engine pull
+# request #40 (their 0034), LGPL-2.1-or-later: see patches/ORIGIN-online.md.
+0014-ntdll-dualstack-ipv4-options.patch
+# Controllers (since engine 1.2): every pad GameInput reports through XInput is an Xbox One controller to the game, so
+# a PlayStation or third-party pad is read as a gamepad, not as a HID device (issue #15). WINE_GAMEINPUT_REAL_IDS=1
+# keeps their own ids.
+0015-gameinput-xinput-pads-as-xbox.patch
 # Highball 0025 (closing async I/O no longer crashes) is NOT in the engine that runs the game today: only
 # its test half reached the dev tree. Turn it on after an in-game test.
 # ../../tools/forza-patches/0025-ntdll-threadpool-io-release-once.patch

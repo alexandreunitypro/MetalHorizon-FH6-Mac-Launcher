@@ -3,20 +3,20 @@
     {
       "id": "engine",
       "name": "Blackwell Engine",
-      "version": "1.1",
-      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.1/blackwell-engine-1.1.tar.xz",
-      "sha256": "e3b650101e17bbd851afcae67c6fbc7ba15bb47cd9649c9eac24a79f5e35862c",
-      "size": 103950532,
+      "version": "1.2",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.2/blackwell-engine-1.2.tar.xz",
+      "sha256": "89158e90d209d8fb41d2964e96cbb1cac27bfe8bcf4cb8bb010ace511bd1f3c7",
+      "size": 103944332,
       "folder": "Blackwell Engine",
       "root": "Blackwell Engine"
     },
     {
       "id": "engine-steam",
       "name": "Blackwell Engine Steam",
-      "version": "steam-1.1",
-      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.1/blackwell-engine-steam-1.1.tar.xz",
-      "sha256": "3d0dd4a05acb42ce7b038e66ec1199bdda54a1de80c96a38983db6ce690eb6c0",
-      "size": 91562260,
+      "version": "steam-1.2",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.2/blackwell-engine-steam-1.2.tar.xz",
+      "sha256": "8fdff40d4c3074652b15c5ada406e870f778b0865f4c135f7530dbcbf7ce2150",
+      "size": 91551424,
       "folder": "Blackwell Engine Steam",
       "root": "Blackwell Engine"
     },
@@ -45,10 +45,10 @@
     {
       "id": "engine-native",
       "name": "Blackwell Engine Native",
-      "version": "1.1",
-      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-native-1.1/blackwell-engine-native-1.1.tar.xz",
-      "sha256": "23dc39dd2a6e7e0b4084f6a3381da5b1365e00f8804def1a8912439d844a204b",
-      "size": 259589544,
+      "version": "1.2",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-native-1.2/blackwell-engine-native-1.2.tar.xz",
+      "sha256": "2e5a2c3f2cf26454bc9cb3e46f16016a2efa5c0afcd69e6f583746cedb57c928",
+      "size": 259568056,
       "folder": "Blackwell Engine Native",
       "root": "Blackwell Engine Native"
     }

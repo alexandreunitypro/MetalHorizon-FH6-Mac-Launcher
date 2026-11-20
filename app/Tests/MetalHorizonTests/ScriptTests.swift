@@ -69,6 +69,14 @@ final class ScriptTests: XCTestCase {
         }
         XCTAssertFalse(out.contains("MTL_HUD_ENABLED"), out)
         XCTAssertFalse(out.lowercased().contains("crossover"), out)
+        // issue #18: the in-game Store catalog is on, and the Xbox service is bound to the game's Store ID, from its
+        // MicrosoftGame.config, or Forza Horizon 6's when there is none
+        XCTAssertTrue(out.contains("XGR_STORE_CATALOG=\"1\""), out)
+        XCTAssertTrue(out.contains("service: XODUS_STORE_PRODUCT=9NR1R1XWLCNB"), out)
+        try "<?xml version=\"1.0\"?>\n<Game>\n  <StoreId>9TESTSTORE01</StoreId>\n</Game>\n"
+            .write(to: root.appendingPathComponent("FH6/MicrosoftGame.config"), atomically: true, encoding: .utf8)
+        (code, out) = try run("metalhorizon-play.sh", env: env)
+        XCTAssertTrue(out.contains("service: XODUS_STORE_PRODUCT=9TESTSTORE01"), out)
     }
 
     func testXboxBrokenLinkSaysWhere() throws {

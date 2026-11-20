@@ -95,7 +95,7 @@ rsync -a --exclude target --exclude .git --exclude '*.bak' --exclude '.DS_Store'
 {
     echo "Source of the xodus binaries in MetalHorizon $VERSION (GPL-3.0, https://github.com/xodus-gaming/xodus)."
     echo "xodus-cli-source/: xodus $(git -C "$XODUS_CLI_SRC" rev-parse --short HEAD 2>/dev/null || echo '?') with local changes; build: cargo build --release -p xodus-cli"
-    echo "xodus-service-source/: Ferestre's xodus tree with patches/xodus-cli/0002; build: PROTOC=<protoc> cargo build --release -p xodus-service"
+    echo "xodus-service-source/: xodus with MetalHorizon's patches/xodus-cli/0002 to 0005 (title XSTS, compact JWE tickets, the account check, and the Store answers: licence tokens, the game's licence, the catalog bridge from Ferestre's icex/xodus, account roles); build: PROTOC=<protoc> cargo build --release -p xodus-service"
     echo "SHA-256 of the bundled binaries:"
     shasum -a 256 "$XODUS_CLI" "$XODUS_SERVICE" | sed 's|  .*/|  |'
 } > "$SRCSTAGE/README.txt"

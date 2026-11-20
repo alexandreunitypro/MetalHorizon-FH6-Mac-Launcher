@@ -73,7 +73,7 @@ enum Diagnostics {
                    edition: .steam),
         KnownIssue(id: "steam-interstitial", title: "Steam is waiting for an answer before starting the game",
                    patterns: [#"LaunchApp waiting for user response to ShowInterstitials"#, #"waiting for user response"#],
-                   explanation: "Steam shows a dialog before the first launch (a licence agreement, a cloud-save choice, an update). In game mode its window is hidden, so it waits.",
+                   explanation: "Steam shows a notice or a dialog before the game's first launch (controller recommended, Steam Input for a PlayStation pad, a licence agreement, a cloud-save choice). Its silent client shows no window, so it waits. Since 1.0.4 MetalHorizon records Steam's pre-launch notices as seen before it starts Steam, as Steam does once they are shown; a licence or cloud-save dialog still needs you.",
                    fix: "Click Open Steam, answer the dialog (start the game once from Steam's Library if needed), then use Play again.",
                    severity: .warning, edition: .steam),
         KnownIssue(id: "steam-auth", title: "The game got no sign-in (E:0-0-L-8)",
@@ -196,6 +196,16 @@ enum Diagnostics {
                    fix: "Export the diagnostics and open an issue; the exception's name is in the evidence.", severity: .warning),
 
         // Xbox edition
+        KnownIssue(id: "device-ticket-refused", title: "Microsoft refused this Mac's device ticket",
+                   patterns: [#"The device ticket could not be renewed"#],
+                   explanation: "Every Xbox request starts with Microsoft's ticket exchange, which takes this Mac's device ticket. Microsoft refused it, and renewing it from the device key failed too, so the game got no sign-in (Initialization Failed, E:0-c2-4). Since 1.0.4 the Xbox service renews a refused device ticket by itself; this line says that renewal failed as well.",
+                   fix: "Check the Mac's connection and its clock (System Settings › General › Date & Time, set automatically), then Sign In Again (Settings › General). If it stays, send the diagnostics (Activity › Export Diagnostics).",
+                   edition: .xbox),
+        KnownIssue(id: "licence-token-failed", title: "The game's licence token was not issued (VIP, Car Pass, expansions)",
+                   patterns: [#"Licence token request failed"#, #"Licence token request did not finish"#, #"refused a licence token"#],
+                   explanation: "The game asks the Xbox service for a licence token and hands it to Forza's servers, which read from it what your account owns: the VIP membership, the Car Pass and the expansions of a Premium edition. This time the token was not issued (the line says why), so the game may show them as not owned.",
+                   fix: "Check the Mac's connection, then quit the game and use Play again. If it keeps failing, Sign In Again (Settings › General) and send the diagnostics (Activity › Export Diagnostics).",
+                   severity: .warning, edition: .xbox),
         KnownIssue(id: "xodus-service-down", title: "xodus-service did not start",
                    patterns: [#"xodus-service did not start"#, #"xodus-service\) did not start"#],
                    explanation: "xodus-service holds the Xbox sign-in and gives the game its tokens. Without it the game cannot sign in, and it may close right away.",
@@ -229,7 +239,7 @@ enum Diagnostics {
                    fix: "Do what the line says, or click Install on the red line of the Setup.", severity: .warning)
     ]
 
-    private static let compiled: [(KnownIssue, [NSRegularExpression])] = issues.map { issue in
+    private static let compiled: [(KnownIssue, [NSRegularExpression])] = (issues + XboxRefusal.knownIssues).map { issue in
         (issue, issue.patterns.compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) })
     }
 

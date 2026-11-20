@@ -495,6 +495,8 @@ final class LauncherModel: ObservableObject {
                            online: needsNetwork ? net.online : nil, clockSkew: net.skew,
                            steamNativeRunning: edition == .steam && Diagnostics.nativeSteamRunning())
             patient.account = check
+            // the game's version against Microsoft's, once the account is known to work (the question needs it)
+            if check == .accepted { patient.gameUpdate = GameVersion.check(resources: Bundle.main.resourceURL, gameDirectory: current.gameDirectory) }
             return patient
         }.value
         var state = doctorState
@@ -511,7 +513,14 @@ final class LauncherModel: ObservableObject {
         var result = exam
         if patient.online == false { result.blocker = "offline" }
         switch patient.account {
-        case .refused(let why)?: result.blocker = "account"; lastAccountProblem = "Xbox does not accept the saved sign-in (\(why)). Sign in again, then Play."
+        case .refused(let why)?:
+            result.blocker = "account"
+            if let refusal = XboxRefusal.from(why) {
+                // the account itself needs something: signing in again would not change it
+                lastAccountProblem = "\(refusal.title). \(refusal.button) (\(refusal.url.host ?? "Microsoft's page")), then Sign In Again and Play."
+            } else {
+                lastAccountProblem = "Xbox does not accept the saved sign-in (\(why)). Sign in again, then Play."
+            }
         case .noSignIn?: result.blocker = "account"; lastAccountProblem = "No Microsoft sign-in is saved. Sign in, then Play."; accountSaved = false
         case .keychainWaiting?: status = "macOS is asking to let xodus-service use your Xbox sign-in (a Keychain window, maybe behind this one): choose Always Allow."
         case .accepted?: signInExpired = false
@@ -980,6 +989,16 @@ final class LauncherModel: ObservableObject {
         userStoppedRun = false
         if edition == .steam {
             runRoute = .d3dmetal
+            // Steam's pre-launch notices wait for an answer the silent client cannot show, and the game never starts
+            // (issues #16, #17): recorded as seen while no client runs, the way Steam records them once shown.
+            if !steamStatus.clientRunning,
+               SteamLaunchNotice.markSeen(steamRoot: URL(fileURLWithPath: setup.steam.steamDirectory),
+                                          appID: Int(steamAppID) ?? 2483190) > 0 {
+                RepairLog.record(Repair(title: "Steam's pre-launch notices recorded as seen",
+                                        detail: "Steam waits for an answer to notices such as \"controller recommended\" before a game's first start, and its silent client cannot show them: the game never started (E:0-0-L-8). They are recorded as seen, as Steam does once they are shown.",
+                                        kind: .fixed))
+                recentRepairs = RepairLog.recent()
+            }
             runSteam("play", activity: .game, statusText: "Playing through Steam. Quit from the game's own menu; Steam stays open in the background.") { code in
                 code == 0 ? "Game closed." : "The game did not start or stopped (error \(code)). What to do shows under the button."
             }

@@ -51,10 +51,19 @@ else
 fi
 export MH_ROUTE="$ROUTE"
 export XODUS_RUNTIME_DIR=/private/tmp/xodus-runtime-test
+# The game's Store ID, from its own MicrosoftGame.config (Forza Horizon 6's when the file cannot be read): the Xbox
+# service answers the game's licence and Store questions for this product only, the licence tokens through which the
+# game's servers see the VIP membership, the Car Pass and the expansions (issue #18) among them.
+STORE_ID="$(LC_ALL=C sed -n 's:.*<StoreId>[[:space:]]*\([A-Za-z0-9]\{12\}\)[[:space:]]*</StoreId>.*:\1:p' "$SOURCE/MicrosoftGame.config" 2>/dev/null | head -1)"
+STORE_ID="${STORE_ID:-9NR1R1XWLCNB}"
+# The runtime's live Store catalog: the in-game marketplace lists the game's add-ons (Ferestre's Forza Horizon 6 recipe
+# turns it on too). It only describes products; what the account owns comes from the licence token.
+export XGR_STORE_CATALOG=1
 
 if [ -n "${MH_DRY_RUN:-}" ]; then
     # bash's own list: /usr/bin/env is protected by SIP and would not show the DYLD_ variables
-    export -p | sed -n 's/^declare -x //p' | grep -E '^(CX_|WINE|D3DM_|MTL_|HB_|XODUS_|DYLD_|MVK_|VKD3D_|DXVK_|VK_|FEX_|MESA_|GST_|MH_ROUTE)' | sort
+    export -p | sed -n 's/^declare -x //p' | grep -E '^(CX_|WINE|D3DM_|MTL_|HB_|XODUS_|XGR_|DYLD_|MVK_|VKD3D_|DXVK_|VK_|FEX_|MESA_|GST_|MH_ROUTE)' | sort
+    echo "service: XODUS_STORE_PRODUCT=$STORE_ID"
     echo "run: $XCLI run $SOURCE $ENGINE/bin/wine --exe forzahorizon6.exe"
     exit 0
 fi
@@ -77,9 +86,11 @@ mkdir -p "$PREFIX/drive_c/highball/logs" "$LOGS" "$(dirname "$GAME_LOG")" 2>/dev
 RT="$XODUS_RUNTIME_DIR"
 # A service left running by an older MetalHorizon keeps its bugs (the 400 on Xbox user tokens before 1.0.2), and one
 # whose log already shows that refusal keeps the refused ticket: either is replaced by a fresh one from this app.
+# So is one started for another game, or before services were bound to the game (it would refuse the licence answers).
 if pgrep -qf xodus-service && ! pgrep -qf 'forzahorizon6\.exe'; then
-    if [ "$XSERVICE" -nt "$RT/xodus.sock" ] || grep -q "Failed to authenticate Xbox user" "$LOGS/xodus-service.log" 2>/dev/null; then
-        echo "restarting the Xbox service (an older one, or one Xbox had refused, was still running)"
+    if [ "$XSERVICE" -nt "$RT/xodus.sock" ] || grep -q "Failed to authenticate Xbox user" "$LOGS/xodus-service.log" 2>/dev/null \
+        || [ "$(cat "$RT/xodus-service.product" 2>/dev/null)" != "$STORE_ID" ]; then
+        echo "restarting the Xbox service (an older one, one Xbox had refused, or one for another game was still running)"
         pkill -f xodus-service 2>/dev/null; sleep 1; rm -f "$RT/xodus.sock"
     fi
 fi
@@ -88,7 +99,8 @@ if [ -S "$RT/xodus.sock" ] && pgrep -qf xodus-service; then
 else
     mkdir -p "$RT" && chmod 700 "$RT"; rm -f "$RT/xodus.sock"
     echo "starting xodus-service (if macOS asks to let it use the 'Xodus Service' Keychain item, choose Always Allow)"
-    ( cd /tmp && XODUS_RUNTIME_DIR="$RT" XODUS_LOG=info nohup "$XSERVICE" > "$LOGS/xodus-service.log" 2>&1 & )
+    ( cd /tmp && XODUS_RUNTIME_DIR="$RT" XODUS_LOG=info XODUS_STORE_PRODUCT="$STORE_ID" nohup "$XSERVICE" > "$LOGS/xodus-service.log" 2>&1 & )
+    echo "$STORE_ID" > "$RT/xodus-service.product"
     # The service reads the sign-in from the Keychain before it opens its socket. After an update its program is new
     # to the Keychain, and macOS asks ("xodus-service wants to use your confidential information stored in Xodus
     # Service"), sometimes behind other windows: the service waits on that answer, so Play does too (up to 10 minutes)

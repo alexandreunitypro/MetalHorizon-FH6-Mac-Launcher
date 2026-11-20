@@ -33,6 +33,15 @@ STEAM_DIR="$PREFIX/drive_c/Program Files (x86)/Steam"
 STEAM_EXE="$STEAM_DIR/steam.exe"
 [ -f "$STEAM_EXE" ] || [ ! -f "$STEAM_DIR/Steam.exe" ] || STEAM_EXE="$STEAM_DIR/Steam.exe"   # case-sensitive volumes
 STEAM_WIN='C:\Program Files (x86)\Steam\steam.exe'
+# Steam's own log: what the client is doing with the launch ("LaunchApp waiting for user response to ShowInterstitials"),
+# which its silent mode never prints. CONSOLE_FROM: where the current launch's lines start.
+STEAM_CONSOLE="$STEAM_DIR/logs/console_log.txt"; CONSOLE_FROM=0; CONSOLE_INODE=""
+console_mark() { CONSOLE_FROM=$(mh_size "$STEAM_CONSOLE"); CONSOLE_INODE=$(stat -f %i "$STEAM_CONSOLE" 2>/dev/null); }
+# what Steam wrote to its console log since console_mark; all of it when Steam started a new file (it rotates its logs)
+console_since() {
+    if [ "$(stat -f %i "$STEAM_CONSOLE" 2>/dev/null)" != "$CONSOLE_INODE" ]; then cat "$STEAM_CONSOLE" 2>/dev/null
+    else tail -c +"$((CONSOLE_FROM + 1))" "$STEAM_CONSOLE" 2>/dev/null; fi
+}
 DXMT="$ENGINE/renderers/dxmt/wine"
 SETUP="$HOME/Library/Application Support/MetalHorizon/Downloads/SteamSetup.exe"
 # Valve's own hosts for the same installer. cdn.steampowered.com is not among them: on some networks it lands on a
@@ -229,6 +238,11 @@ wait_for_game() {
         sleep 2; waited=$((waited + 2))
         [ $((waited % 60)) -eq 0 ] && echo "  waiting for the game to start ($((waited / 60)) min; Steam may be updating or signing in)"
         client_aborted "$log" "$offset" && { echo "  the Steam client stopped with an error"; return 1; }
+        # Steam waits on a notice its silent client cannot show (issues #16, #17): no use waiting out the 5 minutes
+        if [ $((waited % 10)) -eq 0 ] && console_since | grep -a -q "waiting for user response to ShowInterstitials"; then
+            echo "  Steam is waiting for an answer to a pre-launch notice, which its silent client cannot show"
+            return 4
+        fi
         # Steam restarts itself after an update: only a client gone for 20 s in a row counts
         if [ -z "$(client_pids)" ]; then gone=$((gone + 1)); else gone=0; fi
         [ "$gone" -ge 10 ] && [ "$waited" -gt 30 ] && { echo "  the Steam client stopped"; return 1; }
@@ -263,19 +277,36 @@ play_applaunch() {
     minutes="${MH_WAIT_MINUTES:-$minutes}"
     # a client kept for the second way runs on DXMT: the game would inherit it
     [ "$(cut -d' ' -f1 "$MARKER" 2>/dev/null)" = direct ] && stop_client && end_leftovers msync
+    local notices_handled=0
     while :; do
         attempt=$((attempt + 1)); start=$(date +%s)
         : >> "$GAME_LOG"; offset=$(mh_size "$GAME_LOG")
+        console_mark
         if [ -n "$(client_pids)" ]; then
             echo "== launch $attempt: asking the running Steam client"
             ( join_live_sync; "$ENGINE/bin/wine" "$STEAM_WIN" -applaunch "$APPID" >> "$LOGS/steam-forward.log" 2>&1 & )
         else
             echo "== launch $attempt: a silent Steam client (web views without GPU) starts the game. Steam output: $GAME_LOG"
+            # Steam's pre-launch notices ("controller recommended", Steam Input for a PlayStation pad...) wait for an
+            # answer this silent client cannot show, and the game never starts (issues #16, #17): recorded as seen first,
+            # while no client runs, as Steam records them once shown (Highball's SteamLaunchNotice).
+            [ -x "${MH_APP_BINARY:-}" ] && "$MH_APP_BINARY" --steam-notices-seen "$STEAM_DIR" "$APPID" 2>/dev/null | sed 's/^/  /'
             mark game msync
             ( cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" -silent -cef-disable-gpu -cef-disable-gpu-compositing \
                 -applaunch "$APPID" >> "$GAME_LOG" 2>&1 & )
         fi
         wait_for_game "$GAME_LOG" "$offset" "$minutes"; code=$?
+        if [ "$code" -eq 4 ] && [ "$notices_handled" -eq 0 ]; then
+            # Steam writes its settings back when it exits: stopped first, then the notices recorded as seen, then a
+            # cold start that reads them, as Steam does once a notice has been shown (Highball's SteamLaunchNotice)
+            notices_handled=1
+            echo "== recording Steam's pre-launch notices as seen, then starting Steam again"
+            stop_client
+            end_leftovers msync
+            [ -x "${MH_APP_BINARY:-}" ] && "$MH_APP_BINARY" --steam-notices-seen "$STEAM_DIR" "$APPID" 2>/dev/null | sed 's/^/  /'
+            sleep 2
+            continue
+        fi
         [ "$code" -eq 0 ] || return 1
         echo "== game started (through Steam). Quit it from its own menu; Steam stays open in the background."
         game_finished "$offset" "$start" "$attempt"
@@ -356,6 +387,9 @@ cmd_play() {
             # reason) before MetalHorizon starts the game itself, which gives the game no Steam ticket.
             echo "== Steam's last lines:"
             tail -c 6000 "$GAME_LOG" 2>/dev/null | grep -a -v '^[[:space:]]*$' | tail -12 | cut -c1-300 | sed 's/^/  | /'
+            # Steam's own account of the launch (its console log): the game's launch steps only, no account lines
+            echo "== Steam's own log about this launch (logs/console_log.txt):"
+            console_since | grep -a -E "AppID $APPID|LaunchApp|ShowInterstitials" | tail -15 | cut -c1-300 | sed 's/^/  | /'
             echo "== trying Steam once more, from a clean start"
             stop_client
             end_leftovers msync

@@ -1,0 +1,43 @@
+gameinput: every pad is reported to the game as an Xbox One controller (WINE_GAMEINPUT_REAL_IDS=1 keeps its own ids)
+
+MetalHorizon 1.0.4, issue #15. Every pad this backend reports reaches the game through XInput, in the Xbox layout.
+Reported with its own vendor (Sony, or a third-party maker), a pad was a HID-family device to the game, which then
+reads it the HID way, through raw reports this backend does not produce: Forza Horizon 6 showed a DualSense as
+connected and did nothing with it. Reported as an Xbox One controller (045e:02ea, family Xbox One), it is read as the
+gamepad it is to XInput. Its own name ("PlayStation Controller") stays.
+
+--- a/dlls/gameinput/gameinput.c	2026-11-20 13:14:38
++++ b/dlls/gameinput/gameinput.c	2026-11-20 13:14:38
+@@ -331,6 +331,14 @@
+ 
+ /* All the update functions are called with state_cs held. */
+ 
++/* WINE_GAMEINPUT_REAL_IDS=1: report each pad with its own vendor and product, as before MetalHorizon 1.0.4. */
++static BOOL real_ids(void)
++{
++    char value[4];
++    DWORD len = GetEnvironmentVariableA( "WINE_GAMEINPUT_REAL_IDS", value, sizeof(value) );
++    return len == 1 && value[0] == '1';
++}
++
+ static void update_pad( struct device *pad, uint64_t now )
+ {
+     XINPUT_CAPABILITIES_EX caps;
+@@ -348,6 +356,17 @@
+             version = caps.VersionNumber;
+         }
+         lstrcpynA( pad->name, pad_name( vid ), sizeof(pad->name) );
++        /* Every pad here reaches the game through XInput, in the Xbox layout. Reported with its own vendor, a
++         * PlayStation or third-party pad is a HID-family device to the game, which then reads it the HID way, through
++         * raw reports this backend does not produce, and gets nothing: Forza Horizon 6 showed a DualSense as connected
++         * and did nothing with it (MetalHorizon issue #15). So it is reported as what it is to the game, an Xbox One
++         * controller; its own name stays. */
++        if (vid != 0x045e && !real_ids())
++        {
++            TRACE( "pad %lu: %04x:%04x reported as an Xbox One controller\n", pad->slot, vid, pid );
++            vid = 0x045e;
++            pid = 0x02ea;
++        }
+         fill_device_info( pad, vid, pid, version );
+         pad->packet = ~0u;
+         TRACE( "pad %lu connected, %04x:%04x %s\n", pad->slot, vid, pid, pad->name );

@@ -1,5 +1,5 @@
 {
-  "note": "Everything Blackwell Engine Native 1.0 is built from, pinned. Order: extract wine, apply highball patches-arm64 (all, sorted), apply patches-arm64-xbox/0100, run engine/build-native.sh, then engine/package-native.sh with the three Highball archives below.",
+  "note": "Everything Blackwell Engine Native 1.2 is built from, pinned. Order: extract wine, apply highball patches-arm64 (all, sorted), apply patches-arm64-xbox/0100, 0101 and 0102, run engine/build-native.sh, then engine/package-native.sh with the three Highball archives below.",
   "wine": {
     "url": "https://dl.winehq.org/wine/source/11.x/wine-11.18.tar.xz",
     "sha256": "c6282f6d4daecf11f3ab9f9a2b6c598f67be7e28c363ba2cae8a3c44b611e7a4"
@@ -13,7 +13,9 @@
   },
   "blackwell-xbox-patch": {
     "file": "engine/patches-arm64-xbox/0100-blackwell-xbox-on-wine-11.18-arm64.patch",
-    "from": "engine/patches 0001, 0002, 0004, 0006 to 0009 and 0012, ported to Wine 11.18; 0003 (macOS %gs TEB slots) and 0005 (x86-64 exception traces) are x86-64 only and left out; 0008's concurrent_vector hunks are upstream in 11.18; its concurrent queue iterator (which Forza Horizon 6 calls: FHE01 without it, issue #14) is ported since Native 1.1"
+    "from": "engine/patches 0001, 0002, 0004, 0006 to 0009 and 0012, ported to Wine 11.18; 0003 (macOS %gs TEB slots) and 0005 (x86-64 exception traces) are x86-64 only and left out; 0008's concurrent_vector hunks are upstream in 11.18; its concurrent queue iterator (which Forza Horizon 6 calls: FHE01 without it, issue #14) is ported since Native 1.1",
+    "online": "engine/patches-arm64-xbox/0101-ntdll-dualstack-ipv4-options.patch since Native 1.2: prsloan's dual-stack socket fix from highball-engine pull request #40 (their arm64 0059, LGPL-2.1-or-later), so Forza Horizon 6 keeps its UDP game socket and joins online sessions (engine/patches/ORIGIN-online.md)",
+    "controllers": "engine/patches-arm64-xbox/0102-gameinput-xinput-pads-as-xbox.patch since Native 1.2: every pad GameInput reports through XInput is an Xbox One controller to the game (issue #15: a DualSense seen as connected that did nothing); WINE_GAMEINPUT_REAL_IDS=1 keeps their own ids"
   },
   "llvm-mingw": {
     "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz",
@@ -40,8 +42,8 @@
     "note": "Not in the bundle: MetalHorizon installs it from Highball's release and checks its signature (components.json, wineloader)."
   },
   "output": {
-    "file": "blackwell-engine-native-1.1.tar.xz",
-    "sha256": "23dc39dd2a6e7e0b4084f6a3381da5b1365e00f8804def1a8912439d844a204b",
-    "size": 259589544
+    "file": "blackwell-engine-native-1.2.tar.xz",
+    "sha256": "2e5a2c3f2cf26454bc9cb3e46f16016a2efa5c0afcd69e6f583746cedb57c928",
+    "size": 259568056
   }
 }
