@@ -60,6 +60,13 @@ case "$ACTION" in status) ;; *)
 esac
 mh_engine_env
 export WINEPREFIX="$PREFIX"
+# The Steam edition signs in to Xbox by itself, with its own sign-in library (a code at microsoft.com/link the first
+# time, kept in Windows' credential store after), as it does on a Windows PC without the Xbox app's Gaming Runtime.
+# The engine's xgameruntime is the Xbox edition's, whose sign-in is xodus-service: found by the Steam game, it took the
+# sign-in over with no service behind it, said someone was signed in and then had no Xbox token to give (E:0-0-L-8,
+# issues #9, #13, #16, #17, and the 20 November report). Highball's engine, where the Steam game signs in, has no
+# xgameruntime at all; here it is off for every program of the Steam prefix.
+export WINEDLLOVERRIDES="xgameruntime=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 mkdir -p "$LOGS" 2>/dev/null
 
 # --- processes of this prefix -------------------------------------------------------------------------------------

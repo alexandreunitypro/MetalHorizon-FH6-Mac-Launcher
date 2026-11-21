@@ -24,6 +24,15 @@ enum SettingKey {
     static let engineRoute = "metalhorizon.engineRoute"
     static let plainSync = "metalhorizon.plainSync"
     static let ownership = "metalhorizon.xboxOwnership"
+    static let engineChannel = "metalhorizon.engineChannel"
+}
+
+/// Which Blackwell Engine plays: the public one, or the beta (alpha) one the player opted into in Settings › Advanced.
+/// The beta engine installs beside the public one and is used only once it is installed; back on the public channel
+/// it is removed and the public engine plays again.
+enum EngineChannel: String, CaseIterable {
+    case stable = "public"
+    case beta
 }
 
 /// How the player has the Xbox / Microsoft Store edition: bought, or through a Game Pass subscription. Technically the
@@ -79,6 +88,8 @@ let installedEngineDirectory = supportDirectory.appendingPathComponent("Blackwel
 /// The Steam variant (engine/series-steam): the 32-bit half Steam needs, Highball's patches for a launcher's own
 /// window, and DXMT, the renderer Steam's window draws with.
 let installedSteamEngineDirectory = supportDirectory.appendingPathComponent("Blackwell Engine Steam").path
+let installedBetaEngineDirectory = supportDirectory.appendingPathComponent("Blackwell Engine Beta").path
+let installedSteamBetaEngineDirectory = supportDirectory.appendingPathComponent("Blackwell Engine Steam Beta").path
 let installedD3DMetalDirectory = supportDirectory.appendingPathComponent("D3DMetal").path
 /// The Steam edition's prefix: Steam and the game in one place. Its Windows path for the game,
 /// C:\Program Files (x86)\Steam\steamapps\common\ForzaHorizon6, is short whatever the Mac path is, which is what
@@ -109,6 +120,7 @@ struct Setup {
     var engineRoute = EngineRoute.automatic
     var plainSync = false           // Wine's plain synchronization instead of msync (the Autopilot sets it after an msync failure)
     var ownership = XboxOwnership.purchase
+    var engineChannel = EngineChannel.stable
 
     static func load() -> Setup {
         let defaults = settingsStore()
@@ -126,13 +138,23 @@ struct Setup {
         setup.engineRoute = EngineRoute(rawValue: defaults.string(forKey: SettingKey.engineRoute) ?? "") ?? .automatic
         setup.plainSync = defaults.bool(forKey: SettingKey.plainSync)
         setup.ownership = XboxOwnership(rawValue: defaults.string(forKey: SettingKey.ownership) ?? "") ?? .purchase
+        setup.engineChannel = EngineChannel(rawValue: defaults.string(forKey: SettingKey.engineChannel) ?? "") ?? .stable
         return setup
     }
 
-    /// Each edition has its engine; a manual override (engineDirectory) still wins.
+    /// Each edition has its engine; a manual override (engineDirectory) still wins. On the beta channel the edition's
+    /// beta engine plays once it is installed (until then, and if it goes missing, the public one does).
     var engine: String {
         if !engineDirectory.isEmpty { return engineDirectory }
+        if betaEngineInUse { return edition == .steam ? installedSteamBetaEngineDirectory : installedEngineBetaPath }
         return edition == .steam ? installedSteamEngineDirectory : installedEngineDirectory
+    }
+    private var installedEngineBetaPath: String { installedBetaEngineDirectory }
+    /// The beta component of this edition: "engine-beta" or "engine-steam-beta".
+    var betaComponentID: String { edition == .steam ? "engine-steam-beta" : "engine-beta" }
+    /// The beta channel is on, nothing overrides the engine, and the edition's beta engine is installed.
+    var betaEngineInUse: Bool {
+        engineChannel == .beta && engineDirectory.isEmpty && Component.named(betaComponentID)?.isInstalled == true
     }
     var d3dmetal: String { d3dmetalDirectory.isEmpty ? installedD3DMetalDirectory : d3dmetalDirectory }
     var steamPrefixPath: String { steamPrefix.isEmpty ? defaultSteamPrefix : steamPrefix }
@@ -353,7 +375,11 @@ struct Setup {
 
     /// The engine the next Play uses (RouteDecision), from this Mac, the choice in Settings and the last runs.
     func routeDecision(facts: MachineFacts = .current, health: RouteHealth = .load()) -> RouteDecision {
-        RouteDecision.decide(preference: engineRoute, edition: edition, facts: facts, health: health,
+        // The beta engine is the Rosetta line (D3DMetal) with the Blackwell Pacer: on Automatic it is what plays.
+        if betaEngineInUse && engineRoute == .automatic {
+            return RouteDecision(route: .d3dmetal, reason: "Beta engine: Rosetta with the Blackwell Pacer against the 10-second freezes.")
+        }
+        return RouteDecision.decide(preference: engineRoute, edition: edition, facts: facts, health: health,
                              nativeAvailable: (NativeEngine.filesPresent && NativeEngine.loaderPresent)
                                 || Component.named("engine-native") != nil)
     }
@@ -387,7 +413,10 @@ struct Setup {
             "MH_MAX_FPS": String(maxFPS),
             "MH_RETRIES": autoRetry ? "2" : "0",
             "MH_SYNC": plainSync ? "plain" : "msync",
-            "MH_LOGS": logDirectory.path
+            "MH_LOGS": logDirectory.path,
+            // the beta engine's pacer, in the game's process only (BW_PACER_EXE, forzahorizon6.exe by default); the
+            // public engine has none, and an empty value starts none
+            "BW_PACER": betaEngineInUse ? "auto" : ""
         ]
     }
 

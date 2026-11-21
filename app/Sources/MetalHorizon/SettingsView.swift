@@ -202,6 +202,12 @@ private struct AdvancedSettings: View {
     var body: some View {
         Form {
             Section {
+                Toggle("Beta engine (alpha)", isOn: Binding(get: { model.engineChannel == .beta },
+                                                           set: { model.chooseEngineChannel($0 ? .beta : .stable) }))
+                Text("Blackwell Engine Beta, beside the public one: the Blackwell Pacer against the freezes every ten seconds or so under Rosetta (it tunes itself to this Mac), and five of Highball's engine fixes. It plays on D3DMetal. Unfinished: turn it off and MetalHorizon removes it and plays the public engine again.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("Engine channel") }
+            Section {
                 Toggle("Relaunch the game by itself after a failed start", isOn: $model.autoRetry)
                 Toggle("Plain synchronization (instead of msync)", isOn: $model.plainSync)
                 Picker("Crash reports", selection: $model.crashReportMode) {

@@ -1,0 +1,78 @@
+Highball: msync, a multi-object wait that returns early takes its registration back (highball#224)
+
+msync_wait_multiple() registers the thread with the wineserver's msync thread for every object,
+then spins until the server has answered. If an object becomes available during the spin, it
+returned STATUS_PENDING after lowering the waiter counts, without telling the server. The server
+still processed the registration and, when nothing was signaled by then, kept the thread on each
+object's list. Nothing took it off again: the lowered counts mean a later signal does not message
+the server either, so an object that is never signaled (a quit event, say) grows by one node per
+lost race. On the server side, a registration that met a signaled object at index i unregistered
+objects 0..i-1 only when i > 1, so a wait on {quit, work} with work signaled leaked quit's node
+every time. After 524288 nodes the pool printed "msync: warn: node memory pool exhausted" on every
+further allocation and fell back to malloc, and the wineserver grew until the Mac ran out of memory.
+
+- client: the early return goes through server_remove_wait() like every other exit, which also
+  lowers the alert object's count that the old loop left raised.
+- server: unregister objects 0..i-1 whenever i > 0.
+- server: the pool warning prints once.
+
+Reproduced 2026-09-30 on an M4, macOS 27.0, with msyncleak.exe (a worker sets an auto-reset event
+in a loop while the main thread waits on {quit, work}): the pool runs out within seconds and the
+wineserver's RSS grows from 30 MB to 77 MB in 30 s on x64-crossover26.3-r12 (33 MB to 87 MB on
+Highball's Wine 10 engine, x64-sikarugir10.0_6-r15, same symptom). My Summer Car (highball#224)
+fills its log with the same warning over a long session.
+
+Upstream: msync is CrossOver's (and Sikarugir's) implementation, not WineHQ's.
+
+--- a/dlls/ntdll/unix/msync.c	2026-09-30 23:27:09
++++ b/dlls/ntdll/unix/msync.c	2026-09-30 23:27:09
+@@ -377,15 +377,14 @@
+     {
+         if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
+         {
+-            int i;
+-            for (i = 0; i < count; i++)
+-            {
+-                struct event *obj = (struct event *)objs_shm[i];
+-
+-                int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+-                if (refs < 0)
+-                    __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+-            }
++            /* The server still gets the registration sent above and, if nothing it waits
++             * for is signaled by then, keeps this thread on every object's list. Nothing
++             * took it off again, so each lost race leaked list nodes in the wineserver
++             * without bound (pool exhausted, then malloc per wait, gigabytes after hours
++             * of a game that waits on several objects in a hot loop). Unregister like
++             * every other exit does; this also drops the alert object's waiter count,
++             * which the loop here used to leave raised. */
++            server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+             return STATUS_PENDING;
+         }
+     }
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -177,7 +177,13 @@
+ {
+     if (pool->count == 0)
+     {
+-        fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
++        static int warned;
++        /* Once: it used to print on every allocation past the pool, millions of lines. */
++        if (!warned)
++        {
++            warned = 1;
++            fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
++        }
+         return malloc( sizeof(struct tid_node) );
+     }
+     return pool->free_nodes[--pool->count];
+@@ -508,7 +514,7 @@
+             val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
+             if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
+             {
+-                if (i > 1) unregister_wait( &receive_message, tid, i );
++                if (i > 0) unregister_wait( &receive_message, tid, i );  /* objects 0..i-1 were added above */
+                 wake_tid( tid );
+                 break;
+             }

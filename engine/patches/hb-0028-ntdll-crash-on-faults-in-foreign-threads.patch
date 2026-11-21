@@ -1,0 +1,92 @@
+A fault on a thread Wine didn't create ends the program instead of hanging it.
+
+Apple's libdispatch workers run Metal and D3DMetal code inside the game's
+process, on threads without a TEB. When such a thread faults, segv_handler
+(and trap_handler, fpe_handler) runs on it, and save_context reads the TEB's
+copy of the debug registers first: it faults at 0x2f0 while SIGSEGV is still
+blocked, macOS retries that fault forever, and the faulting thread spins while
+the rest of the process carries on with no frame drawn. GravityMark 1.89
+-direct3d12 on D3DMetal 4.0 beta 3 (macOS 27, M2 Max) hangs this way from about
+155,500 asteroids up: the first fault is a NULL read at 0x14 in
+-[AGXG14XFamilyResidencySet _commitAddedAllocations:count:removedAllocations:count:]
+under D3DMetal's command replayer (Apple's bug, reported separately; #23).
+
+On macOS each handler now checks NtCurrentTeb() first. Without a TEB it puts
+the signal back to its default action and returns: the faulting load runs
+again and the process ends with SIGSEGV (a trap, which isn't retried, is raised
+again; SIGFPE likewise), so the crash report names the real fault. A fault Wine
+handles on a thread with a TEB takes the same path as before.
+
+Checked on an M2 Max with the r29 ntdll.so rebuilt with this patch:
+GravityMark -direct3d12 at 200,000 asteroids exits with SIGSEGV after 7 s
+instead of hanging; -direct3d11 scores the same as before (9,594 against
+9,653-9,731). Not sent upstream.
+
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2506,6 +2506,32 @@ static inline BOOL check_invalid_gsbase( ucontext_t *ucontext )
+ }
+ 
+ 
++#ifdef __APPLE__
++/**********************************************************************
++ *		foreign_thread_fault
++ *
++ * A fault on a thread Wine didn't create, which has no TEB: Apple's libdispatch workers running
++ * Metal and D3DMetal code are such threads. The handlers below read the TEB right away, fault
++ * again and re-enter themselves forever, so the program hangs at 100% CPU instead of crashing.
++ * Put the signal back to its default action instead: a fault happens again when the faulting
++ * instruction is retried (a trap, which isn't retried, is raised again), and the process crashes
++ * with a crash report that names the real fault.
++ */
++static BOOL foreign_thread_fault( int sig, BOOL retried )
++{
++    struct sigaction sa;
++
++    if (NtCurrentTeb()) return FALSE;
++    memset( &sa, 0, sizeof(sa) );
++    sa.sa_handler = SIG_DFL;
++    sigemptyset( &sa.sa_mask );
++    sigaction( sig, &sa, NULL );
++    if (!retried) raise( sig );  /* blocked while this handler runs: delivered when it returns */
++    return TRUE;
++}
++#endif
++
++
+ /**********************************************************************
+  *		segv_handler
+  *
+@@ -2517,6 +2543,10 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     EXCEPTION_RECORD rec = { 0 };
+     struct xcontext context;
+ 
++#ifdef __APPLE__
++    if (foreign_thread_fault( signal, TRUE )) return;
++#endif
++
+     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+     save_context( &context, ucontext );
+ 
+@@ -2613,6 +2643,10 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     EXCEPTION_RECORD rec = { 0 };
+     struct xcontext context;
+ 
++#ifdef __APPLE__
++    if (foreign_thread_fault( signal, FALSE )) return;
++#endif
++
+     if (handle_syscall_trap( ucontext, siginfo )) return;
+ 
+     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+@@ -2647,6 +2681,10 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(ucontext) };
+     struct xcontext context;
+ 
++#ifdef __APPLE__
++    if (foreign_thread_fault( signal, TRUE )) return;
++#endif
++
+     save_context( &context, sigcontext );
+ 
+     switch (siginfo->si_code)

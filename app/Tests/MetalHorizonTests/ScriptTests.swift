@@ -120,6 +120,8 @@ final class ScriptTests: XCTestCase {
         XCTAssertTrue(out.contains("CX_GRAPHICS_BACKEND=\"d3dmetal\""), out)
         XCTAssertTrue(out.contains("WINE_GAMEINPUT=\"1\""), out)
         XCTAssertTrue(out.contains("gameoverlayrenderer64,gameoverlayrenderer=d"), out)
+        // the Steam game signs in to Xbox itself: the Xbox edition's runtime stays out of its way (E:0-0-L-8)
+        XCTAssertTrue(out.contains("xgameruntime=d"), out)
         (code, out) = try run("metalhorizon-steam.sh", ["status"], env: env)
         status = SteamStatus.parse(out)
         XCTAssertTrue(out.contains("steam_installed=yes") && out.contains("game_installed=yes") && out.contains("game_build=26422872"), out)

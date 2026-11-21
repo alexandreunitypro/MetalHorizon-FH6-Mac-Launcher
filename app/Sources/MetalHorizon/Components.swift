@@ -26,7 +26,9 @@ struct Component: Decodable {
     }
 
     static func all() -> [Component] {
-        guard let url = Bundle.main.url(forResource: "components", withExtension: "json"),
+        // MH_COMPONENTS_JSON: another list (the tests read the repository's)
+        let override = ProcessInfo.processInfo.environment["MH_COMPONENTS_JSON"].map { URL(fileURLWithPath: $0) }
+        guard let url = override ?? Bundle.main.url(forResource: "components", withExtension: "json"),
               let data = try? Data(contentsOf: url),
               let list = try? JSONDecoder().decode([String: [Component]].self, from: data)["components"] else { return [] }
         return list

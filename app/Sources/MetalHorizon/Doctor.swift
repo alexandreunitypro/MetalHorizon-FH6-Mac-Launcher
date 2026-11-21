@@ -858,4 +858,10 @@ extension Component {
                        supportDirectory.appendingPathComponent(".\(folder).metalhorizon-component.json").path]
         for m in markers { try? FileManager.default.removeItem(atPath: m) }
     }
+
+    /// The component's folder and install record, gone (MetalHorizon's own files only, such as a beta engine).
+    func remove() {
+        forget()
+        if fileExists(destination) { try? FileManager.default.removeItem(atPath: destination) }
+    }
 }

@@ -1,0 +1,42 @@
+# The Steam variant of Blackwell Engine: the same 9 patches as `series`, plus two of Highball's own patches
+# (copied verbatim from https://github.com/gauthierpiarrette/highball-engine/tree/main/patches,
+# Gauthier Piarrette, LGPL-2.1-or-later — see patches/ORIGIN-steam.md), needed for a launcher's own window
+# (here, the Steam client) to draw instead of staying black:
+#   0010 (their 0006) lets a per-exe command line be appended from the registry (launcher browser switches).
+#   0011 (their 0007) fixes a Steam/Rockstar/Ubisoft launcher's sign-in browser window and its own main window
+#        drawing black (Wine bug 60263: a child window whose swap chain belongs to another process).
+# Verified 2026-10-31 to apply with no conflict on top of 0001-0009 (patch -p1 --dry-run, clean).
+# Built with --series series-steam into a separate work folder (engine/build.sh --series series-steam <work>).
+0001-xgameruntime.patch
+0002-kernelbase-app-packages.patch
+0003-macos-teb-slots.patch
+0004-ntdll-msixvc-images-memory.patch
+0005-ntdll-exceptions.patch
+0006-network.patch
+0007-audio-surround.patch
+0008-misc.patch
+0009-diag-msgbox.patch
+0010-kernelbase-per-exe-command-line-append.patch
+0011-winemac-cross-process-child-swapchains.patch
+# GameInput (controllers in GDK games) on top of XInput; off unless WINE_GAMEINPUT=1. Source: src/gameinput/.
+0012-gameinput-xinput-backend.patch
+# Online play (Forza Horizon 6, since engine 1.2): the IPv4 options the game sets on its IPv6 game socket before
+# matchmaking, which macOS refuses, are set as their IPv6 counterparts. prsloan's fix from highball-engine pull
+# request #40 (their 0034), LGPL-2.1-or-later: see patches/ORIGIN-online.md.
+0014-ntdll-dualstack-ipv4-options.patch
+# Controllers (since engine 1.2): every pad GameInput reports through XInput is an Xbox One controller to the game, so
+# a PlayStation or third-party pad is read as a gamepad, not as a HID device (issue #15). WINE_GAMEINPUT_REAL_IDS=1
+# keeps their own ids.
+0015-gameinput-xinput-pads-as-xbox.patch
+# The 32-bit half: 0005's FH6 diagnostics read x86_64 registers, kept to the 64-bit build.
+0013-i386-build-guards.patch
+# --- Beta (alpha) engine: only in MetalHorizon beta mode, never installed for the public channel ---
+# Highball's Rosetta-line patches not in the public engine (copied verbatim from
+# https://github.com/gauthierpiarrette/highball-engine/tree/main/patches, LGPL-2.1-or-later; see patches/ORIGIN-beta.md)
+hb-0005-ntdll-yield-after-auto-event-set.patch
+hb-0014-msync-unregister-early-return.patch
+hb-0015-winecoreaudio-io-buffer-under-half-a-period.patch
+hb-0025-ntdll-threadpool-io-release-once.patch
+hb-0028-ntdll-crash-on-faults-in-foreign-threads.patch
+# Blackwell Pacer: Rosetta's translator stops kept short (BW_PACER=auto), engine/src/pacer/bw_pacer.h
+0016-ntdll-blackwell-pacer.patch

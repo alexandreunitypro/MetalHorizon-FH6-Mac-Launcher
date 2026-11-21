@@ -1,0 +1,36 @@
+# MetalHorizon engine: patch series, applied in this order with `patch -p1` to sources/wine of the
+# tarball pinned in engine/inputs.json. Paths are relative to engine/patches/. A line starting with # is
+# skipped. 0001-0009 are generated from the tree the working engine was built from
+# (engine/make-series.py) and reproduce it exactly (engine/verify-series.sh).
+0001-xgameruntime.patch
+0002-kernelbase-app-packages.patch
+0003-macos-teb-slots.patch
+0004-ntdll-msixvc-images-memory.patch
+0005-ntdll-exceptions.patch
+0006-network.patch
+0007-audio-surround.patch
+0008-misc.patch
+0009-diag-msgbox.patch
+# GameInput (controllers in GDK games) on top of XInput; off unless WINE_GAMEINPUT=1. Source: src/gameinput/.
+0012-gameinput-xinput-backend.patch
+# Online play (Forza Horizon 6, since engine 1.2): the IPv4 options the game sets on its IPv6 game socket before
+# matchmaking, which macOS refuses, are set as their IPv6 counterparts. prsloan's fix from highball-engine pull
+# request #40 (their 0034), LGPL-2.1-or-later: see patches/ORIGIN-online.md.
+0014-ntdll-dualstack-ipv4-options.patch
+# Controllers (since engine 1.2): every pad GameInput reports through XInput is an Xbox One controller to the game, so
+# a PlayStation or third-party pad is read as a gamepad, not as a HID device (issue #15). WINE_GAMEINPUT_REAL_IDS=1
+# keeps their own ids.
+0015-gameinput-xinput-pads-as-xbox.patch
+# Highball 0025 (closing async I/O no longer crashes) is NOT in the engine that runs the game today: only
+# its test half reached the dev tree. Turn it on after an in-game test.
+# ../../tools/forza-patches/0025-ntdll-threadpool-io-release-once.patch
+# --- Beta (alpha) engine: only in MetalHorizon beta mode, never installed for the public channel ---
+# Highball's Rosetta-line patches not in the public engine (copied verbatim from
+# https://github.com/gauthierpiarrette/highball-engine/tree/main/patches, LGPL-2.1-or-later; see patches/ORIGIN-beta.md)
+hb-0005-ntdll-yield-after-auto-event-set.patch
+hb-0014-msync-unregister-early-return.patch
+hb-0015-winecoreaudio-io-buffer-under-half-a-period.patch
+hb-0025-ntdll-threadpool-io-release-once.patch
+hb-0028-ntdll-crash-on-faults-in-foreign-threads.patch
+# Blackwell Pacer: Rosetta's translator stops kept short (BW_PACER=auto), engine/src/pacer/bw_pacer.h
+0016-ntdll-blackwell-pacer.patch

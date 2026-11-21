@@ -216,6 +216,8 @@ final class LauncherModel: ObservableObject {
     @Published var ownership = XboxOwnership.purchase {
         didSet { settingsStore().set(ownership.rawValue, forKey: SettingKey.ownership) }
     }
+    /// Public or beta (alpha) Blackwell Engine: changed only through chooseEngineChannel, which installs or removes.
+    @Published private(set) var engineChannel = EngineChannel.stable
     @Published var plainSync = false {
         didSet { settingsStore().set(plainSync, forKey: SettingKey.plainSync) }
     }
@@ -303,6 +305,7 @@ final class LauncherModel: ObservableObject {
         autoRetry = saved.autoRetry
         engineRoute = saved.engineRoute
         plainSync = saved.plainSync
+        engineChannel = saved.engineChannel
         ownership = saved.ownership
         loginObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
@@ -374,7 +377,7 @@ final class LauncherModel: ObservableObject {
         Setup(edition: edition, gameDirectory: gameDirectory, steamPrefix: steamPrefix, engineDirectory: engineDirectory,
               d3dmetalDirectory: d3dmetalDirectory, metalHUD: metalHUD, controllerMode: controllerMode,
               metalFX: metalFX, maxFPS: maxFPS, autoRetry: autoRetry, engineRoute: engineRoute, plainSync: plainSync,
-              ownership: ownership)
+              ownership: ownership, engineChannel: engineChannel)
     }
     var isBusy: Bool { activity != .idle }
     var canDownload: Bool { !isBusy && !gameDirectory.isEmpty && edition == .xbox }
@@ -609,16 +612,47 @@ final class LauncherModel: ObservableObject {
     /// Installs what the edition is missing (its Blackwell Engine, then D3DMetal once Apple's licence is accepted, and
     /// on a Mac that can run it the native engine with Highball's signed loader) and assembles the shim from that
     /// engine. D3DMetal is always installed: it is what the game falls back to.
+    /// Switches between the public and the beta (alpha) engine: saved, then installed or removed at once.
+    func chooseEngineChannel(_ channel: EngineChannel) {
+        guard channel != engineChannel else { return }
+        engineChannel = channel
+        settingsStore().set(channel.rawValue, forKey: SettingKey.engineChannel)
+        RepairLog.record(Repair(title: channel == .beta ? "Beta engine chosen" : "Public engine chosen",
+                                detail: channel == .beta
+                                    ? "Blackwell Engine Beta installs beside the public engine and plays once it is installed (the Blackwell Pacer, Highball's engine fixes). Unfinished: back on Public, it is removed."
+                                    : "The beta engine is removed; the public Blackwell Engine plays.",
+                                kind: .reconfigured))
+        recentRepairs = RepairLog.recent()
+        Task { await installComponents() }
+    }
+
+    /// The beta engines' folders and markers, gone. Only MetalHorizon's own components: nothing of the player's.
+    private func removeBetaEngines() {
+        for id in ["engine-beta", "engine-steam-beta"] {
+            guard let component = Component.named(id) else { continue }
+            let present = fileExists(component.destination)
+            component.remove()
+            if present {
+                RepairLog.record(Repair(title: "\(component.name) removed", detail: "Back on the public channel: the public Blackwell Engine plays.", kind: .reconfigured))
+            }
+        }
+    }
+
     func installComponents() async {
         guard !isBusy else { return }
         let steam = edition == .steam
         let native = wantsNative
-        let order = ["engine": 0, "engine-steam": 0, "d3dmetal": 1, "wineloader": 2, "engine-native": 3]
+        let order = ["engine": 0, "engine-steam": 0, "engine-beta": 1, "engine-steam-beta": 1, "d3dmetal": 2, "wineloader": 3, "engine-native": 4]
+        let beta = engineChannel == .beta
+        // back on the public channel: the beta engines go, the public engine (always kept installed) plays again
+        if !beta { removeBetaEngines() }
         let missing = Component.all().filter { component in
             guard !component.isInstalled else { return false }
             switch component.id {
             case "engine": return !steam && engineDirectory.isEmpty
             case "engine-steam": return steam && engineDirectory.isEmpty
+            case "engine-beta": return beta && !steam && engineDirectory.isEmpty
+            case "engine-steam-beta": return beta && steam && engineDirectory.isEmpty
             case "d3dmetal": return d3dmetalDirectory.isEmpty
             case "wineloader", "engine-native": return native
             default: return false

@@ -1,0 +1,58 @@
+Highball: winecoreaudio, each pull from the device stays under half a period (highball#127)
+
+The HAL output unit asks Wine's render callback for its whole I/O buffer at once, 512 frames by
+default, which at 48 kHz is 10.7 ms. A shared-mode client is woken every 10 ms period, and a game
+that keeps about one period queued then had less than the device asked for at most pulls; the
+callback played the rest as silence. Counter-Strike 2's menu music on an M4 at 48 kHz: 324 dropouts
+of about 8 ms in two minutes, none with the output set to 96 kHz, where the same 512 frames last
+5.3 ms (measured 2026-10-01 with a raw capture, engine r17). That is the community fix (Audio MIDI
+Setup, 88.2 or 96 kHz), which Bluetooth headphones and most monitors cannot use.
+
+Before the unit is initialized, a render stream now sets the unit's I/O buffer to half its period
+at the device's rate (240 frames at 48 kHz), when the current buffer is larger. The buffer size is
+per process, so other apps keep theirs, and a failure only logs.
+
+Trial result 2026-10-01 (run 36806082052, build engine-wine-11.0-20261001T024555Z-0015-coreaudio-trial):
+on an M4 at 48 kHz, Counter-Strike 2's menu music over the same 95 s had 20 dropouts on r12 and none
+with this build's winecoreaudio.so laid over r12 (nothing else changed); no failure warning from the
+new call. The same cap applied from outside Wine (an AudioUnitInitialize interposer) took the
+Sikarugir default engine from 324 dropouts in two minutes to none. The Half-Life 2 demo had none to
+begin with: the fault needs a game that keeps little queued.
+
+Upstream: not reported yet.
+
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -791,6 +791,32 @@
+         if (authstatus == 0)
+             ERR_(winediag)("Microphone/audio capture permission was denied. "
+                            "This can be enabled under Security & Privacy in System Preferences.\n");
++    }
++
++    if(stream->flow == eRender){
++        /* Highball: keep each pull from the device under half a period. The device asks for
++         * its whole I/O buffer at once, 512 frames by default, which at 48 kHz is 10.7 ms,
++         * longer than the 10 ms period a shared-mode client is woken for. A game that keeps
++         * about one period queued (Counter-Strike 2) then had too little at most pulls, and
++         * the rest of the pull was played as silence: 324 dropouts of about 8 ms in two minutes
++         * of its menu music on an M4 at 48 kHz, none at 96 kHz where the same 512 frames last
++         * 5.3 ms (highball#127). The buffer size is per process, so other apps keep theirs. */
++        AudioStreamBasicDescription hw;
++        UInt32 hw_size = sizeof(hw), cur = 0, cur_size = sizeof(cur), frames;
++        if(AudioUnitGetProperty(stream->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0,
++                                &hw, &hw_size) == noErr && hw.mSampleRate > 0 &&
++           AudioUnitGetProperty(stream->unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0,
++                                &cur, &cur_size) == noErr){
++            frames = muldiv(stream->period / 2, (int)hw.mSampleRate, 10000000);
++            if(frames > 0 && cur > frames){
++                sc = AudioUnitSetProperty(stream->unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0,
++                                          &frames, sizeof(frames));
++                if(sc != noErr)
++                    WARN("Couldn't set the I/O buffer to %u frames: %x\n", (unsigned)frames, (int)sc);
++                else
++                    TRACE("I/O buffer %u -> %u frames at %u Hz\n", (unsigned)cur, (unsigned)frames, (unsigned)hw.mSampleRate);
++            }
++        }
+     }
+ 
+     sc = AudioUnitInitialize(stream->unit);

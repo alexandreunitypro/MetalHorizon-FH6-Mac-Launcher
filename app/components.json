@@ -51,6 +51,26 @@
       "size": 259568056,
       "folder": "Blackwell Engine Native",
       "root": "Blackwell Engine Native"
+    },
+    {
+      "id": "engine-beta",
+      "name": "Blackwell Engine Beta",
+      "version": "beta-1.3a1",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-beta-1.3a1/blackwell-engine-beta-1.3a1.tar.xz",
+      "sha256": "32f50c76b6c92d8766b5b465fb0cab6a85f38c6e8d055c69e1f13529ef165464",
+      "size": 103920220,
+      "folder": "Blackwell Engine Beta",
+      "root": "Blackwell Engine"
+    },
+    {
+      "id": "engine-steam-beta",
+      "name": "Blackwell Engine Steam Beta",
+      "version": "steam-beta-1.3a1",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-beta-1.3a1/blackwell-engine-steam-beta-1.3a1.tar.xz",
+      "sha256": "b2e5c3ca9dbbc758ed935d5cf57e11ab9c915098724cff42e8cf43bd2d1e01b6",
+      "size": 91545436,
+      "folder": "Blackwell Engine Steam Beta",
+      "root": "Blackwell Engine"
     }
   ]
 }
