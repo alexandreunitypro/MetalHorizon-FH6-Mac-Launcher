@@ -1,6 +1,10 @@
 # MetalHorizon – FH6 Mac Launcher – The world most advanced launcher and translator tools to run Forza horizon 6 on Mac 
 
 **Run your own copy of Forza Horizon 6 on an Apple Silicon Mac: Xbox / Microsoft Store AND STEAM!**
+
+**I am committed to patching as many bugs as possible and resolving as many issues as I can; please report them in the "issues" section, and I will release a fix within 24 hours.**
+
+
 Blackwell Engine (Wine) + xodus or Steam + Apple's D3DMetal, open source, no CrossOver, no DRM bypass.
 The best tool in the world to run Forza Horizon 6 on a Mac: the most stable solution, offering exclusive features like multiplayer and significantly better graphics and work with Xbox copy of the game even game pass!.
 
