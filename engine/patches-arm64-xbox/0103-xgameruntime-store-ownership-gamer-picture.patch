@@ -1,0 +1,504 @@
+xgameruntime: the add-ons the player owns, their licences, and the gamer picture (MetalHorizon 1.1.1, issue #18)
+
+Forza Horizon 6 priced add-ons the player had bought, saw no VIP membership, and showed a grey profile picture:
+nothing was ever owned here, and the picture was a neutral square. With MetalHorizon's xodus-service 1.1.1:
+- Store catalog protocol 2 (CSDX): the request carries flags (1: what the account owns, only) and the answer the
+  products of it the account owns, from the Store's collections resolved against the catalog (editions and bundles
+  count with what they contain). Those products and their SKUs come back in the user's collection (quantity 1).
+- XStoreQueryEntitledProductsAsync asks for the game and the add-ons the account owns; XStoreQueryAddOnLicensesAsync
+  answers their licences ("<Store ID>/<SKU>", the developer's offer token, active, no end).
+- XUserGetGamerPictureAsync asks the service for the account's own picture (GSDX frames: the profile's
+  GameDisplayPicRaw, as a PNG of the size asked), on a thread of ours.
+Whenever the service cannot answer (none, an older one, Microsoft unreachable), the game gets what it got before:
+the game alone among the entitled products, no add-on licence, the grey picture, and never an error.
+Tested without the game: engine/tests/store-ownership.
+
+--- a/dlls/xgameruntime/unixlib.h
++++ b/dlls/xgameruntime/unixlib.h
+@@ -84,6 +84,16 @@
+ };
+ 
+ #define XGR_CATALOG_MAX (8 * 1024 * 1024)
++/* The player's gamer picture (GSDX frames, MetalHorizon's xodus-service): a PNG of `pixels` a side from the Xbox
++ * profile, in `buffer` (XGR_PICTURE_MAX bytes); `size` 0 when there is none. */
++#define XGR_PICTURE_MAX (4 * 1024 * 1024)
++struct gamer_picture_params
++{
++    UINT32 pixels;
++    void *buffer;
++    ULONG size;
++};
++
+ struct store_catalog_params
+ {
+     const void *request;
+@@ -115,6 +125,7 @@
+     unix_store_catalog,
+     unix_account_roles,
+     unix_store_entitlement,
++    unix_gamer_picture,
+     unix_funcs_count,
+ };
+ 
+--- a/dlls/xgameruntime/unixlib.c
++++ b/dlls/xgameruntime/unixlib.c
+@@ -588,6 +588,33 @@
+     status = STATUS_SUCCESS;
+ done:
+     close(fd);
++    return status;
++}
++
++/* GSDX: the gamer picture the service fetched from the player's Xbox profile, a PNG; status 1 means none. */
++static NTSTATUS gamer_picture( void *args )
++{
++    struct gamer_picture_params *params = args;
++    UINT32 request[3] = { 0x58445347, 1, 0 }, answer[3];
++    long long deadline = license_now_ms() + 30000;
++    NTSTATUS status = STATUS_UNSUCCESSFUL;
++    int fd;
++
++    params->size = 0;
++    if (!params->buffer) return STATUS_INVALID_PARAMETER;
++    request[2] = params->pixels;
++    if ((fd = connect_service( deadline )) < 0) return io_status( STATUS_NOT_FOUND );
++    errno = 0;
++    if (!license_io( fd, request, sizeof(request), TRUE, deadline ) ||
++        !license_io( fd, answer, sizeof(answer), FALSE, deadline ))
++    { status = io_status( STATUS_UNSUCCESSFUL ); goto done; }
++    if (answer[0] != 0x58445347 || answer[1] != 0 || !answer[2] || answer[2] > XGR_PICTURE_MAX) goto done;
++    if (!license_io( fd, params->buffer, answer[2], FALSE, deadline ))
++    { status = io_status( STATUS_UNSUCCESSFUL ); goto done; }
++    params->size = answer[2];
++    status = STATUS_SUCCESS;
++done:
++    close( fd );
+     return status;
+ }
+ 
+@@ -598,6 +625,7 @@
+     store_catalog,
+     account_roles,
+     store_entitlement,
++    gamer_picture,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+--- a/dlls/xgameruntime/xstore.c
++++ b/dlls/xgameruntime/xstore.c
+@@ -235,6 +235,32 @@
+             image->width = catalog_read_u32( &r ); image->height = catalog_read_u32( &r );
+         }
+     }
++    /* Protocol 2: the products of the answer the account owns, by Store ID, from the Store's collections. Before
++     * MetalHorizon 1.1.1 nothing was ever owned here, and Forza Horizon 6 priced the add-ons a player had bought
++     * and saw no VIP membership (issue #18). */
++    if (r.valid && r.p != r.end)
++    {
++        UINT32 owned = catalog_read_u32( &r );
++        if (!r.valid || owned > count) goto malformed;
++        for (i = 0; i < owned && r.valid; i++)
++        {
++            const char *id = catalog_read_text( &r, s );
++            for (j = 0; id && j < count; j++)
++            {
++                XStoreProduct *p = s->products + j;
++                if (!p->storeId || _stricmp( p->storeId, id )) continue;
++                p->isInUserCollection = TRUE;
++                /* owned as a durable is: one, with no end (31 December 9999) */
++                for (k = 0; k < p->skusCount; k++)
++                {
++                    p->skus[k].isInUserCollection = TRUE;
++                    p->skus[k].collectionData.quantity = 1;
++                    p->skus[k].collectionData.endDate = (time_t)253402300799;
++                }
++            }
++        }
++        TRACE_(storetrace)( "catalog snapshot: %u of the products owned.\n", owned );
++    }
+     if (!r.valid || r.p != r.end) goto malformed;
+     if (!(q = calloc( 1, sizeof(*q) ))) goto oom;
+     q->catalog = s; q->page_size = page_size; *result = q;
+@@ -246,18 +272,51 @@
+     store_catalog_release( s ); return E_FAIL;
+ }
+ 
++/* Catalog request flag (protocol 2): what the account owns, only. */
++#define CATALOG_OWNED_ONLY 1
+ struct catalog_operation
+ {
+     struct store_catalog_params ipc;
+     unsigned char request[24000];
+     struct x_store_product_query *result;
+     UINT32 page_size;
++    BOOL addons;                        /* XStoreQueryAddOnLicensesAsync: the answer is the owned add-ons' licences */
++    BOOL with_game;                     /* the game's own kind was asked for */
++    UINT32 flags;
++    XStoreAddonLicense *licenses;
++    UINT32 license_count;
+ };
+ static void catalog_operation_free( struct catalog_operation *op )
+ {
+     if (op->result) { store_catalog_release( op->result->catalog ); free( op->result ); }
+-    free( op->ipc.response ); free( op );
++    free( op->licenses ); free( op->ipc.response ); free( op );
++}
++/* The owned add-ons of a snapshot as XStoreAddonLicense records: "<Store ID>/<SKU>", the developer's offer token,
++ * active, and no end (a durable add-on is owned for good: 31 December 9999). */
++static HRESULT catalog_licenses( struct catalog_operation *op )
++{
++    struct store_catalog_snapshot *s = op->result ? op->result->catalog : NULL;
++    UINT32 i, n = 0;
++
++    if (!s || !s->count) return S_OK;
++    if (!(op->licenses = calloc( s->count, sizeof(*op->licenses) ))) return E_OUTOFMEMORY;
++    for (i = 0; i < s->count; i++)
++    {
++        const XStoreProduct *p = s->products + i;
++        XStoreAddonLicense *l = op->licenses + n;
++        if (!p->isInUserCollection || p->productKind == XStoreProductKind_Game || !p->storeId) continue;
++        snprintf( l->skuStoreId, sizeof(l->skuStoreId), "%s/%s", p->storeId,
++                  p->skusCount && p->skus[0].skuId && *p->skus[0].skuId ? p->skus[0].skuId : "0010" );
++        lstrcpynA( l->inAppOfferToken, p->inAppOfferToken ? p->inAppOfferToken : "", sizeof(l->inAppOfferToken) );
++        l->isActive = TRUE;
++        l->expirationDate = (time_t)253402300799;
++        TRACE_(storetrace)( "owned add-on %s (offer %s).\n", l->skuStoreId, debugstr_a(l->inAppOfferToken) );
++        n++;
++    }
++    op->license_count = n;
++    return S_OK;
+ }
++
+ static HRESULT CALLBACK catalog_provider( XAsyncOp operation, const XAsyncProviderData *data )
+ {
+     struct catalog_operation *op = data->context;
+@@ -272,9 +331,40 @@
+         hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) : status ? E_FAIL :
+              catalog_decode( op->ipc.response, op->ipc.response_size, op->page_size, &op->result );
+         TRACE_(storetrace)( "catalog operation completed: hr %#lx.\n", hr );
++        /* What the account owns is never worth a failure the game did not get before: without the Store, no
++         * add-ons, and the entitled products are the running game alone, as they were. */
++        if (op->addons)
++        {
++            if (SUCCEEDED(hr)) hr = catalog_licenses( op );
++            if (FAILED(hr))
++            {
++                WARN( "the owned add-ons could not be listed (%#lx); answering none.\n", hr );
++                op->license_count = 0;
++                hr = S_OK;
++            }
++            IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr,
++                                            op->license_count * sizeof(XStoreAddonLicense) );
++            return E_PENDING;
++        }
++        if (FAILED(hr) && (op->flags & CATALOG_OWNED_ONLY))
++        {
++            struct x_store_product_query *q = calloc( 1, sizeof(*q) );
++            WARN( "the owned products could not be listed (%#lx); answering the game alone.\n", hr );
++            if (q)
++            {
++                if ((q->has_current = op->with_game)) init_current_product( q );
++                op->result = q;
++                hr = S_OK;
++            }
++        }
+         IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr, SUCCEEDED(hr) ? sizeof(op->result) : 0 );
+         return E_PENDING;
+     case XAsyncOp_GetResult:
++        if (op->addons)
++        {
++            memcpy( data->buffer, op->licenses, op->license_count * sizeof(XStoreAddonLicense) );
++            return S_OK;
++        }
+         memcpy( data->buffer, &op->result, sizeof(op->result) ); op->result = NULL; return S_OK;
+     case XAsyncOp_Cleanup:
+         catalog_operation_free( op ); return S_OK;
+@@ -306,9 +396,11 @@
+         if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z'))) return FALSE;
+     return TRUE;
+ }
++/* `flags` (protocol 2): CATALOG_OWNED_ONLY asks for what the account owns only. `addons`: the answer is licences. */
+ static HRESULT catalog_begin( const char *parent, XStoreProductKind kinds, BOOL associated,
+                               UINT32 page_size, const char **ids, SIZE_T count,
+-                              const char **actions, SIZE_T action_count, XAsyncBlock *async )
++                              const char **actions, SIZE_T action_count, XAsyncBlock *async,
++                              UINT32 flags, BOOL addons )
+ {
+     struct catalog_operation *op;
+     WCHAR locale_w[LOCALE_NAME_MAX_LENGTH], market_w[8];
+@@ -320,12 +412,13 @@
+     for (i = 0; i < count; i++) if (!catalog_valid_id(ids[i])) return E_INVALIDARG;
+     for (i = 0; i < action_count; i++) if (!actions[i]) return E_INVALIDARG;
+     if (!(op = calloc(1,sizeof(*op)))) return E_OUTOFMEMORY;
+-    op->page_size = page_size; op->ipc.request = op->request;
++    op->page_size = page_size; op->ipc.request = op->request; op->addons = addons;
++    op->flags = flags; op->with_game = !!(kinds & XStoreProductKind_Game);
+     if (GetUserDefaultLocaleName(locale_w,ARRAY_SIZE(locale_w)))
+         WideCharToMultiByte(CP_UTF8,0,locale_w,-1,locale,sizeof(locale),NULL,NULL);
+     if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT,LOCALE_SISO3166CTRYNAME,market_w,ARRAY_SIZE(market_w)))
+         WideCharToMultiByte(CP_UTF8,0,market_w,-1,market,sizeof(market),NULL,NULL);
+-    catalog_write_u32(op,1); catalog_write_u32(op,associated); catalog_write_u32(op,kinds);
++    catalog_write_u32(op,2); catalog_write_u32(op,associated); catalog_write_u32(op,kinds);
+     if (!catalog_write_text(op,parent) || !catalog_write_text(op,market) || !catalog_write_text(op,locale)) goto invalid;
+     catalog_write_u32(op,count);
+     for (i = 0; i < count; i++)
+@@ -335,6 +428,7 @@
+     }
+     catalog_write_u32(op,action_count);
+     for (i = 0; i < action_count; i++) if (!catalog_write_text(op,actions[i])) goto invalid;
++    catalog_write_u32(op,flags);
+     if (!(op->ipc.response = malloc(XGR_CATALOG_MAX))) { catalog_operation_free(op); return E_OUTOFMEMORY; }
+     hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, op, &store_catalog_identity, "StoreCatalog", catalog_provider );
+     if (FAILED(hr)) catalog_operation_free(op);
+@@ -554,7 +648,7 @@
+     {
+         char parent[64];
+         if (!storeContextHandle || !xgr_config_element("StoreId",parent,sizeof(parent))) return E_INVALIDARG;
+-        return catalog_begin(parent,productKinds,TRUE,maxItemsToRetrievePerPage,NULL,0,NULL,0,async);
++        return catalog_begin(parent,productKinds,TRUE,maxItemsToRetrievePerPage,NULL,0,NULL,0,async,0,FALSE);
+     }
+     return complete_empty_query( async );
+ }
+@@ -572,7 +666,7 @@
+     {
+         char parent[64];
+         if (!storeContextHandle || !xgr_config_element("StoreId",parent,sizeof(parent))) return E_INVALIDARG;
+-        return catalog_begin(parent,productKinds,FALSE,256,storeIds,storeIdsCount,actionFilters,actionFiltersCount,async);
++        return catalog_begin(parent,productKinds,FALSE,256,storeIds,storeIdsCount,actionFilters,actionFiltersCount,async,0,FALSE);
+     }
+     return complete_empty_query( async );
+ }
+@@ -586,6 +680,15 @@
+ static HRESULT WINAPI x_store_XStoreQueryEntitledProductsAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage, XAsyncBlock *async )
+ {
+     TRACE( "iface %p, storeContextHandle %p, productKinds %#x, async %p.\n", iface, storeContextHandle, productKinds, async );
++    /* With the live catalog: the game and the add-ons the account owns (issue #18), whose products come back marked
++     * as in the user's collection. Without it, or for the game alone, the running game as before. */
++    if (catalog_enabled() && (productKinds & ~XStoreProductKind_Game))
++    {
++        char parent[64];
++        if (storeContextHandle && xgr_config_element("StoreId",parent,sizeof(parent)))
++            return catalog_begin(parent,productKinds,TRUE,maxItemsToRetrievePerPage ? maxItemsToRetrievePerPage : 256,
++                                 NULL,0,NULL,0,async,CATALOG_OWNED_ONLY,FALSE);
++    }
+     return complete_query( async, !!(productKinds & XStoreProductKind_Game) );
+ }
+ 
+@@ -821,29 +924,40 @@
+ {
+     TRACE( "iface %p, storeContextHandle %p, async %p.\n", iface, storeContextHandle, async );
+     if (!async) return E_INVALIDARG;
++    /* With the live catalog: the durable add-ons the account owns, from the Store's collections (issue #18: the VIP
++     * membership and the Car Pass were not seen). Without it: none, as before. */
++    if (catalog_enabled())
++    {
++        char parent[64];
++        if (storeContextHandle && xgr_config_element("StoreId",parent,sizeof(parent)))
++            return catalog_begin(parent,XStoreProductKind_Durable,TRUE,256,NULL,0,NULL,0,async,CATALOG_OWNED_ONLY,TRUE);
++    }
+     xgr_async_complete( async, S_OK, NULL );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryAddOnLicensesResultCount( IXStoreImpl6 *iface, XAsyncBlock *async, UINT32 *count )
+ {
++    SIZE_T size = 0;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, async %p, count %p.\n", iface, async, count );
+-
+     if (!count) return E_INVALIDARG;
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    *count = 0; /* no add-ons owned */
+-    return hr;
++    *count = 0;
++    /* The catalog's add-on mode answers licences; the fallback completes with none (size 0). */
++    if (FAILED(hr = IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, &size ))) return hr;
++    *count = (UINT32)(size / sizeof(XStoreAddonLicense));
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryAddOnLicensesResult( IXStoreImpl6 *iface, XAsyncBlock *async, UINT32 count, XStoreAddonLicense *addOnLicenses )
+ {
+-    HRESULT hr;
+-
+     TRACE( "iface %p, async %p, count %u, addOnLicenses %p.\n", iface, async, count, addOnLicenses );
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    return hr;
++    /* nothing to copy: the operation's status, and what it held is released */
++    if (!count) return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &store_catalog_identity, 0, NULL, NULL );
++    if (!addOnLicenses) return E_INVALIDARG;
++    return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &store_catalog_identity,
++                                            count * sizeof(XStoreAddonLicense), addOnLicenses, NULL );
+ }
+ 
+ static HRESULT WINAPI x_store_XStoreQueryConsumableBalanceRemainingAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *storeProductId, XAsyncBlock *async )
+@@ -1255,7 +1369,7 @@
+ {
+     TRACE( "iface %p, storeContextHandle %p, storeId %s, async %p.\n", iface, storeContextHandle, debugstr_a( storeId ), async );
+     if (catalog_enabled())
+-        return storeContextHandle ? catalog_begin(storeId,productKinds,TRUE,maxItemsToRetrievePerPage,NULL,0,NULL,0,async) : E_INVALIDARG;
++        return storeContextHandle ? catalog_begin(storeId,productKinds,TRUE,maxItemsToRetrievePerPage,NULL,0,NULL,0,async,0,FALSE) : E_INVALIDARG;
+     return complete_empty_query( async );
+ }
+ 
+--- a/dlls/xgameruntime/xuser.c
++++ b/dlls/xgameruntime/xuser.c
+@@ -640,40 +640,140 @@
+     return E_NOTIMPL;
+ }
+ 
+-/* A neutral 64x64 grey PNG. Forza Horizon 6 asks for the gamer picture when its online session comes up
+- * and, given E_NOTIMPL from this *Async call, aborted (c0000409) seconds later. The picture itself would
+- * need profile.xboxlive.com's GameDisplayPicRaw; a valid image is what the title needs to carry on. */
++/* The gamer picture. Forza Horizon 6 asks for it when its online session comes up and, given E_NOTIMPL from the
++ * *Async call, aborted (c0000409) seconds later; a neutral 64x64 grey PNG kept it going, and players saw a grey
++ * profile picture (issue #18). The picture is now the account's own: xodus-service reads the profile's
++ * GameDisplayPicRaw from profile.xboxlive.com and fetches that image as a PNG of the size asked (GSDX frames).
++ * The grey square stays the answer whenever that fails -- no service, an older one, nobody signed in, no picture
++ * set -- and the call never fails for it. After a failure the next minute's asks take the grey square at once,
++ * rather than waiting on the service again. The round trip runs on a thread of ours, as the token requests do. */
+ static const BYTE gamer_picture_png[] = { 0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x40,0x08,0x02,0x00,0x00,0x00,0x25,0x0b,0xe6,0x89,0x00,0x00,0x00,0x4b,0x49,0x44,0x41,0x54,0x78,0xda,0xed,0xcf,0x31,0x0d,0x00,0x00,0x0c,0x03,0xa0,0xfa,0xad,0xff,0xbf,0x12,0x76,0x2f,0x01,0x07,0xa4,0xcf,0x45,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0xe0,0x32,0x8e,0x02,0x11,0x2d,0x6b,0x7e,0x6f,0x8a,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,0x42,0x60,0x82 };
++
++#define PICTURE_RETRY_MS 60000
++
++struct picture_request
++{
++    struct gamer_picture_params params;
++    XAsyncBlock *async;                /* set when DoWork hands the request off */
++    const BYTE *data;
++    SIZE_T size;
++};
++
++static const char gamer_picture_identity;
++static volatile ULONGLONG picture_failed_at;   /* GetTickCount64() of the last failure; 0: none */
++
++static UINT32 picture_pixels( XUserGamerPictureSize size )
++{
++    switch (size)
++    {
++    case XUserGamerPictureSize_Small: return 64;
++    case XUserGamerPictureSize_Medium: return 208;
++    case XUserGamerPictureSize_Large: return 424;
++    case XUserGamerPictureSize_ExtraLarge: return 1080;
++    default: return 208;
++    }
++}
++
++static void picture_request_free( struct picture_request *req )
++{
++    free( req->params.buffer );
++    free( req );
++}
++
++static void picture_request_run( struct picture_request *req )
++{
++    ULONGLONG failed = picture_failed_at, now = GetTickCount64();
++    NTSTATUS status = STATUS_RETRY;
++    void *shrunk;
++
++    if (!failed || now - failed >= PICTURE_RETRY_MS)
++    {
++        if (!(req->params.buffer = malloc( XGR_PICTURE_MAX ))) status = STATUS_NO_MEMORY;
++        else status = XGR_UNIX_CALL( gamer_picture, &req->params );
++        if (!status && req->params.size && req->params.size <= XGR_PICTURE_MAX)
++        {
++            if ((shrunk = realloc( req->params.buffer, req->params.size ))) req->params.buffer = shrunk;
++            req->data = req->params.buffer;
++            req->size = req->params.size;
++            picture_failed_at = 0;
++            TRACE( "the account's gamer picture: %u px, %lu bytes.\n", req->params.pixels, req->params.size );
++        }
++        else
++        {
++            picture_failed_at = now | 1;
++            WARN( "no gamer picture from the Xbox profile (%#lx); the plain one stands in.\n", status );
++        }
++    }
++    if (!req->data)
++    {
++        req->data = gamer_picture_png;
++        req->size = sizeof(gamer_picture_png);
++    }
++    /* Completion may release the request on another thread: the last use. */
++    IXThreadingImpl_XAsyncComplete( x_threading_impl, req->async, S_OK, req->size );
++}
+ 
++static void CALLBACK picture_request_detached( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    picture_request_run( context );
++}
++
++static HRESULT CALLBACK picture_provider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    struct picture_request *req = data->context;
++    HRESULT hr;
++
++    switch (op)
++    {
++    case XAsyncOp_Begin:
++        return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
++    case XAsyncOp_DoWork:
++        req->async = data->async;
++        pin_module();
++        if (FAILED(hr = xgr_async_run_detached( data->async, picture_request_detached, req )))
++        {
++            WARN( "no thread for the gamer picture (%#lx); asking on this one.\n", hr );
++            picture_request_run( req );
++        }
++        return E_PENDING;
++    case XAsyncOp_GetResult:
++        memcpy( data->buffer, req->data, req->size );
++        return S_OK;
++    case XAsyncOp_Cleanup:
++        picture_request_free( req );
++        return S_OK;
++    default:
++        return S_OK;
++    }
++}
++
+ static HRESULT WINAPI x_user_XUserGetGamerPictureAsync( IXUserImpl6 *iface, XUserHandle user, XUserGamerPictureSize pictureSize, XAsyncBlock *async )
+ {
++    struct picture_request *req;
++    HRESULT hr;
++
+     TRACE( "iface %p, user %p, pictureSize %d, async %p.\n", iface, user, pictureSize, async );
+     if (!async) return E_INVALIDARG;
+-    xgr_async_complete_ex( async, S_OK, (void *)gamer_picture_png, sizeof(gamer_picture_png) );
+-    return S_OK;
++    if (!(req = calloc( 1, sizeof(*req) ))) return E_OUTOFMEMORY;
++    req->params.pixels = picture_pixels( pictureSize );
++    hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, req, &gamer_picture_identity,
++                                      "XUserGetGamerPicture", picture_provider );
++    if (FAILED(hr)) picture_request_free( req );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetGamerPictureResultSize( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T *bufferSize )
+ {
+-    HRESULT hr;
+     TRACE( "iface %p, async %p, bufferSize %p.\n", iface, async, bufferSize );
+     if (!bufferSize) return E_INVALIDARG;
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    if (FAILED(hr)) return hr;
+-    *bufferSize = sizeof(gamer_picture_png);
+-    return S_OK;
++    return IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, bufferSize );
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetGamerPictureResult( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T bufferSize, void *buffer, SIZE_T *bufferUsed )
+ {
+-    HRESULT hr;
+     TRACE( "iface %p, async %p, bufferSize %Iu, buffer %p, bufferUsed %p.\n", iface, async, bufferSize, buffer, bufferUsed );
+-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
+-    if (FAILED(hr)) return hr;
+-    if (!buffer || bufferSize < sizeof(gamer_picture_png)) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+-    memcpy( buffer, gamer_picture_png, sizeof(gamer_picture_png) );
+-    if (bufferUsed) *bufferUsed = sizeof(gamer_picture_png);
+-    return S_OK;
++    if (!buffer && bufferSize) return E_INVALIDARG;
++    return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &gamer_picture_identity, bufferSize, buffer, bufferUsed );
+ }
+ 
+ static HRESULT WINAPI x_user_XUserGetAgeGroup( IXUserImpl6 *iface, XUserHandle user, XUserAgeGroup *ageGroup )

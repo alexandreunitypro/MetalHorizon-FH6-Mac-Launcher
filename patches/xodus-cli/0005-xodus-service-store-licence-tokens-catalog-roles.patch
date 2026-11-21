@@ -1,6 +1,7 @@
-xodus-service: answer the game's Store questions (licence tokens, its own licence, the Store catalog, account roles)
+xodus-service: answer the game's Store questions (licence tokens, its own licence, the Store catalog, what the account
+owns, account roles) and give it the player's gamer picture
 
-MetalHorizon 1.0.4. The engines run Ferestre's xgameruntime (icex/xgameruntime), which asks the service for Store
+MetalHorizon 1.0.4, completed in 2.0.0. The engines run Ferestre's xgameruntime (icex/xgameruntime), which asks the service for Store
 licence tokens (XML message type 7, XStoreQueryLicenseTokenAsync), the game's own licence (ESDX frames), the Store
 catalog (CSDX frames) and the account roles (ASDX frames). This service, from upstream xodus with MetalHorizon's
 patches 0002 to 0004, knew none of them: "Unimplemented" and "Unknown magic" in its log, a closed connection for the
@@ -10,8 +11,19 @@ game, and in the game no VIP membership, no Car Pass cars and no expansions (Met
   /v8.0/licenseToken authorized and signed with the title's XSTS token for licensing.mp.microsoft.com, through the
   service's existing XSTS path (xml.rs: xsts_response, factored out of the XSTS branch). Bound to the game's Store ID
   (XODUS_STORE_PRODUCT, binding.rs) when the launcher passes it.
-- connection/catalog.rs: Ferestre's Store catalog bridge, unchanged (plus one live test, ignored by default).
-- connection/router.rs: the three frames above; a client closing its connection is no longer logged as an error.
+- connection/catalog.rs: Ferestre's Store catalog bridge, plus protocol 2 (MetalHorizon 2.0.0, engine 1.3): the
+  request carries flags (1: what the account owns, only) and the answer the products of it the account owns, so the
+  in-game store stops pricing what was bought; what is owned is listed even when it is no longer sold on its own. Two
+  live tests, ignored by default; one writes the answers engine/tests/store-ownership serves to the runtime.
+- connection/collections.rs (2.0.0): what the account owns, from the Store's collections
+  (collections.mp.microsoft.com/v6.0/collections/query, as Ferestre's xodus-cli asks it: an MSA device ticket for the
+  caller, the user's for the beneficiary), resolved against the public catalog: an add-on counts when its entry names
+  the game as its parent, an owned edition or bundle with everything it contains (the VIP membership and the Car Pass
+  of a Premium Edition). Kept for ten minutes.
+- connection/picture.rs (2.0.0): the gamer picture (GSDX frames): the profile's GameDisplayPicRaw from
+  profile.xboxlive.com with the user's Xbox token, fetched as a PNG of the size asked; status 1 when there is none.
+- connection/router.rs: the frames above; a client closing its connection is no longer logged as an error.
+- Cargo.toml: uuid (the collections request's correlation vector), from the workspace.
 - xml.rs: the runtime's extended frame size (type bit 0x8000) for requests over 64 KiB; any XML type is answered with
   its type plus one, as the runtime checks.
 - proto.rs: the unimplemented protobuf framing refuses instead of panicking.
@@ -21,48 +33,19 @@ game, and in the game no VIP membership, no Car Pass cars and no expansions (Met
   (as Ferestre does since icex/xodus e35bde1) and the request tried again, in the service and in --check; the renewed
   ticket stays in memory (nothing written to the Keychain).
 
-diff -ruN a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
---- a/crates/xodus/proto/xodus/common.proto	2026-11-20 12:58:24
-+++ b/crates/xodus/proto/xodus/common.proto	2026-11-20 13:17:14
-@@ -10,4 +10,6 @@
-     MSA_TOKEN_RESPONSE=4;
-     XSTS_TOKEN_REQUEST=5;
-     XSTS_TOKEN_RESPONSE=6;
-+    LICENSE_TOKEN_REQUEST=7;
-+    LICENSE_TOKEN_RESPONSE=8;
- }
-diff -ruN a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
---- a/crates/xodus/src/models/xgameruntime/xuser.rs	2026-11-20 12:58:24
-+++ b/crates/xodus/src/models/xgameruntime/xuser.rs	2026-11-20 13:17:14
-@@ -56,3 +56,25 @@
-     #[serde(default)]
-     pub signature: String,
- }
-+
-+/// A title's `XStoreQueryLicenseTokenAsync`, as the runtime frames it (message type 7): the game's own Store ID,
-+/// the add-ons it asks about, and its custom developer string (base64, so XML cannot normalize or reject control
-+/// characters in it). The service answers with type 8 carrying only the licence token (a JWT), or an empty frame.
-+/// Same shape as Ferestre's xodus fork (icex/xodus), whose xgameruntime this engine runs.
-+#[derive(Deserialize)]
-+#[serde(rename_all = "PascalCase")]
-+pub struct LicenseTokenIpcRequest {
-+    pub parent_product_id: String,
-+    pub product_ids: LicenseProductIds,
-+    pub custom_base64: String,
-+    #[serde(default)]
-+    pub title_id: String,
-+    #[serde(default)]
-+    pub title_client_id: String,
-+}
-+
-+#[derive(Deserialize)]
-+pub struct LicenseProductIds {
-+    #[serde(rename = "ProductId", default)]
-+    pub ids: Vec<String>,
-+}
-diff -ruN a/crates/xodus-service/src/binding.rs b/crates/xodus-service/src/binding.rs
---- a/crates/xodus-service/src/binding.rs	1970-01-01 01:00:00
-+++ b/crates/xodus-service/src/binding.rs	2026-11-20 13:17:14
+
+--- a/crates/xodus-service/Cargo.toml
++++ b/crates/xodus-service/Cargo.toml
+@@ -16,6 +16,7 @@
+ quick-xml = { version = "0.42.0", features = ["serialize", "overlapped-lists"] }
+ tokio-util = "0.7.19"
+ serde_json = "1.0.151"
++uuid = { workspace = true }
+ p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ xal = { git = "https://github.com/xodus-gaming/xal-rs", rev = "6aa2420f8f0d5e6f7460ff13f399037583a942f4", version = "0.1.3" }
+ 
+--- /dev/null
++++ b/crates/xodus-service/src/binding.rs
 @@ -0,0 +1,13 @@
 +//! The game this service answers for, as MetalHorizon's Play binds it: `XODUS_STORE_PRODUCT`, the game's 12-character
 +//! Store ID from its MicrosoftGame.config. Unset (or not a Store ID), nothing is bound and every answer is as before.
@@ -77,13 +60,13 @@ diff -ruN a/crates/xodus-service/src/binding.rs b/crates/xodus-service/src/bindi
 +        })
 +        .clone()
 +}
-diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-service/src/connection/catalog.rs
---- a/crates/xodus-service/src/connection/catalog.rs	1970-01-01 01:00:00
-+++ b/crates/xodus-service/src/connection/catalog.rs	2026-11-20 13:17:14
-@@ -0,0 +1,616 @@
-+// Store catalog bridge (CSDX frames): copied unchanged from Ferestre's xodus fork, icex/xodus at a4f9d5c
+--- /dev/null
++++ b/crates/xodus-service/src/connection/catalog.rs
+@@ -0,0 +1,807 @@
++// Store catalog bridge (CSDX frames): from Ferestre's xodus fork, icex/xodus at a4f9d5c
 +// (crates/xodus-service/src/connection/catalog.rs, GPL-3.0 like the rest of xodus), whose xgameruntime this engine
-+// runs: it answers the game's Store product queries (its add-ons and editions) from the public catalog.
++// runs: it answers the game's Store product queries (its add-ons and editions) from the public catalog. MetalHorizon
++// 1.1.1 adds protocol 2: which of those products the account owns, from the Store's collections (collections.rs).
 +//! Read-only Store catalog bridge. Microsoft supplies relationships, product
 +//! metadata and prices; listing a product never grants an account a license.
 +//! The wire protocol is bounded, versioned and contains no credentials.
@@ -101,7 +84,19 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +
 +type Error = &'static str;
 +
++/// What the account owns, for a version 2 answer: its active entitlements with what its editions and bundles of the
++/// game contain (`all`), and the game's own add-ons among them (`addons`, collections.rs's `family`).
++#[derive(Default)]
++pub(super) struct Ownership {
++    pub(super) all: HashSet<String>,
++    pub(super) addons: HashSet<String>,
++}
++
 +struct Request {
++    /// 1, or 2 (MetalHorizon 1.1.1): flags after the action filters, and the owned products after the products
++    version: u32,
++    /// version 2, flag 1: only what the account owns (the game's entitled products and add-on licences)
++    owned_only: bool,
 +    kinds: u32,
 +    associated: bool,
 +    parent: String,
@@ -137,7 +132,8 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +}
 +fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
 +    let mut r = Reader(bytes);
-+    if r.integer()? != 1 {
++    let version = r.integer()?;
++    if version != 1 && version != 2 {
 +        return Err("unsupported catalog protocol");
 +    }
 +    let mode = r.integer()?;
@@ -188,10 +184,16 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +        }
 +        actions.push(action);
 +    }
++    let flags = if version >= 2 { r.integer()? } else { 0 };
++    if flags & !1 != 0 {
++        return Err("unsupported catalog flags");
++    }
 +    if !r.0.is_empty() || (mode == 1 && !ids.is_empty()) || (mode == 0 && ids.is_empty()) {
 +        return Err("invalid catalog request shape");
 +    }
 +    Ok(Request {
++        version,
++        owned_only: flags & 1 != 0,
 +        kinds,
 +        associated: mode == 1,
 +        parent,
@@ -388,7 +390,9 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +                    .any(|r| &r[12..] == string(&d["Sku"], "SkuId")))
 +                && d["Availabilities"]
 +                    .as_array()
-+                    .is_some_and(|aa| aa.iter().any(|a| accepted(a, &req.actions, req.associated)))
++                    // what is owned is listed whether or not it is still sold on its own (the game's base SKUs are
++                    // not: it is sold in its editions; a pre-order bonus no longer is)
++                    .is_some_and(|aa| aa.iter().any(|a| accepted(a, &req.actions, req.associated && !req.owned_only)))
 +        })
 +        .collect();
 +    if skus.is_empty() {
@@ -527,13 +531,43 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +    Ok(entries)
 +}
 +
-+async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
++/// Game in XStoreProductKind.
++const KIND_GAME: u32 = 4;
++
++async fn fetch(req: &Request, ownership: Option<&Ownership>) -> Result<Vec<u8>, Error> {
 +    let client = catalog_client()?;
-+    let ids = if req.associated {
++    let none = Ownership::default();
++    let ownership = ownership.unwrap_or(&none);
++    // Only what the account owns: the game's add-ons it owns, outright or in an edition or bundle, whether or not the
++    // game's Add-ons channel lists them, and the running game itself when games are asked for (it runs under a
++    // licence, bought or through Game Pass, so it is the player's to the runtime).
++    let mut ids = if req.owned_only && req.associated {
++        let mut ids: Vec<String> = ownership.addons.iter().cloned().collect();
++        ids.sort();
++        ids
++    } else if req.associated {
 +        associated_ids(&client, req).await?
 +    } else {
 +        req.ids.clone()
 +    };
++    if req.owned_only {
++        ids.retain(|id| id.len() >= 12 && ownership.all.contains(&id[..12].to_ascii_uppercase()));
++        ids.retain(|id| !id[..12].eq_ignore_ascii_case(&req.parent));
++        if req.kinds & KIND_GAME != 0 {
++            ids.insert(0, req.parent.clone());
++        }
++        if ids.is_empty() {
++            let mut out = Vec::new();
++            integer(&mut out, 1);
++            integer(&mut out, 0);
++            integer(&mut out, 0);
++            if req.version >= 2 {
++                integer(&mut out, 0);
++            }
++            tracing::info!(products = 0, "Store catalog query completed (the account owns none of them)");
++            return Ok(out);
++        }
++    }
 +    let mut unique = HashSet::new();
 +    let ids: Vec<_> = ids
 +        .iter()
@@ -545,6 +579,7 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +    integer(&mut out, 0);
 +    integer(&mut out, 0);
 +    let mut count = 0;
++    let mut written: Vec<String> = Vec::new();
 +    for chunk in ids.chunks(20) {
 +        let value = json(client.get(format!("https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market={}&languages={}",chunk.join(","),req.market,req.language))
 +            .send().await.map_err(|_| "product catalog transport failed")?).await?;
@@ -560,6 +595,7 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +            }
 +            if product(&mut out, p, req)? {
 +                count += 1;
++                written.push(string(p, "ProductId").to_ascii_uppercase());
 +            }
 +            if out.len() > MAX_RESPONSE {
 +                return Err("catalog wire response exceeds limit");
@@ -567,15 +603,32 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +        }
 +    }
 +    out[8..12].copy_from_slice(&(count as u32).to_le_bytes());
++    // version 2: the products of the answer the account owns, by Store ID, after the products
++    let mut owned_written = 0;
++    if req.version >= 2 {
++        let mine: Vec<&String> = written
++            .iter()
++            .filter(|id| ownership.all.contains(*id) || (req.owned_only && id.eq_ignore_ascii_case(&req.parent)))
++            .collect();
++        owned_written = mine.len();
++        integer(&mut out, mine.len() as u32);
++        for id in mine {
++            text(&mut out, id)?;
++        }
++    }
 +    tracing::info!(
 +        products = count,
++        owned = owned_written,
 +        associated = req.associated,
 +        "Store catalog query completed"
 +    );
 +    Ok(out)
 +}
 +
-+pub(super) async fn handle(socket: &mut tokio::net::UnixStream) -> tokio::io::Result<()> {
++pub(super) async fn handle(
++    socket: &mut tokio::net::UnixStream,
++    context: &crate::simple_context::SimpleContext,
++) -> tokio::io::Result<()> {
 +    let size = socket.read_u32_le().await? as usize;
 +    if size == 0 || size > MAX_REQUEST {
 +        return Err(std::io::ErrorKind::InvalidData.into());
@@ -583,10 +636,43 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +    let mut bytes = vec![0; size];
 +    socket.read_exact(&mut bytes).await?;
 +    let result = match parse_request(&bytes) {
-+        Ok(req) => tokio::time::timeout(Duration::from_secs(45), fetch(&req))
-+            .await
++        Ok(req) => {
++            // version 2: what the account owns, from the Store's collections, resolved against the catalog (none,
++            // said in the log, on a failure)
++            let owned = if req.version >= 2 {
++                match tokio::time::timeout(Duration::from_secs(25), super::collections::owned(context)).await {
++                    Ok(Ok(owned)) => {
++                        let addons = tokio::time::timeout(
++                            Duration::from_secs(20),
++                            super::collections::family(&req.parent, &owned),
++                        )
++                        .await
++                        .map(|set| (*set).clone())
++                        .unwrap_or_else(|_| {
++                            tracing::warn!("The game's owned add-ons could not be resolved in 20 s");
++                            HashSet::new()
++                        });
++                        let mut all = owned.ids.clone();
++                        all.extend(addons.iter().cloned());
++                        Some(Ownership { all, addons })
++                    }
++                    Ok(Err(e)) => {
++                        tracing::warn!("The account's Store collection could not be read: {e}");
++                        None
++                    }
++                    Err(_) => {
++                        tracing::warn!("The account's Store collection did not answer in 25 s");
++                        None
++                    }
++                }
++            } else {
++                None
++            };
++            tokio::time::timeout(Duration::from_secs(45), fetch(&req, owned.as_ref()))
++                .await
 +            .unwrap_or(Err("catalog query timed out"))
-+            .map_err(|e| (E_FAIL, e)),
++            .map_err(|e| (E_FAIL, e))
++        }
 +        Err(e) => Err((E_INVALIDARG, e)),
 +    };
 +    let bytes = match result {
@@ -611,6 +697,8 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +    #[test]
 +    fn filters_do_not_invent_ownership_or_ignore_kind_and_sku() {
 +        let req = Request {
++            version: 1,
++            owned_only: false,
 +            kinds: 2,
 +            associated: true,
 +            parent: "9TESTPARENT0".into(),
@@ -633,6 +721,16 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +        req.associated = false;
 +        req.ids = vec!["9TESTADDON000011".into()];
 +        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++    }
++    #[test]
++    fn what_is_owned_is_listed_even_when_it_is_no_longer_sold_on_its_own() {
++        // the game's base SKUs (it is sold in its editions) and a pre-order bonus: no Purchase action anywhere
++        let p = serde_json::json!({"ProductId":"9NR1R1XWLCNB","ProductKind":"Game","LocalizedProperties":[{"ProductTitle":"Forza Horizon 6","ProductDescription":"","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{}},"Availabilities":[{"AvailabilityId":"a","Actions":["Details","License","Fulfill"],"OrderManagementData":{"Price":{"MSRP":0.0,"ListPrice":0.0,"CurrencyCode":"USD"}}}]}]});
++        let mut req = Request { version: 2, owned_only: false, kinds: 6, associated: true, parent: "9NR1R1XWLCNB".into(),
++                                market: "US".into(), language: "en-US".into(), ids: vec![], actions: vec![] };
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap(), "the store lists what can be bought");
++        req.owned_only = true;
++        assert!(product(&mut Vec::new(), &p, &req).unwrap(), "what is owned is listed as it is");
 +    }
 +    #[test]
 +    fn lowercase_store_ids_match_the_catalog_answer() {
@@ -684,22 +782,428 @@ diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-servic
 +    #[tokio::test]
 +    #[ignore]
 +    async fn forza_horizon_6_and_its_add_ons_come_back_from_the_live_catalog() {
-+        let own = Request { kinds: 31, associated: false, parent: "9NR1R1XWLCNB".into(), market: "US".into(),
++        let own = Request { version: 1, owned_only: false, kinds: 31, associated: false, parent: "9NR1R1XWLCNB".into(), market: "US".into(),
 +                            language: "en-US".into(), ids: vec!["9NR1R1XWLCNB".into()], actions: vec![] };
-+        let bytes = fetch(&own).await.expect("the game's own entry");
++        let bytes = fetch(&own, None).await.expect("the game's own entry");
 +        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
 +        assert_eq!(count, 1, "one product for the game itself");
-+        let addons = Request { kinds: 31, associated: true, parent: "9NR1R1XWLCNB".into(), market: "US".into(),
++        let addons = Request { version: 1, owned_only: false, kinds: 31, associated: true, parent: "9NR1R1XWLCNB".into(), market: "US".into(),
 +                               language: "en-US".into(), ids: vec![], actions: vec![] };
-+        let bytes = fetch(&addons).await.expect("its add-ons");
++        let bytes = fetch(&addons, None).await.expect("its add-ons");
 +        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
 +        eprintln!("Forza Horizon 6 add-ons in the US catalog: {count}");
 +        assert!(count > 0, "the game has add-ons (VIP, Car Pass, expansions)");
 +    }
++
++    /// Protocol 2: the flags after the action filters, flag 1 only; version 1 has none.
++    #[test]
++    fn version_2_requests_carry_the_owned_only_flag() {
++        fn request(version: u32, flags: Option<u32>) -> Vec<u8> {
++            let mut b = Vec::new();
++            for n in [version, 1, 2] { b.extend(n.to_le_bytes()); }
++            for t in ["9NR1R1XWLCNB", "US", "en-US"] { b.extend((t.len() as u32).to_le_bytes()); b.extend(t.as_bytes()); }
++            b.extend(0u32.to_le_bytes());
++            b.extend(0u32.to_le_bytes());
++            if let Some(f) = flags { b.extend(f.to_le_bytes()); }
++            b
++        }
++        let v2 = parse_request(&request(2, Some(1))).unwrap();
++        assert!(v2.owned_only && v2.version == 2 && v2.associated);
++        assert!(!parse_request(&request(2, Some(0))).unwrap().owned_only);
++        assert!(parse_request(&request(2, Some(2))).is_err(), "unknown flags are refused");
++        assert!(parse_request(&request(1, Some(1))).is_err(), "version 1 has no flags");
++        assert!(parse_request(&request(1, None)).is_ok());
++        assert!(parse_request(&request(3, Some(0))).is_err());
++    }
++
++    /// MetalHorizon: protocol 2 against the live catalog, with an owned set: the game itself is listed as owned
++    /// after the products. Network only, no account. `cargo test -- --ignored`.
++    #[tokio::test]
++    #[ignore]
++    async fn version_2_lists_the_owned_products_after_the_products() {
++        let own = Request { version: 2, owned_only: false, kinds: 31, associated: false, parent: "9NR1R1XWLCNB".into(),
++                            market: "US".into(), language: "en-US".into(), ids: vec!["9NR1R1XWLCNB".into()], actions: vec![] };
++        let owned = Ownership { all: ["9NR1R1XWLCNB".to_string()].into_iter().collect(), addons: HashSet::new() };
++        let bytes = fetch(&own, Some(&owned)).await.expect("the game's own entry");
++        let tail = &bytes[bytes.len() - (4 + 4 + 12)..];
++        assert_eq!(u32::from_le_bytes(tail[..4].try_into().unwrap()), 1, "one owned product");
++        assert_eq!(&tail[8..], b"9NR1R1XWLCNB");
++        let nothing = fetch(&own, None).await.unwrap();
++        assert_eq!(u32::from_le_bytes(nothing[nothing.len() - 4..].try_into().unwrap()), 0, "no owned set: none owned");
++    }
++
++    /// MetalHorizon: real answers for the runtime's end-to-end test under Wine (engine/tests/store-ownership), which
++    /// serves them back to xgameruntime as a stand-in service would. The account owns the Deluxe Edition, every fourth
++    /// add-on of the game's Add-ons channel and one product of another game; ownership is resolved against the live
++    /// catalog as the service does. The answers: as the in-game store lists the add-ons, as the owned add-ons
++    /// (licences) and as the entitled products; `owned.txt` is the add-ons the game must see as owned.
++    /// Network only, no account. `XODUS_CATALOG_DUMP=<folder> cargo test -- --ignored the_runtime_test_answers`.
++    #[tokio::test]
++    #[ignore]
++    async fn the_runtime_test_answers() {
++        let Ok(dir) = std::env::var("XODUS_CATALOG_DUMP") else { return };
++        let dir = std::path::PathBuf::from(dir);
++        let ask = |owned_only: bool, kinds: u32| Request {
++            version: 2, owned_only, kinds, associated: true, parent: "9NR1R1XWLCNB".into(),
++            market: "US".into(), language: "en-US".into(), ids: vec![], actions: vec![],
++        };
++        let listed = associated_ids(&catalog_client().unwrap(), &ask(false, 2)).await.expect("the game's add-ons");
++        let mut owned = super::super::collections::Owned::default();
++        for id in listed.iter().step_by(4).take(8).map(|id| id[..12].to_ascii_uppercase()) {
++            owned.ids.insert(id.clone());
++            owned.addons.insert(id);
++        }
++        owned.ids.insert("9NQ1H88ZH2D7".into()); // the Deluxe Edition: a game, holding add-ons
++        owned.ids.insert("9WZDNCRFJ3TJ".into()); // another title altogether: Netflix, an app
++        let addons = super::super::collections::family("9NR1R1XWLCNB", &owned).await;
++        assert!(addons.contains("9NTBFBZMB84T") && addons.contains("9MSTD1ZC25D7"), "the Deluxe Edition's add-ons");
++        assert!(!addons.contains("9NQ1H88ZH2D7") && !addons.contains("9NR1R1XWLCNB"), "not the editions or the game");
++        let mut all = owned.ids.clone();
++        all.extend(addons.iter().cloned());
++        let ownership = Ownership { all, addons: (*addons).clone() };
++        let mut list: Vec<_> = addons.iter().cloned().collect();
++        list.sort();
++        std::fs::write(dir.join("owned.txt"), list.join("\n") + "\n").unwrap();
++        for (name, owned_only, kinds) in [("listing", false, 2), ("addons", true, 2), ("entitled", true, 6)] {
++            let bytes = fetch(&ask(owned_only, kinds), Some(&ownership)).await.expect(name);
++            std::fs::write(dir.join(format!("{name}.bin")), bytes).unwrap();
++        }
++    }
 +}
-diff -ruN a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
---- a/crates/xodus-service/src/connection/license.rs	1970-01-01 01:00:00
-+++ b/crates/xodus-service/src/connection/license.rs	2026-11-20 13:17:14
+--- /dev/null
++++ b/crates/xodus-service/src/connection/collections.rs
+@@ -0,0 +1,329 @@
++//! What the signed-in account owns: the Microsoft Store's collections.
++//!
++//! The game asks the runtime which of its products the player owns (its add-ons: the VIP membership, the Car Pass,
++//! car packs, expansions) and, until MetalHorizon 1.1.1, the answer was always "none": the in-game store priced what
++//! the player had bought, and VIP was not seen (issue #18). The request is the one Ferestre's xodus-cli makes for
++//! its owned-title listing (icex/xodus, crates/xodus-cli/src/commands/collections.rs, checked there against the
++//! service): `POST collections.mp.microsoft.com/v6.0/collections/query`, the caller authenticated with an MSA device
++//! ticket and the beneficiary with an MSA user ticket, both for www.microsoft.com under MBI_SSL, the user ticket in
++//! the `t=...&p=` form. Only entitlements whose status is Active count. The answer is kept for ten minutes.
++//!
++//! What a player owns of the game is then resolved against the public catalog (`family`): an add-on counts when its
++//! catalog entry names the game as its parent ("addOnParent"), and an edition or bundle the account owns (Deluxe,
++//! Premium, an add-ons bundle) counts with everything it contains ("BundledSkus"), whether the collection lists those
++//! items one by one or not. So the VIP membership and the Car Pass of a Premium Edition are owned to the game.
++use std::collections::HashSet;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use xodus::models::live::ExchangeUserTokenOutcome;
++use xodus::models::secrets::Token;
++use xodus::models::soap;
++
++use crate::simple_context::SimpleContext;
++
++const QUERY: &str = "https://collections.mp.microsoft.com/v6.0/collections/query";
++const HOSTING_APP: &str = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
++const TARGET: &str = "www.microsoft.com";
++const KEEP: Duration = Duration::from_secs(600);
++const MAX_PAGES: usize = 20;
++
++static CACHE: Mutex<Option<(Instant, Arc<Owned>)>> = Mutex::new(None);
++static FAMILY: Mutex<Option<(Instant, String, Arc<HashSet<String>>)>> = Mutex::new(None);
++/// Catalog entries looked up for one resolution, at most (20 to a request).
++const MAX_LOOKUPS: usize = 400;
++
++/// The account's active entitlements (12-character Store IDs, upper case), and those of them that are not games or
++/// apps, which may be add-ons of the game.
++#[derive(Default)]
++pub(super) struct Owned {
++    pub(super) ids: HashSet<String>,
++    pub(super) addons: HashSet<String>,
++}
++
++/// The user ticket as collections takes it: `d=<ticket>` becomes `t=<ticket>&p=` (Ferestre's store_ticket).
++pub(super) fn user_ticket(ticket: String) -> String {
++    match ticket.strip_prefix("d=") {
++        Some(value) if !value.is_empty() => {
++            if value.contains("&p=") { format!("t={value}") } else { format!("t={value}&p=") }
++        }
++        _ => ticket,
++    }
++}
++
++/// The 12-character Store IDs of the active entitlements in one page of the answer, each with whether it may be an
++/// add-on (its kind is not Game or Application, or not given), and the page's continuation token.
++pub(super) fn page(text: &str) -> Result<(Vec<(String, bool)>, Option<String>), String> {
++    let value: serde_json::Value =
++        serde_json::from_str(text).map_err(|_| "the collections answer is not JSON".to_string())?;
++    let ids = value["items"]
++        .as_array()
++        .into_iter()
++        .flatten()
++        .filter(|item| item["status"].as_str().is_none_or(|s| s.eq_ignore_ascii_case("Active")))
++        .filter_map(|item| {
++            let id = item["productId"].as_str()?;
++            // the kind, under either name the Store has used for it
++            let addon = item["productKind"]
++                .as_str()
++                .or(item["productType"].as_str())
++                .is_none_or(|k| !k.eq_ignore_ascii_case("Game") && !k.eq_ignore_ascii_case("Application"));
++            Some((id, addon))
++        })
++        .filter(|(id, _)| id.len() == 12 && id.bytes().all(|c| c.is_ascii_alphanumeric()))
++        .map(|(id, addon)| (id.to_ascii_uppercase(), addon))
++        .collect();
++    let next = value["continuationToken"].as_str().filter(|t| !t.is_empty()).map(str::to_string);
++    Ok((ids, next))
++}
++
++fn correlation_vector() -> String {
++    format!("{}.0", uuid::Uuid::new_v4().simple())
++}
++
++/// The account's active entitlements. Kept for ten minutes.
++pub(super) async fn owned(context: &SimpleContext) -> Result<Arc<Owned>, String> {
++    if let Ok(cache) = CACHE.lock()
++        && let Some((at, set)) = cache.as_ref()
++        && at.elapsed() < KEEP
++    {
++        return Ok(set.clone());
++    }
++    let device = context.device_token.clone().ok_or("no device ticket")?;
++    let issued = xodus::api::live::exchange_device_token(
++        &context.client,
++        device.clone(),
++        HOSTING_APP.into(),
++        TARGET.into(),
++        Some(soap::PolicyReference::mbi_ssl()),
++    )
++    .await
++    .map_err(|e| format!("the Store's device ticket: {e:?}"))?;
++    let Token::Compact(auth) = Token::from(issued) else {
++        return Err("the Store's device ticket came back in the legacy form".into());
++    };
++    let Ok(Token::Legacy(user_legacy)) = context.tokens().get_user_sts_token() else {
++        return Err("no signed-in user ticket".into());
++    };
++    let user = context.tokens().get_user().map_err(|e| format!("no stored user: {e}"))?;
++    let outcome = xodus::api::live::exchange_user_token(
++        &context.client,
++        user_legacy,
++        user.username,
++        device,
++        None,
++        Some("Silent".to_string()),
++        HOSTING_APP.into(),
++        &[(TARGET.to_owned(), Some(soap::PolicyReference::mbi_ssl()))],
++    )
++    .await
++    .map_err(|e| format!("the Store's user ticket: {e:?}"))?;
++    let token: Token = match outcome {
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut c))
++            if !c.security_tokens.is_empty() => c.security_tokens.remove(0).into(),
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(t)) => (*t).into(),
++        _ => return Err("Microsoft refused the Store's user ticket".into()),
++    };
++    let Token::Compact(ticket) = token else {
++        return Err("the Store's user ticket came back in the legacy form".into());
++    };
++    let identity = user_ticket(ticket);
++
++    let mut set = Owned::default();
++    let mut continuation: Option<String> = None;
++    for _ in 0..MAX_PAGES {
++        let mut body = serde_json::json!({
++            "maxPageSize": 100,
++            "excludeDuplicates": true,
++            "productTypes": ["Application", "Durable", "Game", "Pass"],
++            "beneficiaries": [{ "identitytype": "msa", "identityValue": identity, "localTicketReference": "1" }],
++        });
++        if let Some(token) = &continuation {
++            body["continuationToken"] = serde_json::Value::String(token.clone());
++        }
++        let response = context
++            .client
++            .post(QUERY)
++            .header("Authorization", &auth)
++            .header("Content-Type", "application/json")
++            .header("MS-CV", correlation_vector())
++            .body(body.to_string())
++            .timeout(Duration::from_secs(20))
++            .send()
++            .await
++            .map_err(|e| format!("the Store's collections could not be reached ({})", e.without_url()))?;
++        let status = response.status();
++        let text = response.text().await.unwrap_or_default();
++        if !status.is_success() {
++            return Err(format!("the Store's collections answered HTTP {status}"));
++        }
++        let (ids, next) = page(&text)?;
++        for (id, addon) in ids {
++            if addon {
++                set.addons.insert(id.clone());
++            }
++            set.ids.insert(id);
++        }
++        continuation = next;
++        if continuation.is_none() {
++            break;
++        }
++    }
++    tracing::info!("The account owns {} Store products (collections)", set.ids.len());
++    let set = Arc::new(set);
++    if let Ok(mut cache) = CACHE.lock() {
++        *cache = Some((Instant::now(), set.clone()));
++    }
++    Ok(set)
++}
++
++fn related(entry: &serde_json::Value) -> impl Iterator<Item = (&str, &str)> {
++    entry["MarketProperties"]
++        .as_array()
++        .into_iter()
++        .flatten()
++        .flat_map(|m| m["RelatedProducts"].as_array().into_iter().flatten())
++        .filter_map(|r| Some((r["RelatedProductId"].as_str()?, r["RelationshipType"].as_str()?)))
++}
++
++/// The game's editions: the bundles its catalog entry names ("Bundle").
++pub(super) fn editions(parent_entry: &serde_json::Value) -> HashSet<String> {
++    related(parent_entry)
++        .filter(|(_, kind)| kind.eq_ignore_ascii_case("Bundle"))
++        .map(|(id, _)| id.to_ascii_uppercase())
++        .collect()
++}
++
++/// Whether a catalog entry is an add-on of `parent` ("addOnParent").
++pub(super) fn is_addon_of(entry: &serde_json::Value, parent: &str) -> bool {
++    related(entry).any(|(id, kind)| kind.eq_ignore_ascii_case("addOnParent") && id.eq_ignore_ascii_case(parent))
++}
++
++/// What a bundle contains: the products of its SKUs' BundledSkus.
++pub(super) fn bundled(entry: &serde_json::Value) -> HashSet<String> {
++    entry["DisplaySkuAvailabilities"]
++        .as_array()
++        .into_iter()
++        .flatten()
++        .flat_map(|d| d["Sku"]["Properties"]["BundledSkus"].as_array().into_iter().flatten())
++        .filter_map(|b| b["BigId"].as_str())
++        .filter(|id| id.len() == 12 && id.bytes().all(|c| c.is_ascii_alphanumeric()))
++        .map(|id| id.to_ascii_uppercase())
++        .collect()
++}
++
++/// The game's add-ons the account owns: those it owns outright (their catalog entry names the game as parent) and
++/// those an owned edition or bundle contains. The game itself and its editions are not in the answer. Kept for ten
++/// minutes; what could not be looked up is left out, said in the log.
++pub(super) async fn family(parent: &str, owned: &Owned) -> Arc<HashSet<String>> {
++    let parent = parent.to_ascii_uppercase();
++    let mut fingerprint: Vec<&String> = owned.ids.iter().collect();
++    fingerprint.sort();
++    let key = format!("{parent}:{}", fingerprint.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","));
++    if let Ok(cache) = FAMILY.lock()
++        && let Some((at, k, set)) = cache.as_ref()
++        && *k == key
++        && at.elapsed() < KEEP
++    {
++        return set.clone();
++    }
++    let editions = match super::catalog::relationships(vec![parent.clone()]).await {
++        Ok(entries) => entries.first().map(editions).unwrap_or_default(),
++        Err(e) => {
++            tracing::warn!("The game's editions could not be looked up: {e}");
++            HashSet::new()
++        }
++    };
++    let mut lookup: Vec<String> = owned
++        .addons
++        .iter()
++        .chain(editions.iter().filter(|e| owned.ids.contains(*e)))
++        .filter(|id| **id != parent)
++        .cloned()
++        .collect();
++    lookup.sort();
++    lookup.dedup();
++    if lookup.len() > MAX_LOOKUPS {
++        tracing::warn!("{} owned products to look up; only the first {MAX_LOOKUPS} are", lookup.len());
++        lookup.truncate(MAX_LOOKUPS);
++    }
++    let mut mine = HashSet::new();
++    for chunk in lookup.chunks(200) {
++        match super::catalog::relationships(chunk.to_vec()).await {
++            Ok(entries) => {
++                for entry in &entries {
++                    let id = entry["ProductId"].as_str().unwrap_or_default().to_ascii_uppercase();
++                    let edition = editions.contains(&id);
++                    if edition || is_addon_of(entry, &parent) {
++                        if !edition {
++                            mine.insert(id);
++                        }
++                        mine.extend(bundled(entry));
++                    }
++                }
++            }
++            Err(e) => {
++                tracing::warn!("Owned products could not be looked up in the catalog: {e}");
++                break;
++            }
++        }
++    }
++    mine.remove(&parent);
++    for edition in &editions {
++        mine.remove(edition);
++    }
++    tracing::info!("The account owns {} of the game's add-ons", mine.len());
++    let mine = Arc::new(mine);
++    if let Ok(mut cache) = FAMILY.lock() {
++        *cache = Some((Instant::now(), key, mine.clone()));
++    }
++    mine
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_user_ticket_takes_the_collections_form() {
++        assert_eq!(user_ticket("d=abc".into()), "t=abc&p=");
++        assert_eq!(user_ticket("d=abc&p=x".into()), "t=abc&p=x");
++        assert_eq!(user_ticket("t=already".into()), "t=already");
++    }
++
++    #[test]
++    fn only_active_store_ids_count() {
++        let text = r#"{"items":[
++            {"productId":"9NR1R1XWLCNB","productType":"Game","status":"Active"},
++            {"productId":"9p0vipaddon0","productType":"Durable","status":"Active"},
++            {"productId":"9EXPIREDPASS","productType":"Pass","status":"Expired"},
++            {"productId":"not-a-store-id","status":"Active"}],
++            "continuationToken":"next-page"}"#;
++        let (ids, next) = page(text).unwrap();
++        assert_eq!(ids, vec![("9NR1R1XWLCNB".to_string(), false), ("9P0VIPADDON0".to_string(), true)]);
++        assert_eq!(next.as_deref(), Some("next-page"));
++        assert!(page(r#"{"items":[]}"#).unwrap().1.is_none());
++        assert!(page("<html>").is_err());
++        let (kindless, _) = page(r#"{"items":[{"productId":"9ABCDEFGHIJK"}]}"#).unwrap();
++        assert_eq!(kindless, vec![("9ABCDEFGHIJK".to_string(), true)], "no kind given: it may be an add-on");
++    }
++
++    #[test]
++    fn editions_add_ons_and_bundle_contents_come_from_the_catalog_entries() {
++        let parent = serde_json::json!({"ProductId":"9NR1R1XWLCNB","MarketProperties":[{"RelatedProducts":[
++            {"RelatedProductId":"9NQ1H88ZH2D7","RelationshipType":"Bundle"},
++            {"RelatedProductId":"9ndbxsjfp7dh","RelationshipType":"Bundle"},
++            {"RelatedProductId":"9XXXXXXXXXXX","RelationshipType":"SellableBy"}]}]});
++        assert_eq!(editions(&parent), ["9NQ1H88ZH2D7", "9NDBXSJFP7DH"].map(String::from).into_iter().collect());
++        let addon = serde_json::json!({"ProductId":"9MSTD1ZC25D7","MarketProperties":[{"RelatedProducts":[
++            {"RelatedProductId":"9NR1R1XWLCNB","RelationshipType":"addOnParent"},
++            {"RelatedProductId":"9NQ1H88ZH2D7","RelationshipType":"Bundle"}]}]});
++        assert!(is_addon_of(&addon, "9nr1r1xwlcnb"));
++        assert!(!is_addon_of(&addon, "9NQ1H88ZH2D7"), "a bundle that sells it is not its parent");
++        assert!(!is_addon_of(&parent, "9NR1R1XWLCNB"));
++        let deluxe = serde_json::json!({"ProductId":"9NQ1H88ZH2D7","DisplaySkuAvailabilities":[
++            {"Sku":{"SkuId":"0010","Properties":{"IsBundle":true,"BundledSkus":[{"BigId":"9NR1R1XWLCNB"},{"BigId":"9NTBFBZMB84T"},{"BigId":"9MSTD1ZC25D7"}]}}},
++            {"Sku":{"SkuId":"0017","Properties":{"IsBundle":true,"BundledSkus":[{"BigId":"9PLW4PR6DH9T"},{"BigId":"bad"}]}}}]});
++        assert_eq!(bundled(&deluxe), ["9NR1R1XWLCNB", "9NTBFBZMB84T", "9MSTD1ZC25D7", "9PLW4PR6DH9T"].map(String::from).into_iter().collect());
++    }
++}
+--- /dev/null
++++ b/crates/xodus-service/src/connection/license.rs
 @@ -0,0 +1,199 @@
 +//! Store licence tokens (`XStoreQueryLicenseTokenAsync`), asked by the runtime with message type 7.
 +//!
@@ -900,12 +1404,13 @@ diff -ruN a/crates/xodus-service/src/connection/license.rs b/crates/xodus-servic
 +        assert!(parse_response(b"<html>").is_err());
 +    }
 +}
-diff -ruN a/crates/xodus-service/src/connection/mod.rs b/crates/xodus-service/src/connection/mod.rs
---- a/crates/xodus-service/src/connection/mod.rs	2026-11-20 12:58:24
-+++ b/crates/xodus-service/src/connection/mod.rs	2026-11-20 13:17:14
-@@ -1,9 +1,11 @@
+--- a/crates/xodus-service/src/connection/mod.rs
++++ b/crates/xodus-service/src/connection/mod.rs
+@@ -1,9 +1,13 @@
 +pub mod catalog;
++pub mod collections;
 +pub mod license;
++pub mod picture;
  pub mod proto;
  pub mod router;
  pub mod xml;
@@ -916,9 +1421,174 @@ diff -ruN a/crates/xodus-service/src/connection/mod.rs b/crates/xodus-service/sr
      let size = message_buffer.len() as u16;
      buffer.extend(magic.to_le_bytes());
      buffer.extend(msg_type.to_le_bytes());
-diff -ruN a/crates/xodus-service/src/connection/proto.rs b/crates/xodus-service/src/connection/proto.rs
---- a/crates/xodus-service/src/connection/proto.rs	2026-11-20 12:58:24
-+++ b/crates/xodus-service/src/connection/proto.rs	2026-11-20 13:17:14
+--- /dev/null
++++ b/crates/xodus-service/src/connection/picture.rs
+@@ -0,0 +1,163 @@
++//! The player's gamer picture, for XUserGetGamerPictureAsync (GSDX frames).
++//!
++//! The runtime used to hand every title a neutral grey square: Forza Horizon 6 aborted when the call failed, and the
++//! picture itself needs the Xbox profile service. So players saw a grey profile picture (issue #18). This asks
++//! profile.xboxlive.com for the account's GameDisplayPicRaw setting (the picture's address, on Xbox's image service)
++//! with the user's Xbox token, fetches it as a PNG of the size asked for, and keeps it for the life of the service.
++//!
++//! Frame: "GSDX", then [version 1, size in pixels] as two u32; the answer is "GSDX", [status, length] as two u32 and
++//! the PNG (status 0), or status 1 and no bytes: the runtime then keeps its grey square.
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use xodus::models::xgameruntime::xuser::XSTSTokenRequest;
++
++use crate::simple_context::SimpleContext;
++
++pub(super) const MAGIC: u32 = 0x58445347; // "GSDX"
++const PROFILE: &str = "https://profile.xboxlive.com/users/me/profile/settings?settings=GameDisplayPicRaw";
++const MAX_IMAGE: usize = 4 * 1024 * 1024;
++
++static CACHE: Mutex<Option<HashMap<u32, Arc<Vec<u8>>>>> = Mutex::new(None);
++
++/// The sizes Xbox's image service is asked for, from what XUserGamerPictureSize stands for (64, 208, 424, 1080).
++pub(super) fn pixels(asked: u32) -> u32 {
++    match asked {
++        0..=64 => 64,
++        65..=208 => 208,
++        209..=424 => 424,
++        _ => 1080,
++    }
++}
++
++/// The picture's address in the profile service's answer, as a PNG of `px` pixels a side.
++pub(super) fn picture_url(profile: &str, px: u32) -> Result<String, String> {
++    let value: serde_json::Value =
++        serde_json::from_str(profile).map_err(|_| "the profile answer is not JSON".to_string())?;
++    let url = value["profileUsers"]
++        .as_array()
++        .and_then(|users| users.first())
++        .and_then(|user| user["settings"].as_array())
++        .and_then(|settings| settings.iter().find(|s| s["id"] == "GameDisplayPicRaw"))
++        .and_then(|s| s["value"].as_str())
++        .filter(|u| u.starts_with("https://"))
++        .ok_or_else(|| "the profile has no gamer picture".to_string())?;
++    let joiner = if url.contains('?') { '&' } else { '?' };
++    Ok(format!("{url}{joiner}format=png&w={px}&h={px}"))
++}
++
++fn is_png(bytes: &[u8]) -> bool {
++    bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
++}
++
++async fn fetch(context: &SimpleContext, px: u32) -> Result<Arc<Vec<u8>>, String> {
++    if let Ok(cache) = CACHE.lock()
++        && let Some(hit) = cache.as_ref().and_then(|c| c.get(&px))
++    {
++        return Ok(hit.clone());
++    }
++    let auth = super::xml::xsts_response(
++        context,
++        &XSTSTokenRequest {
++            url: PROFILE.into(),
++            relying_party: String::new(),
++            method: "GET".into(),
++            body_base64: String::new(),
++            title_id: String::new(),
++            title_client_id: String::new(),
++        },
++    )
++    .await
++    .map_err(|e| format!("no Xbox token for the profile: {e}"))?;
++    let mut request = context
++        .client
++        .get(PROFILE)
++        .header("Authorization", &auth.token)
++        .header("x-xbl-contract-version", "3")
++        .timeout(Duration::from_secs(15));
++    if !auth.signature.is_empty() {
++        request = request.header("Signature", &auth.signature);
++    }
++    let response = request.send().await.map_err(|e| format!("the profile could not be reached ({})", e.without_url()))?;
++    if !response.status().is_success() {
++        return Err(format!("the profile service answered HTTP {}", response.status()));
++    }
++    let url = picture_url(&response.text().await.unwrap_or_default(), px)?;
++    let image = context
++        .client
++        .get(&url)
++        .timeout(Duration::from_secs(15))
++        .send()
++        .await
++        .map_err(|e| format!("the picture could not be fetched ({})", e.without_url()))?;
++    if !image.status().is_success() {
++        return Err(format!("the image service answered HTTP {}", image.status()));
++    }
++    let bytes = image.bytes().await.map_err(|e| e.without_url().to_string())?;
++    if bytes.len() > MAX_IMAGE || !is_png(&bytes) {
++        return Err("the image service did not answer with a PNG".into());
++    }
++    let bytes = Arc::new(bytes.to_vec());
++    if let Ok(mut cache) = CACHE.lock() {
++        cache.get_or_insert_with(HashMap::new).insert(px, bytes.clone());
++    }
++    tracing::info!("Gamer picture fetched ({px} px, {} bytes)", bytes.len());
++    Ok(bytes)
++}
++
++pub(super) async fn handle(socket: &mut tokio::net::UnixStream, context: &SimpleContext) -> tokio::io::Result<()> {
++    let mut head = [0u8; 8];
++    tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut head))
++        .await
++        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
++    let version = u32::from_le_bytes(head[..4].try_into().unwrap());
++    let asked = u32::from_le_bytes(head[4..].try_into().unwrap());
++    let answer = if version != 1 {
++        Err(format!("gamer picture request version {version}"))
++    } else {
++        tokio::time::timeout(Duration::from_secs(25), fetch(context, pixels(asked)))
++            .await
++            .unwrap_or_else(|_| Err("the gamer picture did not come in 25 s".into()))
++    };
++    let mut out = Vec::new();
++    out.extend(MAGIC.to_le_bytes());
++    match answer {
++        Ok(png) => {
++            out.extend(0u32.to_le_bytes());
++            out.extend((png.len() as u32).to_le_bytes());
++            out.extend(png.iter());
++        }
++        Err(e) => {
++            tracing::warn!("No gamer picture, the game keeps a plain one: {e}");
++            out.extend(1u32.to_le_bytes());
++            out.extend(0u32.to_le_bytes());
++        }
++    }
++    socket.write_all(&out).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_picture_address_comes_from_the_profile_settings() {
++        let answer = r#"{"profileUsers":[{"id":"2535","hostId":null,"settings":[
++            {"id":"GameDisplayPicRaw","value":"https://images-eds-ssl.xboxlive.com/image?url=abc"}],"isSponsoredUser":false}]}"#;
++        assert_eq!(picture_url(answer, 208).unwrap(),
++                   "https://images-eds-ssl.xboxlive.com/image?url=abc&format=png&w=208&h=208");
++        let plain = r#"{"profileUsers":[{"settings":[{"id":"GameDisplayPicRaw","value":"https://example.test/pic.png"}]}]}"#;
++        assert_eq!(picture_url(plain, 64).unwrap(), "https://example.test/pic.png?format=png&w=64&h=64");
++        assert!(picture_url(r#"{"profileUsers":[{"settings":[]}]}"#, 64).is_err());
++        assert!(picture_url(r#"{"profileUsers":[{"settings":[{"id":"GameDisplayPicRaw","value":"http://insecure"}]}]}"#, 64).is_err());
++    }
++
++    #[test]
++    fn sizes_follow_the_runtimes_enumeration() {
++        assert_eq!((pixels(64), pixels(208), pixels(424), pixels(1080), pixels(0)), (64, 208, 424, 1080, 64));
++        assert!(is_png(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0]));
++        assert!(!is_png(b"\xff\xd8\xff"));
++    }
++}
+--- a/crates/xodus-service/src/connection/proto.rs
++++ b/crates/xodus-service/src/connection/proto.rs
 @@ -1,8 +1,10 @@
  use crate::simple_context::SimpleContext;
  
@@ -931,9 +1601,8 @@ diff -ruN a/crates/xodus-service/src/connection/proto.rs b/crates/xodus-service/
 +    tracing::warn!("A protobuf-framed request arrived; this service only speaks the XML framing");
 +    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "protobuf framing is not implemented"))
  }
-diff -ruN a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
---- a/crates/xodus-service/src/connection/router.rs	2026-11-20 12:58:24
-+++ b/crates/xodus-service/src/connection/router.rs	2026-11-20 13:27:02
+--- a/crates/xodus-service/src/connection/router.rs
++++ b/crates/xodus-service/src/connection/router.rs
 @@ -1,12 +1,19 @@
  use std::sync::Arc;
  
@@ -980,13 +1649,14 @@ diff -ruN a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service
              return;
          }
  
-@@ -32,14 +46,158 @@
+@@ -32,14 +46,159 @@
          let res = match magic {
              crate::XML_MAGIC => super::xml::handle(&mut socket, &mut context).await,
              crate::PROTO_MAGIC => super::proto::handle(&mut socket, &mut context).await,
 +            ROLES_MAGIC => roles(&mut socket, &context).await,
 +            ENTITLEMENT_MAGIC => entitlement(&mut socket, &context).await,
-+            CATALOG_MAGIC => super::catalog::handle(&mut socket).await,
++            CATALOG_MAGIC => super::catalog::handle(&mut socket, &context).await,
++            super::picture::MAGIC => super::picture::handle(&mut socket, &context).await,
              _ => {
 -                tracing::error!("Unknown magic");
 +                tracing::warn!("Unknown message {magic:#010x} from the game; closing its connection");
@@ -1000,8 +1670,8 @@ diff -ruN a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service
 +            tracing::warn!("There was an error handling the message: {err}");
 +            return;
          }
-+    }
-+}
+     }
+ }
 +
 +fn signed_in(context: &SimpleContext) -> bool {
 +    context.tokens().get_user().is_ok() && context.tokens().get_user_sts_token().is_ok()
@@ -1139,11 +1809,10 @@ diff -ruN a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service
 +        let mut header = [0u8; 8];
 +        s.read_exact(&mut header).await.unwrap();
 +        assert_eq!(u16::from_le_bytes([header[4], header[5]]), 42);
-     }
- }
-diff -ruN a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
---- a/crates/xodus-service/src/connection/xml.rs	2026-11-20 12:58:24
-+++ b/crates/xodus-service/src/connection/xml.rs	2026-11-20 13:27:02
++    }
++}
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
 @@ -246,23 +246,37 @@
      context: &mut SimpleContext,
  ) -> tokio::io::Result<()> {
@@ -1188,10 +1857,11 @@ diff -ruN a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/sr
      socket.write_all(&data).await
  }
  
-@@ -303,6 +317,168 @@
+@@ -302,7 +316,169 @@
+         max_body,
      )
  }
- 
++
 +/// The XSTS token a request needs, and the request's signature when its endpoint takes one: minted as the title
 +/// first (what Windows does), the user-only token as the fallback. The title's own requests and the licence token
 +/// path share it: a licence token is asked of licensing.mp.microsoft.com with exactly such a token.
@@ -1271,7 +1941,7 @@ diff -ruN a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/sr
 +        }
 +    };
 +    tracing::debug!("Relying party: {relying_party}");
-+
+ 
 +    // Re-use a still-valid token rather than paying for the whole
 +    // chain again; keep a minute of headroom so one never expires in
 +    // flight.
@@ -1524,9 +2194,8 @@ diff -ruN a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/sr
          }
          _ => Err("Unimplemented".into()),
      }
-diff -ruN a/crates/xodus-service/src/device.rs b/crates/xodus-service/src/device.rs
---- a/crates/xodus-service/src/device.rs	1970-01-01 01:00:00
-+++ b/crates/xodus-service/src/device.rs	2026-11-20 13:27:02
+--- /dev/null
++++ b/crates/xodus-service/src/device.rs
 @@ -0,0 +1,85 @@
 +//! The device ticket, renewed when Microsoft refuses it.
 +//!
@@ -1613,9 +2282,8 @@ diff -ruN a/crates/xodus-service/src/device.rs b/crates/xodus-service/src/device
 +        assert_eq!(super::current(&start).token, "start");
 +    }
 +}
-diff -ruN a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
---- a/crates/xodus-service/src/main.rs	2026-11-20 13:17:14
-+++ b/crates/xodus-service/src/main.rs	2026-11-20 13:27:02
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
 @@ -9,7 +9,9 @@
  use tracing_subscriber::util::SubscriberInitExt;
  use xodus::tokens::TokenManager;
@@ -1709,7 +2377,7 @@ diff -ruN a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
      if std::env::args().any(|a| a == "--check") {
          let user = match tokens.get_user_sts_token() {
              Ok(xodus::models::secrets::Token::Legacy(user)) => user,
-@@ -59,14 +137,24 @@
+@@ -59,15 +137,25 @@
              }
          };
          let signer = xodus::api::xbox::RequestSigner::generate();
@@ -1730,11 +2398,49 @@ diff -ruN a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
 +        if let Err(err) = &result
 +            && device::worth_renewing(err)
 +            && let Ok(renewed) = device::renew(&client, &tokens).await
-+        {
+         {
 +            eprintln!("CHECK note: Microsoft's ticket exchange failed ({err}); trying again with a renewed device ticket");
 +            result = xodus::api::xbox::try_run_with_signer(&client, renewed, user, "http://xboxlive.com", Some(&signer)).await;
 +        }
 +        match result
-         {
++        {
              Ok(_) => {
                  println!("CHECK ok: Xbox accepted the account");
+                 std::process::exit(0);
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -10,4 +10,6 @@
+     MSA_TOKEN_RESPONSE=4;
+     XSTS_TOKEN_REQUEST=5;
+     XSTS_TOKEN_RESPONSE=6;
++    LICENSE_TOKEN_REQUEST=7;
++    LICENSE_TOKEN_RESPONSE=8;
+ }
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs
+@@ -56,3 +56,25 @@
+     #[serde(default)]
+     pub signature: String,
+ }
++
++/// A title's `XStoreQueryLicenseTokenAsync`, as the runtime frames it (message type 7): the game's own Store ID,
++/// the add-ons it asks about, and its custom developer string (base64, so XML cannot normalize or reject control
++/// characters in it). The service answers with type 8 carrying only the licence token (a JWT), or an empty frame.
++/// Same shape as Ferestre's xodus fork (icex/xodus), whose xgameruntime this engine runs.
++#[derive(Deserialize)]
++#[serde(rename_all = "PascalCase")]
++pub struct LicenseTokenIpcRequest {
++    pub parent_product_id: String,
++    pub product_ids: LicenseProductIds,
++    pub custom_base64: String,
++    #[serde(default)]
++    pub title_id: String,
++    #[serde(default)]
++    pub title_client_id: String,
++}
++
++#[derive(Deserialize)]
++pub struct LicenseProductIds {
++    #[serde(rename = "ProductId", default)]
++    pub ids: Vec<String>,
++}

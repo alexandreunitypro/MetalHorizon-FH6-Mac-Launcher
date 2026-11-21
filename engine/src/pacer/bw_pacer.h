@@ -98,7 +98,7 @@ static inline int bw_pacer_parse( const char *value, struct bw_pacer *p )
         p->automatic = 1;
         p->duty = 40;                   /* where MacGameFix's player found the best compromise on an M4 Max */
         p->min_duty = 10;
-        p->max_duty = 70;
+        p->max_duty = 60;               /* from about 65 up the game's own short pause grows (MacGameFix, M4 Max) */
         if (value[4] == ',') bytes = (unsigned)strtoul( value + 5, NULL, 10 );
         p->bytes = bw_pacer_clamp_bytes( bytes );
         return 1;

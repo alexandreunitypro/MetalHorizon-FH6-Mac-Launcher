@@ -210,6 +210,9 @@ On the author's setup, playing is one line: `bash tools/jouer.sh`.
 - [Ferestre](https://github.com/icex/ferestre), by icex: Wine patches for the Xbox edition.
 - Highball's Steam method (window with DXMT and sync off, silent client for games, clean shutdown) and their
   [DXMT build](https://github.com/gauthierpiarrette/dxmt); [DXMT](https://github.com/3Shain/dxmt) by 3Shain (MIT).
+- [MetalDuck](https://github.com/Lospi/MetalDuck), by Roberto Camargo (GPL-3.0): frame generation (Settings ›
+  Graphics). Its window capture, its use of Apple's frame interpolation model and its overlay are adapted in
+  [`app/Sources/MetalHorizon/FrameGeneration/`](app/Sources/MetalHorizon/FrameGeneration/).
 - [SDL](https://github.com/libsdl-org/SDL) (zlib) for controllers; [mingw-w64](https://www.mingw-w64.org) for the Steam engine.
 - [xodus](https://github.com/xodus-gaming/xodus) (GPL-3.0): MSIXVC packages and Xbox sign-in.
 - Wine, and CodeWeavers for the CrossOver sources (LGPL-2.1-or-later).

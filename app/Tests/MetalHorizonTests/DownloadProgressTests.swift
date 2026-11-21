@@ -88,4 +88,43 @@ final class DownloadProgressTests: XCTestCase {
         let lines = ["Downloading", "progress 1 2", "progress 5", "error: not enough free disk space"]
         XCTAssertEqual(LogFilter.apply(lines, errorsOnly: false, search: ""), ["Downloading", "error: not enough free disk space"])
     }
+
+    // MARK: How a download ends (21 November 2026: "Download finished." with no game)
+
+    /// xodus-cli's line from that download's log, word for word.
+    private let shortOfRoom = "not enough free disk space on /Users/alexandre/Documents/FORZA HORIZON 6: need 170545541024 bytes, have 16238161920 bytes (files: 170545541024)"
+
+    func testReadsXodusLineWhenTheDiskIsShortOfRoom() throws {
+        let space = try XCTUnwrap(DownloadProgress.notEnoughSpace(shortOfRoom))
+        XCTAssertEqual(space.need, 170_545_541_024)
+        XCTAssertEqual(space.free, 16_238_161_920)
+        for line in ["", "progress 1 2", "not enough free disk space", "need 5 bytes, have 3 bytes", "Download finished."] {
+            XCTAssertNil(DownloadProgress.notEnoughSpace(line), line)
+        }
+    }
+
+    func testTheReportedDownloadIsNotFinished() {
+        // the download of 21 November: xodus gave up for lack of room and exited with 0, and there was no game
+        let status = DownloadProgress.outcome(exitCode: 0, gameReady: false, log: ["Initializing", shortOfRoom], folder: "~/Documents/FORZA HORIZON 6")
+        XCTAssertFalse(status.contains("Download finished"))
+        XCTAssertEqual(status, "Not enough free space: the game needs 171 GB in ~/Documents/FORZA HORIZON 6, and 16.2 GB are free. "
+                       + "Free some space, or choose a folder on a drive with more room, then press Download the Game again.")
+        // the same with xodus-cli 0007, which exits with a failure
+        XCTAssertEqual(DownloadProgress.outcome(exitCode: 1, gameReady: false, log: [shortOfRoom], folder: "~/FH6"),
+                       DownloadProgress.notEnoughSpaceMessage(need: 170_545_541_024, free: 16_238_161_920, folder: "~/FH6"))
+    }
+
+    func testFinishedOnlyWithTheGame() {
+        XCTAssertEqual(DownloadProgress.outcome(exitCode: 0, gameReady: true, log: ["progress 10 10"], folder: "~/FH6"), "Download finished.")
+        let without = DownloadProgress.outcome(exitCode: 0, gameReady: false, log: ["could not get the licence"], folder: "~/FH6")
+        XCTAssertFalse(without.contains("finished"))
+        XCTAssertTrue(without.contains("Download the Game"))
+        XCTAssertEqual(DownloadProgress.outcome(exitCode: 101, gameReady: false, log: [], folder: "~/FH6"),
+                       "The download stopped (error 101). See the activity log.")
+    }
+
+    func testCountsTheRoomOfAnExistingDisk() throws {
+        let free = try XCTUnwrap(DownloadProgress.availableBytes(at: NSTemporaryDirectory() + "a/folder/not/made/yet"))
+        XCTAssertGreaterThan(free, 0, "a folder not made yet counts the room of the disk it would be on")
+    }
 }

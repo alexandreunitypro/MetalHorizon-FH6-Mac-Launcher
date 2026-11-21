@@ -1,0 +1,164 @@
+From: FORZA-LAUNCHER-FOR-MAC-BLACKWELL-PROJECT
+Subject: [PATCH] streaming: a download that did not happen exits with a failure
+
+MetalHorizon 2.0.0. `xodus-cli streaming` gave up without the game (not enough free disk space, no licence, an
+unexpected content key) after printing why, and still exited with success: MetalHorizon said "Download finished.",
+Download the Game stayed, and there was no game (report of 21 November: 171 GB needed, 16 GB free, after the
+package's index, about 1 GB, had been fetched). run_reader now says whether the files were downloaded, and `run` exits
+with a failure when they were not. The index cached for that run (.xodus-streaming-tmp.msixvc, about 1 GB, emptied by
+the next run anyway) is removed when the download is given up, so it does not hold room on a disk short of it.
+
+On top of 0006, in the tree MetalHorizon bundles xodus-cli from (work/xodus), with patch -p1.
+Tests: cargo test --release --offline -p xodus-cli streaming.
+---
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -104,7 +104,7 @@
+     market: Option<String>,
+ ) -> ExitCode {
+     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+-    if source.starts_with("file://") {
++    let downloaded = if source.starts_with("file://") {
+         let fsrc = source.strip_prefix("file://").unwrap_or_default();
+         let f = match File::open(fsrc).await {
+             Ok(f) => f,
+@@ -133,7 +133,7 @@
+             &tx,
+             rx,
+         )
+-        .await;
++        .await
+     } else {
+         let vurl = if source.starts_with("http://") || source.starts_with("https://") {
+             source
+@@ -209,10 +209,16 @@
+             &tx,
+             rx,
+         )
+-        .await;
+-    }
++        .await
++    };
+ 
+-    ExitCode::SUCCESS
++    // A download that did not happen (no licence, no room on the disk) is a failure: it used to end with success,
++    // and MetalHorizon said "Download finished." with no game.
++    if downloaded {
++        ExitCode::SUCCESS
++    } else {
++        ExitCode::FAILURE
++    }
+ }
+ 
+ async fn run_cli_reader<Reader>(
+@@ -227,7 +233,7 @@
+     url: &str,
+     tx: &Sender<ProgressEvent>,
+     mut rx: Receiver<ProgressEvent>,
+-) -> ()
++) -> bool
+ where
+     Reader: AsyncRead + Unpin,
+ {
+@@ -291,7 +297,7 @@
+ 
+         total_progess.abandon();
+     });
+-    run_reader(
++    let downloaded = run_reader(
+         client,
+         tokens,
+         destination,
+@@ -309,8 +315,16 @@
+     if tx.send(ProgressEvent::Done { ack }).await.is_ok() {
+         acked.await.ok();
+     }
++    downloaded
+ }
+ 
++/// The download is given up before its files (no licence, no room on the disk): the package's index cached for this
++/// run is removed, as the next run would empty it anyway (about 1 GB, on a disk that may be short of room).
++fn give_up(cache_path: &Path) -> bool {
++    std::fs::remove_file(cache_path).ok();
++    false
++}
++
+ async fn run_reader<Reader>(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+@@ -322,7 +336,7 @@
+     l: u64,
+     url: &str,
+     tx: &Sender<ProgressEvent>,
+-) -> ()
++) -> bool
+ where
+     Reader: AsyncRead + Unpin,
+ {
+@@ -401,7 +415,7 @@
+     .await;
+     if let Err(err) = license {
+         eprintln!("{}", err);
+-        return;
++        return give_up(&cache_path);
+     }
+     let (key, game_splicense) = license.unwrap();
+     if game_splicense.content_keys.len() != 1 {
+@@ -409,10 +423,10 @@
+             "unexpected number of content keys {}",
+             game_splicense.content_keys.len()
+         );
+-        return;
++        return give_up(&cache_path);
+     }
+     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
+-        return;
++        return give_up(&cache_path);
+     };
+ 
+     let full_key = content_key.unpack(&key).expect("failed to unpack");
+@@ -438,7 +452,7 @@
+                 out.display(),
+                 err
+             );
+-            return;
++            return give_up(&cache_path);
+         }
+     };
+ 
+@@ -450,7 +464,7 @@
+             available_free_space,
+             total_size
+         );
+-        return;
++        return give_up(&cache_path);
+     }
+ 
+     tx.send(ProgressEvent::UpdateRemaining {
+@@ -544,6 +558,7 @@
+ 
+     std::fs::remove_file(&final_path).ok();
+     std::fs::rename(&cache_path, &final_path).expect("ok");
++    true
+ }
+ 
+ #[cfg(test)]
+@@ -571,6 +586,18 @@
+     }
+ 
+     #[test]
++    fn giving_up_fails_and_removes_the_cached_index() {
++        let dir = std::env::temp_dir().join(format!("xodus-give-up-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let cache = dir.join(".xodus-streaming-tmp.msixvc");
++        std::fs::write(&cache, b"index").unwrap();
++        assert!(!give_up(&cache), "a download given up is a failure");
++        assert!(!cache.exists(), "the run's cached index is removed");
++        assert!(!give_up(&cache), "and nothing to remove is fine");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    #[test]
+     fn progress_lines_nothing_to_fetch() {
+         let mut lines = ProgressLines::default();
+         assert_eq!(lines.start(42, 0, Instant::now()), "progress 0 0");

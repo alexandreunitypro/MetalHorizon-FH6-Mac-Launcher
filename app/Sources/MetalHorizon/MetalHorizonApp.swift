@@ -149,6 +149,7 @@ struct MetalHorizonApp: App {
             ("xodus", "https://github.com/xodus-gaming/xodus"),
             ("xodus Wine", "https://github.com/xodus-gaming/wine"),
             ("DXMT, by 3Shain", "https://github.com/3Shain/dxmt"),
+            ("MetalDuck, by Roberto Camargo (frame generation)", "https://github.com/Lospi/MetalDuck"),
             ("Mullion", "https://github.com/dttdrv/mullion"),
             ("Wine", "https://github.com/wine-mirror/wine"),
             ("llvm-mingw", "https://github.com/mstorsjo/llvm-mingw"),
@@ -161,9 +162,9 @@ struct MetalHorizonApp: App {
 
     private func showAbout() {
         let credits = NSAttributedString(string: """
-            MetalHorizon X 2.0. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
+            MetalHorizon X \(Updater.currentVersion). Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
             Built on Highball (its native arm64 route, FEX patches and signed loader), Ferestre, xodus, Wine, FEX, KosmicKrisp, \
-            vkd3d-proton, DXVK, DXMT, SDL and Apple's D3DMetal: see the Thanks menu.
+            vkd3d-proton, DXVK, DXMT, SDL, MetalDuck (frame generation) and Apple's D3DMetal: see the Thanks menu.
             """, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
         NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
         NSApp.activate(ignoringOtherApps: true)
@@ -237,7 +238,10 @@ final class LauncherModel: ObservableObject {
     @Published var autoRetry = true {
         didSet { settingsStore().set(autoRetry, forKey: SettingKey.autoRetry) }
     }
-    @Published var activity = Activity.idle
+    @Published var activity = Activity.idle {
+        // frame generation (MetalDuck, Settings › Graphics) runs while the game does
+        didSet { if (activity == .game) != (oldValue == .game) { FrameGeneration.shared.gameStateChanged(playing: activity == .game) } }
+    }
     @Published var status = "Ready."
     @Published var accountSaved = false
     /// Xbox refused the saved sign-in during the last Play (metalhorizon-play.sh leaves this marker): the account step
@@ -962,13 +966,25 @@ final class LauncherModel: ObservableObject {
 
     func download() {
         guard canDownload, let resources = Bundle.main.resourceURL else { return }
+        // A first download needs the game's whole size where it goes: refused here at once, rather than after xodus
+        // has fetched the package's index (about 1 GB) to find the disk short of room. An update (the game already
+        // there) needs less, and xodus checks it.
+        if !setup.gameCheck.ok, let free = DownloadProgress.availableBytes(at: gameDirectory), free < DownloadProgress.gameBytes {
+            status = DownloadProgress.notEnoughSpaceMessage(need: DownloadProgress.gameBytes, free: free,
+                                                            folder: Setup.tildePath(gameDirectory))
+            return
+        }
         let cli = Setup.xodusCLI(resources: resources)
         // xodus checks the licence on the signed-in account: only an owned game downloads.
         // XODUS_PROGRESS=lines: "progress <done> <total>" lines for the bar (patches/xodus-cli/0006)
         run(executable: cli, arguments: ["streaming", storeProductID, gameDirectory],
             environment: ["RUST_BACKTRACE": "1", "XODUS_PROGRESS": "lines"],
-            activity: .download, statusText: "Downloading Forza Horizon 6 from the Xbox servers…", logName: "download") { code in
-            code == 0 ? "Download finished." : "The download stopped (error \(code)). See the activity log."
+            activity: .download, statusText: "Downloading Forza Horizon 6 from the Xbox servers…", logName: "download") { [weak self] code in
+            // finished only when the game is there: xodus said so (not enough room...) and an older xodus-cli exited
+            // with 0 anyway (DownloadProgress.outcome)
+            guard let self else { return code == 0 ? "Download finished." : "The download stopped (error \(code))." }
+            return DownloadProgress.outcome(exitCode: code, gameReady: self.setup.gameCheck.ok, log: self.outputTail.lines,
+                                            folder: Setup.tildePath(self.gameDirectory))
         }
     }
 

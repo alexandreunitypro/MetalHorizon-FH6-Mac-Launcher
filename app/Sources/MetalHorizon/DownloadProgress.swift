@@ -51,6 +51,55 @@ enum DownloadProgress {
     }
 }
 
+// MARK: - How a download ends
+
+// 21 November 2026: with 16 GB free, xodus-cli fetched the package's index (about 1 GB), found it needed 171 GB, said
+// so and stopped, but with exit code 0: the window said "Download finished.", Download the Game stayed, and there was
+// no game. xodus-cli now exits with a failure (patches/xodus-cli/0007); the window also checks the room before a first
+// download, and after any download looks at what xodus said and whether the game is there.
+extension DownloadProgress {
+    /// The room the game's files take, as xodus-cli asked for it on 21 November 2026 (170.5 GB). xodus checks the
+    /// exact figure itself once it has read the package's index.
+    static let gameBytes: Int64 = 170_545_541_024
+
+    /// The room left where the game goes, counted as xodus-cli counts it: what the volume has available now, without
+    /// the space macOS could purge (xodus refuses on this figure, so a check on a larger one would let it fail).
+    static func availableBytes(at path: String) -> Int64? {
+        var url = URL(fileURLWithPath: path)
+        while !FileManager.default.fileExists(atPath: url.path), url.path != "/" { url.deleteLastPathComponent() }
+        return (try? url.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity.map(Int64.init)
+    }
+
+    /// xodus-cli's line when the disk is short of room:
+    /// `not enough free disk space on <folder>: need <n> bytes, have <m> bytes (files: <t>)`.
+    static func notEnoughSpace(_ line: String) -> (need: Int64, free: Int64)? {
+        guard let regex = try? NSRegularExpression(pattern: #"not enough free disk space on .*: need (\d+) bytes, have (\d+) bytes"#),
+              let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+              let needRange = Range(match.range(at: 1), in: line), let freeRange = Range(match.range(at: 2), in: line),
+              let need = Int64(line[needRange]), let free = Int64(line[freeRange]) else { return nil }
+        return (need, free)
+    }
+
+    /// What the window says when the room is missing.
+    static func notEnoughSpaceMessage(need: Int64, free: Int64, folder: String) -> String {
+        "Not enough free space: the game needs \(bytes(need)) in \(folder), and \(bytes(free)) are free. "
+            + "Free some space, or choose a folder on a drive with more room, then press Download the Game again."
+    }
+
+    /// What the window says when xodus-cli's download ends. An exit code of 0 is not enough on its own: an older
+    /// xodus-cli exited with 0 after giving up, so the game must be there too.
+    static func outcome(exitCode: Int32, gameReady: Bool, log: [String], folder: String) -> String {
+        if let space = log.lazy.compactMap(notEnoughSpace).last {
+            return notEnoughSpaceMessage(need: space.need, free: space.free, folder: folder)
+        }
+        if exitCode == 0 && gameReady { return "Download finished." }
+        if exitCode == 0 {
+            return "The download ended without the game. What xodus said is in the activity log; press Download the Game to try again."
+        }
+        return "The download stopped (error \(exitCode)). See the activity log."
+    }
+}
+
 /// The download's state from its progress lines: where it is, and a speed smoothed over a few seconds (a single
 /// half-second would make the time left jump around).
 struct DownloadMeter: Equatable {

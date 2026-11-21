@@ -43,6 +43,12 @@ final class BetaChannelTests: XCTestCase {
         XCTAssertTrue(beta.betaEngineInUse)
         XCTAssertEqual(beta.engine, installedBetaEngineDirectory)
         XCTAssertEqual(beta.optionsEnvironment(gameInput: false)["BW_PACER"], "auto", "the pacer runs with the beta engine")
+        XCTAssertEqual(beta.optionsEnvironment(gameInput: false)["BW_TRAP_BOOST"], "1", "and the trap boost")
+        if ProcessInfo.processInfo.activeProcessorCount > 8 {
+            XCTAssertEqual(beta.optionsEnvironment(gameInput: false)["WINENCPU"], "8", "the game sees 8 processors")
+        }
+        XCTAssertNil(setup(.xbox, .stable).optionsEnvironment(gameInput: false)["BW_TRAP_BOOST"], "nothing of the beta on Public")
+        XCTAssertNil(setup(.xbox, .stable).optionsEnvironment(gameInput: false)["WINENCPU"])
         XCTAssertEqual(setup(.xbox, .stable).engine, installedEngineDirectory, "the public channel ignores an installed beta")
         XCTAssertEqual(setup(.xbox, .stable).optionsEnvironment(gameInput: false)["BW_PACER"], "")
         XCTAssertEqual(setup(.xbox, .beta, override: "/opt/my-wine").engine, "/opt/my-wine", "a chosen engine folder still wins")

@@ -1,5 +1,5 @@
 {
-  "note": "Everything Blackwell Engine Native 1.2 is built from, pinned. Order: extract wine, apply highball patches-arm64 (all, sorted), apply patches-arm64-xbox/0100, 0101 and 0102, run engine/build-native.sh, then engine/package-native.sh with the three Highball archives below.",
+  "note": "Everything Blackwell Engine Native 1.3 is built from, pinned. Order: extract wine, apply highball patches-arm64 (all, sorted), apply patches-arm64-xbox/0100 to 0104 in order, run engine/build-native.sh, then engine/package-native.sh with the three Highball archives below.",
   "wine": {
     "url": "https://dl.winehq.org/wine/source/11.x/wine-11.18.tar.xz",
     "sha256": "c6282f6d4daecf11f3ab9f9a2b6c598f67be7e28c363ba2cae8a3c44b611e7a4"
@@ -15,7 +15,9 @@
     "file": "engine/patches-arm64-xbox/0100-blackwell-xbox-on-wine-11.18-arm64.patch",
     "from": "engine/patches 0001, 0002, 0004, 0006 to 0009 and 0012, ported to Wine 11.18; 0003 (macOS %gs TEB slots) and 0005 (x86-64 exception traces) are x86-64 only and left out; 0008's concurrent_vector hunks are upstream in 11.18; its concurrent queue iterator (which Forza Horizon 6 calls: FHE01 without it, issue #14) is ported since Native 1.1",
     "online": "engine/patches-arm64-xbox/0101-ntdll-dualstack-ipv4-options.patch since Native 1.2: prsloan's dual-stack socket fix from highball-engine pull request #40 (their arm64 0059, LGPL-2.1-or-later), so Forza Horizon 6 keeps its UDP game socket and joins online sessions (engine/patches/ORIGIN-online.md)",
-    "controllers": "engine/patches-arm64-xbox/0102-gameinput-xinput-pads-as-xbox.patch since Native 1.2: every pad GameInput reports through XInput is an Xbox One controller to the game (issue #15: a DualSense seen as connected that did nothing); WINE_GAMEINPUT_REAL_IDS=1 keeps their own ids"
+    "controllers": "engine/patches-arm64-xbox/0102-gameinput-xinput-pads-as-xbox.patch since Native 1.2: every pad GameInput reports through XInput is an Xbox One controller to the game (issue #15: a DualSense seen as connected that did nothing); WINE_GAMEINPUT_REAL_IDS=1 keeps their own ids",
+    "store": "engine/patches-arm64-xbox/0103-xgameruntime-store-ownership-gamer-picture.patch since Native 1.3: the add-ons the account owns, their licences and the account's own gamer picture, from xodus-service (issue #18); what the game got before whenever the service cannot answer",
+    "pads": "engine/patches-arm64-xbox/0104-gameinput-controller-ui-navigation-and-macos-pads.patch since Native 1.3: a pad is also a generic controller and a UI navigation device, as Windows reports an Xbox pad, and when XInput has no pad the pads macOS knows are read through GameController.framework (a PlayStation pad on Bluetooth, issue #15); WINE_GAMEINPUT_APPLE=0 turns that source off"
   },
   "llvm-mingw": {
     "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz",

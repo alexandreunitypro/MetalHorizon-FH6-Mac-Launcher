@@ -124,7 +124,9 @@ final class InstallerTests: XCTestCase {
         let loader = try XCTUnwrap(all["wineloader"]), native = try XCTUnwrap(all["engine-native"])
         let home = FileManager.default.homeDirectoryForCurrentUser
         let sources = [home.appendingPathComponent("BlackwellEngine-build/arm64-inputs/Highball-0.10.26.zip"),
-                       home.appendingPathComponent("BlackwellEngine-build/native-out/blackwell-engine-native-1.2.tar.xz")]
+                       // the bundle the pins name, whichever version that is
+                       home.appendingPathComponent("BlackwellEngine-build/native-out")
+                           .appendingPathComponent(URL(string: native.url)!.lastPathComponent)]
         guard sources.allSatisfy({ fileExists($0.path) }) else { throw XCTSkip("the native archives are not on this Mac") }
         for source in sources {
             let cached = downloadCache.appendingPathComponent(source.lastPathComponent)

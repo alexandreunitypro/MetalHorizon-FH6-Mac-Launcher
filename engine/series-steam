@@ -28,5 +28,10 @@
 # a PlayStation or third-party pad is read as a gamepad, not as a HID device (issue #15). WINE_GAMEINPUT_REAL_IDS=1
 # keeps their own ids.
 0015-gameinput-xinput-pads-as-xbox.patch
+# Controllers (since engine 1.3, MetalHorizon 1.1.1, issue #15): a pad is also a generic controller and a UI
+# navigation device, as Windows reports an Xbox pad, and when XInput has no pad the pads macOS itself knows are read
+# through GameController.framework (a PlayStation pad on Bluetooth). WINE_GAMEINPUT_APPLE=0 turns that source off.
+# Tested without the game: tests/gameinput-pads.
+0018-gameinput-controller-ui-navigation-and-macos-pads.patch
 # The 32-bit half: 0005's FH6 diagnostics read x86_64 registers, kept to the 64-bit build.
 0013-i386-build-guards.patch

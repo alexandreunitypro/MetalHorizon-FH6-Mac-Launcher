@@ -46,7 +46,7 @@ path, version, series, commit = sys.argv[1:5]
 d = json.load(open(path))
 d.update({"version": version, "channel": "beta", "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
           "seriesSha256": series, "commit": commit,
-          "beta": "Rosetta line: Blackwell Pacer (BW_PACER=auto) and Highball's 0005, 0014, 0015, 0025, 0028"})
+          "beta": "Rosetta line: the public engine plus the Blackwell Pacer (BW_PACER=auto), the Trap Boost (BW_TRAP_BOOST=1) and Highball's 0005, 0014, 0015, 0025, 0028"})
 json.dump(d, open(path, "w"), indent=2)
 PY
 echo "== 4. tarball"

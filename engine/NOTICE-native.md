@@ -17,7 +17,13 @@ The native Apple silicon engine MetalHorizon 1.0 uses for Forza Horizon 6 (Xbox 
     IPv6 game socket before matchmaking (`IP_DONTFRAGMENT`, `IP_TTL`), which macOS refuses, are set as their IPv6
     counterparts, so the game keeps its UDP socket and joins online sessions;
   - since 1.2, `0102-gameinput-xinput-pads-as-xbox.patch`: every pad GameInput reports through XInput is an Xbox One
-    controller to the game, so a PlayStation or third-party pad is read as a gamepad (issue #15).
+    controller to the game, so a PlayStation or third-party pad is read as a gamepad (issue #15);
+  - since 1.3, `0103-xgameruntime-store-ownership-gamer-picture.patch`: the add-ons the account owns (the VIP
+    membership, the Car Pass, what an edition contains), their licences and the account's own gamer picture, from
+    MetalHorizon's xodus-service (issue #18);
+  - since 1.3, `0104-gameinput-controller-ui-navigation-and-macos-pads.patch`: a pad is also a generic controller and a
+    UI navigation device, as Windows reports an Xbox pad, and when XInput has no pad the pads macOS itself knows are
+    read through Apple's GameController.framework, so a PlayStation pad on Bluetooth reaches the game (issue #15).
 - **From Highball's engine release** `engine-arm64-wine-11.18-20261104T130327Z-arm64-games-0053-0054` (unchanged):
   FEX 2610 with Highball's FEX patches (MIT) as `xtajit64.dll` / `xtajit.dll` and its Darwin helper; GStreamer 1.28.7
   and winegstreamer (LGPL-2.1); the host libraries Wine opens by name (FreeType, GnuTLS, SDL and what they link);

@@ -1,0 +1,10 @@
+LIBRARY xinput1_4.dll
+EXPORTS
+    XInputGetState
+    XInputSetState
+    XInputGetCapabilities
+    XInputEnable
+    XInputGetStateEx @100 NONAME
+    XInputGetCapabilitiesEx @108 NONAME
+    FakeXInputSet
+    FakeXInputMotors

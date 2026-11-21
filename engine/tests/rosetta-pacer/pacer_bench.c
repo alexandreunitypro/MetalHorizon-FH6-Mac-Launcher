@@ -8,7 +8,9 @@
  * runs under Rosetta, as the game does.
  *
  *   clang -O2 -arch x86_64 -I../../src/pacer -o pacer_bench pacer_bench.c -lpthread
- *   [BW_PACER=auto|<duty>[,<bytes>]] ./pacer_bench <seconds> [trappers=2] [writers=3] [pages=4096]
+ *   [BW_PACER=auto|<duty>[,<bytes>]] [BW_TRAP_BOOST=1] ./pacer_bench <seconds> [trappers=2] [writers=3] [pages=4096]
+ *                                                               [spinners=0]
+ * Spinners are threads that only keep a core busy, as the game's own threads do (the trap boost's case).
  *
  * Prints the stops (when, how long) and, per thread kind, the calls made a second.
  * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -16,8 +18,10 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE
 #include "bw_pacer.h"
+#include "bw_trapboost.h"
 #include <signal.h>
 #include <sys/ucontext.h>
+#include <pthread/qos.h>
 
 #define MAX_STOPS 512
 struct stop { char kind; int index; double at_s, took_ms; };
@@ -46,6 +50,9 @@ static void *trapper( void *arg )
 {
     int index = (int)(intptr_t)arg;
     unsigned char *stub = mmap( NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    /* BENCH_TRAPPER_QOS=utility: the trapping threads at a low priority, against high-priority spinners */
+    if (getenv( "BENCH_TRAPPER_QOS" ) && !strcmp( getenv( "BENCH_TRAPPER_QOS" ), "utility" ))
+        pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
     stub[0] = 0x0f; stub[1] = 0x0b; stub[2] = 0xc3;   /* ud2; ret */
     while (running)
     {
@@ -59,6 +66,17 @@ static void *trapper( void *arg )
 }
 
 static unsigned pages = 4096;
+
+static void *spinner( void *arg )
+{
+    volatile unsigned long long n = 0;
+    (void)arg;
+    /* BENCH_SPINNER_QOS=1: the spinners run as a game's high-priority threads do (Wine maps them to this QoS) */
+    if (getenv( "BENCH_SPINNER_QOS" ) && !strcmp( getenv( "BENCH_SPINNER_QOS" ), "1" ))
+        pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
+    while (running) n++;
+    return NULL;
+}
 
 static void *writer( void *arg )
 {
@@ -87,10 +105,11 @@ int main( int argc, char **argv )
     unsigned seconds = argc > 1 ? (unsigned)atoi( argv[1] ) : 60;
     unsigned trappers = argc > 2 ? (unsigned)atoi( argv[2] ) : 2;
     unsigned writers = argc > 3 ? (unsigned)atoi( argv[3] ) : 3;
+    unsigned spinners = argc > 5 ? (unsigned)atoi( argv[5] ) : 0;
     struct sigaction sa;
     pthread_t threads[64];
     unsigned i, n = 0, worst_ms = 0;
-    int pacer;
+    int pacer, boost;
 
     if (argc > 4) pages = (unsigned)atoi( argv[4] );
     memset( &sa, 0, sizeof(sa) );
@@ -101,6 +120,8 @@ int main( int argc, char **argv )
             trappers, writers, pages, bw_pacer_translated() ? "yes" : "no", getenv( "BW_PACER" ) ? getenv( "BW_PACER" ) : "(unset)" );
     start_ns = bw_pacer_now();
     pacer = bw_pacer_start( NULL );
+    boost = bw_trapboost_start( NULL );
+    for (i = 0; i < spinners && n < 64; i++) pthread_create( &threads[n++], NULL, spinner, NULL );
     for (i = 0; i < trappers && n < 64; i++) pthread_create( &threads[n++], NULL, trapper, (void *)(intptr_t)i );
     for (i = 0; i < writers && n < 64; i++) pthread_create( &threads[n++], NULL, writer, (void *)(intptr_t)i );
     sleep( seconds );
@@ -108,7 +129,8 @@ int main( int argc, char **argv )
     for (i = 0; i < n; i++) pthread_join( threads[i], NULL );
 
     /* one stop shared by several threads is one event: grouped by start within 5 ms */
-    printf( "pacer: %s\n", pacer ? "on" : "off" );
+    printf( "pacer: %s, trap boost: %s, spinners: %u\n", pacer ? "on" : "off", boost ? "on" : "off", spinners );
+    if (trappers) printf( "one trap's round trip: %.1f us on average\n", seconds * trappers * 1e6 / (double)(trap_calls ? trap_calls : 1) );
     printf( "calls a second: traps %.0f, rewrites %.0f\n", trap_calls / (double)seconds, write_calls / (double)seconds );
     printf( "stops of 20 ms or more (any thread):\n" );
     {

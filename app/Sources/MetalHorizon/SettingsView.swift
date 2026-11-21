@@ -153,6 +153,7 @@ private struct GraphicsSettings: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            FrameGenerationSection()
         }
         .formStyle(.grouped)
         .frame(minHeight: 260)

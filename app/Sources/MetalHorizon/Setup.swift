@@ -401,16 +401,25 @@ struct Setup {
         return FileManager.default.isExecutableFile(atPath: login.path) ? login : resources.appendingPathComponent("xodus-cli")
     }
 
+    /// Frames on screen for each of the game's: 1 unless frame generation is on and can run here.
+    var frameGenerationMultiplier: Int {
+        let settings = FrameGenerationSettings.load()
+        return settings.enabled && frameGenerationSupported() ? settings.mode.multiplier : 1
+    }
+
     /// The options every script reads (metalhorizon-common.sh).
     func optionsEnvironment(gameInput: Bool) -> [String: String] {
-        [
+        var env: [String: String] = [
             "MH_ENGINE": engine,
             "MH_D3DMETAL": d3dmetal,
             "MH_SHIM": shimDirectory,
             "MH_HUD": metalHUD ? "1" : "0",
             "MH_GAMEINPUT": gameInput ? "1" : "0",
             "MH_METALFX": metalFX ? "1" : "0",
-            "MH_MAX_FPS": String(maxFPS),
+            // with frame generation on (MetalDuck, Settings › Graphics) and no cap of the player's, the game is capped at
+            // the screen's refresh divided by the multiplier, so its frames come evenly between the interpolated ones
+            "MH_MAX_FPS": String(FrameGenerationSettings.gameFrameCap(
+                playerCap: maxFPS, multiplier: frameGenerationMultiplier, refresh: mainDisplayRefreshRate())),
             "MH_RETRIES": autoRetry ? "2" : "0",
             "MH_SYNC": plainSync ? "plain" : "msync",
             "MH_LOGS": logDirectory.path,
@@ -418,6 +427,13 @@ struct Setup {
             // public engine has none, and an empty value starts none
             "BW_PACER": betaEngineInUse ? "auto" : ""
         ]
+        if betaEngineInUse {
+            // Rosetta's exception server raised for the game's traps (bw_trapboost.h), and the game shown at most 8
+            // processors: fewer of its worker threads compete for the translator, and the Mac runs cooler (MacGameFix)
+            env["BW_TRAP_BOOST"] = "1"
+            if ProcessInfo.processInfo.activeProcessorCount > 8 { env["WINENCPU"] = "8" }
+        }
+        return env
     }
 
     /// What metalhorizon-play.sh reads (the MCP server's show_play_environment passes the same).

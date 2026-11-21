@@ -28,6 +28,16 @@ DLL has to be loaded by the game), in how it starts (only in `BW_PACER_EXE`, onl
 process, signals blocked) and in `BW_PACER=auto`, which tunes its duty from the stops it sees itself. Measured in
 `engine/tests/rosetta-pacer/README.md`.
 
+## The Blackwell Trap Boost (since 1.3a2, Blackwell Engine's own code)
+
+The same patch adds `engine/src/pacer/bw_trapboost.h`: Rosetta's exception server (`com.apple.rosetta.exceptionserver`,
+the one thread that services every trap of a translated process) raised to the latency and throughput tiers and the
+precedence of a highest-priority thread, when `BW_TRAP_BOOST=1` (set by MetalHorizon in beta mode). The finding is
+MacGameFix's (NotProton's `rosetta-trap-boost` plugin, `engine/sources/fh6-20261111/rosetta-trap-boost.c`, a library
+injected into the process); here a thread in ntdll does it, only in `BW_PACER_EXE`, only under Rosetta. MetalHorizon's
+beta mode also shows the game at most 8 processors (`WINENCPU=8`, which this engine's ntdll understands), as
+MacGameFix recommends: fewer of its worker threads compete for the translator.
+
 MacGameFix's other Forza Horizon 6 change, a fast path in ntdll's exception dispatcher that executes the simple
 instructions between the protection's traps itself (its `0023`, about 1,800 lines of x86 instruction emulation for
 Wine 11.21), is not in this alpha: on this engine's base it cannot be checked without the game, and an emulation
