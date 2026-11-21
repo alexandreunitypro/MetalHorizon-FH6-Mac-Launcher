@@ -850,7 +850,7 @@ struct UpdateSheet: View {
                     if retry {
                         Button("Try Again") { updater.retry() }
                     }
-                    Button(page == nil && !retry ? "OK" : "Continue") { updater.dismiss() }
+                    Button(page == nil && !retry ? tr("OK") : tr("Continue")) { updater.dismiss() }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
                 }

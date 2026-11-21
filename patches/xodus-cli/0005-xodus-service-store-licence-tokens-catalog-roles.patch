@@ -1,0 +1,1740 @@
+xodus-service: answer the game's Store questions (licence tokens, its own licence, the Store catalog, account roles)
+
+MetalHorizon 1.0.4. The engines run Ferestre's xgameruntime (icex/xgameruntime), which asks the service for Store
+licence tokens (XML message type 7, XStoreQueryLicenseTokenAsync), the game's own licence (ESDX frames), the Store
+catalog (CSDX frames) and the account roles (ASDX frames). This service, from upstream xodus with MetalHorizon's
+patches 0002 to 0004, knew none of them: "Unimplemented" and "Unknown magic" in its log, a closed connection for the
+game, and in the game no VIP membership, no Car Pass cars and no expansions (MetalHorizon issue #18).
+
+- connection/license.rs: licence tokens the way Ferestre's service (icex/xodus a4f9d5c) asks them, POST
+  /v8.0/licenseToken authorized and signed with the title's XSTS token for licensing.mp.microsoft.com, through the
+  service's existing XSTS path (xml.rs: xsts_response, factored out of the XSTS branch). Bound to the game's Store ID
+  (XODUS_STORE_PRODUCT, binding.rs) when the launcher passes it.
+- connection/catalog.rs: Ferestre's Store catalog bridge, unchanged (plus one live test, ignored by default).
+- connection/router.rs: the three frames above; a client closing its connection is no longer logged as an error.
+- xml.rs: the runtime's extended frame size (type bit 0x8000) for requests over 64 KiB; any XML type is answered with
+  its type plus one, as the runtime checks.
+- proto.rs: the unimplemented protobuf framing refuses instead of panicking.
+- main.rs: --latest-version <content id>, the version Microsoft publishes for the game's package (authenticated package
+  service, http://update.xboxlive.com), so MetalHorizon can offer an update to an outdated game.
+- device.rs: when Microsoft's ticket exchange refuses, the device ticket is renewed once from the stored device key
+  (as Ferestre does since icex/xodus e35bde1) and the request tried again, in the service and in --check; the renewed
+  ticket stays in memory (nothing written to the Keychain).
+
+diff -ruN a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+--- a/crates/xodus/proto/xodus/common.proto	2026-11-20 12:58:24
++++ b/crates/xodus/proto/xodus/common.proto	2026-11-20 13:17:14
+@@ -10,4 +10,6 @@
+     MSA_TOKEN_RESPONSE=4;
+     XSTS_TOKEN_REQUEST=5;
+     XSTS_TOKEN_RESPONSE=6;
++    LICENSE_TOKEN_REQUEST=7;
++    LICENSE_TOKEN_RESPONSE=8;
+ }
+diff -ruN a/crates/xodus/src/models/xgameruntime/xuser.rs b/crates/xodus/src/models/xgameruntime/xuser.rs
+--- a/crates/xodus/src/models/xgameruntime/xuser.rs	2026-11-20 12:58:24
++++ b/crates/xodus/src/models/xgameruntime/xuser.rs	2026-11-20 13:17:14
+@@ -56,3 +56,25 @@
+     #[serde(default)]
+     pub signature: String,
+ }
++
++/// A title's `XStoreQueryLicenseTokenAsync`, as the runtime frames it (message type 7): the game's own Store ID,
++/// the add-ons it asks about, and its custom developer string (base64, so XML cannot normalize or reject control
++/// characters in it). The service answers with type 8 carrying only the licence token (a JWT), or an empty frame.
++/// Same shape as Ferestre's xodus fork (icex/xodus), whose xgameruntime this engine runs.
++#[derive(Deserialize)]
++#[serde(rename_all = "PascalCase")]
++pub struct LicenseTokenIpcRequest {
++    pub parent_product_id: String,
++    pub product_ids: LicenseProductIds,
++    pub custom_base64: String,
++    #[serde(default)]
++    pub title_id: String,
++    #[serde(default)]
++    pub title_client_id: String,
++}
++
++#[derive(Deserialize)]
++pub struct LicenseProductIds {
++    #[serde(rename = "ProductId", default)]
++    pub ids: Vec<String>,
++}
+diff -ruN a/crates/xodus-service/src/binding.rs b/crates/xodus-service/src/binding.rs
+--- a/crates/xodus-service/src/binding.rs	1970-01-01 01:00:00
++++ b/crates/xodus-service/src/binding.rs	2026-11-20 13:17:14
+@@ -0,0 +1,13 @@
++//! The game this service answers for, as MetalHorizon's Play binds it: `XODUS_STORE_PRODUCT`, the game's 12-character
++//! Store ID from its MicrosoftGame.config. Unset (or not a Store ID), nothing is bound and every answer is as before.
++pub fn store_product() -> Option<String> {
++    static BOUND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
++    BOUND
++        .get_or_init(|| {
++            std::env::var("XODUS_STORE_PRODUCT")
++                .ok()
++                .map(|p| p.trim().to_ascii_uppercase())
++                .filter(|p| p.len() == 12 && p.bytes().all(|c| c.is_ascii_alphanumeric()))
++        })
++        .clone()
++}
+diff -ruN a/crates/xodus-service/src/connection/catalog.rs b/crates/xodus-service/src/connection/catalog.rs
+--- a/crates/xodus-service/src/connection/catalog.rs	1970-01-01 01:00:00
++++ b/crates/xodus-service/src/connection/catalog.rs	2026-11-20 13:17:14
+@@ -0,0 +1,616 @@
++// Store catalog bridge (CSDX frames): copied unchanged from Ferestre's xodus fork, icex/xodus at a4f9d5c
++// (crates/xodus-service/src/connection/catalog.rs, GPL-3.0 like the rest of xodus), whose xgameruntime this engine
++// runs: it answers the game's Store product queries (its add-ons and editions) from the public catalog.
++//! Read-only Store catalog bridge. Microsoft supplies relationships, product
++//! metadata and prices; listing a product never grants an account a license.
++//! The wire protocol is bounded, versioned and contains no credentials.
++use serde_json::Value;
++use std::collections::HashSet;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++const MAX_REQUEST: usize = 24_000;
++const MAX_RESPONSE: usize = 8 * 1024 * 1024;
++const MAX_HTTP: usize = 16 * 1024 * 1024;
++const MAGIC: u32 = 0x58445343; // CSDX, separate from the released XML protocol
++const E_INVALIDARG: u32 = 0x80070057;
++const E_FAIL: u32 = 0x80004005;
++
++type Error = &'static str;
++
++struct Request {
++    kinds: u32,
++    associated: bool,
++    parent: String,
++    market: String,
++    language: String,
++    ids: Vec<String>,
++    actions: Vec<String>,
++}
++
++struct Reader<'a>(&'a [u8]);
++impl Reader<'_> {
++    fn integer(&mut self) -> Result<u32, Error> {
++        let b = self.0.get(..4).ok_or("truncated catalog request")?;
++        let n = u32::from_le_bytes(b.try_into().unwrap());
++        self.0 = &self.0[4..];
++        Ok(n)
++    }
++    fn text(&mut self) -> Result<String, Error> {
++        let n = self.integer()? as usize;
++        if n > 128 {
++            return Err("catalog input too long");
++        }
++        let b = self.0.get(..n).ok_or("truncated catalog input")?;
++        let s = std::str::from_utf8(b)
++            .map_err(|_| "invalid catalog input")?
++            .to_owned();
++        self.0 = &self.0[n..];
++        Ok(s)
++    }
++}
++fn valid_id(s: &str) -> bool {
++    matches!(s.len(), 12 | 16) && s.bytes().all(|c| c.is_ascii_alphanumeric())
++}
++fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
++    let mut r = Reader(bytes);
++    if r.integer()? != 1 {
++        return Err("unsupported catalog protocol");
++    }
++    let mode = r.integer()?;
++    let kinds = r.integer()?;
++    // Store IDs are case-insensitive and the catalog answers in upper case,
++    // so compare and ask in upper case whatever case the title passed.
++    let parent = r.text()?.to_ascii_uppercase();
++    let market = r.text()?;
++    let language = r.text()?;
++    if mode > 1
++        || kinds == 0
++        || kinds & !31 != 0
++        || !valid_id(&parent)
++        || market.len() != 2
++        || !market.bytes().all(|c| c.is_ascii_alphabetic())
++        || language.is_empty()
++        || language.len() > 16
++        || !language
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
++    {
++        return Err("invalid catalog parameters");
++    }
++    let count = r.integer()?;
++    if count > 256 {
++        return Err("too many catalog IDs");
++    }
++    let mut ids = Vec::new();
++    for _ in 0..count {
++        let id = r.text()?.to_ascii_uppercase();
++        if !valid_id(&id) {
++            return Err("invalid catalog ID");
++        }
++        ids.push(id);
++    }
++    let count = r.integer()?;
++    if count > 8 {
++        return Err("too many action filters");
++    }
++    let mut actions = Vec::new();
++    for _ in 0..count {
++        let action = r.text()?;
++        if !matches!(
++            action.as_str(),
++            "Purchase" | "License" | "Gift" | "Redeem" | "Details" | "Browse" | "Curate"
++        ) {
++            return Err("unsupported action filter");
++        }
++        actions.push(action);
++    }
++    if !r.0.is_empty() || (mode == 1 && !ids.is_empty()) || (mode == 0 && ids.is_empty()) {
++        return Err("invalid catalog request shape");
++    }
++    Ok(Request {
++        kinds,
++        associated: mode == 1,
++        parent,
++        market,
++        language,
++        ids,
++        actions,
++    })
++}
++
++async fn json(mut response: reqwest::Response) -> Result<Value, Error> {
++    tracing::debug!(
++        status = response.status().as_u16(),
++        "Store catalog HTTP response"
++    );
++    if !response.status().is_success() {
++        return Err("catalog HTTP failure");
++    }
++    if response
++        .content_length()
++        .is_some_and(|n| n > MAX_HTTP as u64)
++    {
++        return Err("catalog HTTP response too large");
++    }
++    let mut bytes = Vec::new();
++    while let Some(b) = response
++        .chunk()
++        .await
++        .map_err(|_| "catalog response failed")?
++    {
++        if b.len() > MAX_HTTP - bytes.len() {
++            return Err("catalog response too large");
++        }
++        bytes.extend_from_slice(&b);
++    }
++    serde_json::from_slice(&bytes).map_err(|_| "invalid catalog JSON")
++}
++
++async fn associated_ids(client: &reqwest::Client, req: &Request) -> Result<Vec<String>, Error> {
++    // This is the Xbox site's real Add-ons channel, including its opaque
++    // continuation tokens. Never use recommendations as product relationships.
++    let key = format!("ProductAddOns_{}", &req.parent[..12]);
++    let locale = format!(
++        "{}-{}",
++        req.language.split('-').next().unwrap_or("en"),
++        req.market
++    );
++    let mut continuation = String::new();
++    let mut seen_tokens = HashSet::new();
++    let mut ids = Vec::new();
++    let mut seen_ids = HashSet::new();
++    for _ in 0..128 {
++        let body = serde_json::json!({"ChannelId": key, "ChannelKeyToBeUsedInResponse": key,
++            "ReturnFilters": false, "EncodedCT": continuation});
++        let cv = format!(
++            "{:x}.0",
++            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
++        );
++        let value = json(
++            client
++                .post(format!(
++                    "https://emerald.xboxservices.com/xboxcomfd/browse?locale={locale}"
++                ))
++                .header("X-MS-API-Version", "1.1")
++                .header("MS-CV", cv)
++                .json(&body)
++                .send()
++                .await
++                .map_err(|_| "associated catalog transport failed")?,
++        )
++        .await?;
++        let channel = value
++            .get("channels")
++            .and_then(|v| v.get(&key))
++            .ok_or("missing associated catalog channel")?;
++        let products = channel
++            .get("products")
++            .and_then(Value::as_array)
++            .ok_or("missing associated products")?;
++        for product in products {
++            let id = product
++                .get("productId")
++                .and_then(Value::as_str)
++                .ok_or("invalid associated product")?;
++            if !valid_id(id) {
++                return Err("invalid associated product ID");
++            }
++            if seen_ids.insert(id.to_owned()) {
++                ids.push(id.to_owned());
++            }
++        }
++        if ids.len() > 2048 {
++            return Err("associated catalog exceeds limit");
++        }
++        continuation = channel
++            .get("encodedCT")
++            .and_then(Value::as_str)
++            .unwrap_or("")
++            .to_owned();
++        if continuation.is_empty() {
++            return Ok(ids);
++        }
++        if continuation.len() > 16_384 || !seen_tokens.insert(continuation.clone()) {
++            return Err("invalid associated catalog continuation");
++        }
++    }
++    Err("associated catalog paging exceeds limit")
++}
++
++fn string<'a>(v: &'a Value, name: &str) -> &'a str {
++    v.get(name).and_then(Value::as_str).unwrap_or("")
++}
++fn integer(out: &mut Vec<u8>, n: u32) {
++    out.extend(n.to_le_bytes());
++}
++fn text(out: &mut Vec<u8>, s: &str) -> Result<(), Error> {
++    if s.len() > 131_072 || s.contains('\0') {
++        return Err("invalid catalog text");
++    }
++    integer(out, s.len() as u32);
++    out.extend(s.as_bytes());
++    Ok(())
++}
++fn kind(p: &Value) -> u32 {
++    match string(p, "ProductKind") {
++        "Game" => 4,
++        "Durable" => 2,
++        "Consumable" => 1,
++        "UnmanagedConsumable" => 16,
++        "Pass" => 8,
++        _ => match string(p, "ProductType") {
++            "Game" => 4,
++            "Durable" => 2,
++            "Consumable" => 1,
++            "Subscription" => 8,
++            _ => 0,
++        },
++    }
++}
++fn date(s: &str) -> u64 {
++    chrono::DateTime::parse_from_rfc3339(s)
++        .ok()
++        .map(|d| d.timestamp().max(0) as u64)
++        .unwrap_or(0)
++}
++fn price(out: &mut Vec<u8>, availability: &Value) -> Result<(), Error> {
++    let price = &availability["OrderManagementData"]["Price"];
++    for field in ["MSRP", "ListPrice"] {
++        let n = price[field].as_f64().unwrap_or(0.0);
++        if !n.is_finite() || n < 0.0 || n > f32::MAX as f64 {
++            return Err("invalid catalog price");
++        }
++        out.extend((n as f32).to_le_bytes());
++    }
++    text(out, string(price, "CurrencyCode"))?;
++    out.extend(date(string(&availability["Conditions"], "EndDate")).to_le_bytes());
++    Ok(())
++}
++fn accepted(a: &Value, filters: &[String], purchasable: bool) -> bool {
++    let Some(actions) = a.get("Actions").and_then(Value::as_array) else {
++        return false;
++    };
++    let has = |f: &str| actions.iter().any(|a| a.as_str() == Some(f));
++    (!purchasable || has("Purchase")) && filters.iter().all(|f| has(f))
++}
++fn product(out: &mut Vec<u8>, p: &Value, req: &Request) -> Result<bool, Error> {
++    let k = kind(p);
++    let id = string(p, "ProductId");
++    if k & req.kinds == 0 {
++        return Ok(false);
++    }
++    if !valid_id(id) || id.len() != 12 {
++        return Err("invalid product identity");
++    }
++    let local = p["LocalizedProperties"]
++        .as_array()
++        .and_then(|v| v.first())
++        .ok_or("missing localized product")?;
++    let displays = p["DisplaySkuAvailabilities"]
++        .as_array()
++        .ok_or("missing product SKUs")?;
++    let requested_skus: Vec<_> = req
++        .ids
++        .iter()
++        .filter(|r| r.len() == 16 && &r[..12] == id)
++        .collect();
++    let whole_product = req.associated || req.ids.iter().any(|r| r == id);
++    let skus: Vec<_> = displays
++        .iter()
++        .filter(|d| {
++            (whole_product
++                || requested_skus
++                    .iter()
++                    .any(|r| &r[12..] == string(&d["Sku"], "SkuId")))
++                && d["Availabilities"]
++                    .as_array()
++                    .is_some_and(|aa| aa.iter().any(|a| accepted(a, &req.actions, req.associated)))
++        })
++        .collect();
++    if skus.is_empty() {
++        return Ok(false);
++    }
++    if skus.len() > 256 {
++        return Err("too many product SKUs");
++    }
++    integer(out, k);
++    for s in [
++        id,
++        string(local, "ProductTitle"),
++        string(local, "ProductDescription"),
++        string(local, "Language"),
++        string(&p["Properties"], "InAppOfferToken"),
++    ] {
++        text(out, s)?;
++    }
++    integer(out, skus.len() as u32);
++    for display in skus {
++        let sku = &display["Sku"];
++        let props = &sku["Properties"];
++        let sl = sku["LocalizedProperties"]
++            .as_array()
++            .and_then(|v| v.first())
++            .unwrap_or(local);
++        let sid = string(sku, "SkuId");
++        if sid.len() != 4 || !sid.bytes().all(|b| b.is_ascii_alphanumeric()) {
++            return Err("invalid SKU identity");
++        }
++        for s in [
++            sid,
++            string(sl, "SkuTitle"),
++            string(sl, "SkuDescription"),
++            string(sl, "Language"),
++        ] {
++            text(out, s)?;
++        }
++        integer(out, props["IsTrial"].as_bool().unwrap_or(false) as u32);
++        integer(
++            out,
++            props["Packages"].as_array().is_some_and(|p| !p.is_empty()) as u32,
++        );
++        let available: Vec<_> = display["Availabilities"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .filter(|a| accepted(a, &req.actions, req.associated))
++            .collect();
++        if available.len() > 256 {
++            return Err("too many availabilities");
++        }
++        integer(out, available.len() as u32);
++        for a in available {
++            text(out, string(a, "AvailabilityId"))?;
++            price(out, a)?;
++        }
++    }
++    let images = local["Images"].as_array().map(Vec::as_slice).unwrap_or(&[]);
++    if images.len() > 256 {
++        return Err("too many catalog images");
++    }
++    integer(out, images.len() as u32);
++    for image in images {
++        let raw = string(image, "Uri");
++        let uri = if raw.starts_with("//") {
++            format!("https:{raw}")
++        } else {
++            raw.to_owned()
++        };
++        for s in [
++            &uri,
++            string(image, "Caption"),
++            string(image, "ImagePurpose"),
++        ] {
++            text(out, s)?;
++        }
++        integer(
++            out,
++            image["Width"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
++        );
++        integer(
++            out,
++            image["Height"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
++        );
++    }
++    Ok(true)
++}
++
++fn catalog_client() -> Result<reqwest::Client, Error> {
++    reqwest::Client::builder()
++        .redirect(reqwest::redirect::Policy::none())
++        .timeout(Duration::from_secs(20))
++        .connect_timeout(Duration::from_secs(8))
++        .build()
++        .map_err(|_| "cannot build catalog client")
++}
++
++/// The catalog entries of up to 256 products, for their relationships.
++///
++/// Relationships do not depend on the market, so this asks the neutral one
++/// rather than guessing the account's. A product the catalog does not know is
++/// simply absent from the answer; anything it returns that was not asked for
++/// fails the whole lookup.
++pub(super) async fn relationships(ids: Vec<String>) -> Result<Vec<Value>, Error> {
++    if ids.len() > 256 || !ids.iter().all(|id| valid_id(id) && id.len() == 12) {
++        return Err("invalid catalog IDs");
++    }
++    let client = catalog_client()?;
++    let mut entries = Vec::new();
++    for chunk in ids.chunks(20) {
++        let value = json(
++            client
++                .get(format!(
++                    "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market=neutral&languages=en-US",
++                    chunk.join(",")
++                ))
++                .send()
++                .await
++                .map_err(|_| "product catalog transport failed")?,
++        )
++        .await?;
++        let products = value["Products"]
++            .as_array()
++            .ok_or("missing catalog products")?;
++        for product in products {
++            if !chunk
++                .iter()
++                .any(|id| id.eq_ignore_ascii_case(string(product, "ProductId")))
++            {
++                return Err("unexpected catalog product");
++            }
++            entries.push(product.clone());
++        }
++    }
++    Ok(entries)
++}
++
++async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
++    let client = catalog_client()?;
++    let ids = if req.associated {
++        associated_ids(&client, req).await?
++    } else {
++        req.ids.clone()
++    };
++    let mut unique = HashSet::new();
++    let ids: Vec<_> = ids
++        .iter()
++        .map(|s| &s[..12])
++        .filter(|s| unique.insert(s.to_string()))
++        .collect();
++    let mut out = Vec::new();
++    integer(&mut out, 1);
++    integer(&mut out, 0);
++    integer(&mut out, 0);
++    let mut count = 0;
++    for chunk in ids.chunks(20) {
++        let value = json(client.get(format!("https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market={}&languages={}",chunk.join(","),req.market,req.language))
++            .send().await.map_err(|_| "product catalog transport failed")?).await?;
++        let products = value["Products"]
++            .as_array()
++            .ok_or("missing catalog products")?;
++        for p in products {
++            if !ids
++                .iter()
++                .any(|id| id.eq_ignore_ascii_case(string(p, "ProductId")))
++            {
++                return Err("unexpected catalog product");
++            }
++            if product(&mut out, p, req)? {
++                count += 1;
++            }
++            if out.len() > MAX_RESPONSE {
++                return Err("catalog wire response exceeds limit");
++            }
++        }
++    }
++    out[8..12].copy_from_slice(&(count as u32).to_le_bytes());
++    tracing::info!(
++        products = count,
++        associated = req.associated,
++        "Store catalog query completed"
++    );
++    Ok(out)
++}
++
++pub(super) async fn handle(socket: &mut tokio::net::UnixStream) -> tokio::io::Result<()> {
++    let size = socket.read_u32_le().await? as usize;
++    if size == 0 || size > MAX_REQUEST {
++        return Err(std::io::ErrorKind::InvalidData.into());
++    }
++    let mut bytes = vec![0; size];
++    socket.read_exact(&mut bytes).await?;
++    let result = match parse_request(&bytes) {
++        Ok(req) => tokio::time::timeout(Duration::from_secs(45), fetch(&req))
++            .await
++            .unwrap_or(Err("catalog query timed out"))
++            .map_err(|e| (E_FAIL, e)),
++        Err(e) => Err((E_INVALIDARG, e)),
++    };
++    let bytes = match result {
++        Ok(b) => b,
++        Err((hr, e)) => {
++            tracing::warn!("Store catalog query failed: {e}");
++            let mut b = Vec::new();
++            integer(&mut b, 1);
++            integer(&mut b, hr);
++            integer(&mut b, 0);
++            b
++        }
++    };
++    socket.write_u32_le(MAGIC).await?;
++    socket.write_u32_le(bytes.len() as u32).await?;
++    socket.write_all(&bytes).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn filters_do_not_invent_ownership_or_ignore_kind_and_sku() {
++        let req = Request {
++            kinds: 2,
++            associated: true,
++            parent: "9TESTPARENT0".into(),
++            market: "US".into(),
++            language: "en-US".into(),
++            ids: vec![],
++            actions: vec![],
++        };
++        let p = serde_json::json!({"ProductId":"9TESTADDON00","ProductKind":"Durable","Properties":{"InAppOfferToken":"real-offer"},"LocalizedProperties":[{"ProductTitle":"café","ProductDescription":"description","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{}},"Availabilities":[{"AvailabilityId":"test","Actions":["Purchase"],"OrderManagementData":{"Price":{"MSRP":3.0,"ListPrice":2.0,"CurrencyCode":"USD"}}}]}]});
++        let mut out = Vec::new();
++        assert!(product(&mut out, &p, &req).unwrap());
++        assert!(out.windows(5).any(|w| w == "café".as_bytes()));
++        let mut req = req;
++        req.kinds = 4;
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++        req.kinds = 2;
++        req.actions = vec!["Gift".into()];
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++        req.actions.clear();
++        req.associated = false;
++        req.ids = vec!["9TESTADDON000011".into()];
++        assert!(!product(&mut Vec::new(), &p, &req).unwrap());
++    }
++    #[test]
++    fn lowercase_store_ids_match_the_catalog_answer() {
++        let mut b = vec![];
++        integer(&mut b, 1);
++        integer(&mut b, 0);
++        integer(&mut b, 31);
++        for s in ["9testparent0", "US", "en-US"] {
++            text(&mut b, s).unwrap();
++        }
++        integer(&mut b, 1);
++        text(&mut b, "9testaddon000010").unwrap();
++        integer(&mut b, 0);
++        let req = parse_request(&b).unwrap();
++        assert_eq!(req.parent, "9TESTPARENT0");
++        assert_eq!(req.ids, ["9TESTADDON000010"]);
++        // The catalog echoes the canonical upper-case ID; the SKU asked for in
++        // lower case still selects its SKU.
++        let p = serde_json::json!({"ProductId":"9TESTADDON00","ProductKind":"Durable","LocalizedProperties":[{"ProductTitle":"t","ProductDescription":"d","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{}},"Availabilities":[{"AvailabilityId":"a","Actions":["Purchase"],"OrderManagementData":{"Price":{"MSRP":1.0,"ListPrice":1.0,"CurrencyCode":"USD"}}}]}]});
++        assert!(product(&mut Vec::new(), &p, &req).unwrap());
++    }
++
++    #[test]
++    fn request_is_versioned_and_rejects_paths_and_trailing_data() {
++        let mut b = vec![];
++        integer(&mut b, 1);
++        integer(&mut b, 0);
++        integer(&mut b, 31);
++        for s in ["9TESTPARENT0", "US", "en-US"] {
++            text(&mut b, s).unwrap();
++        }
++        integer(&mut b, 1);
++        text(&mut b, "9TESTADDON00").unwrap();
++        integer(&mut b, 0);
++        assert!(parse_request(&b).is_ok());
++        b.push(0);
++        assert!(parse_request(&b).is_err());
++        b.pop();
++        b[0] = 2;
++        assert!(parse_request(&b).is_err());
++        assert!(!valid_id("../badparent"));
++        for n in 0..b.len() {
++            assert!(parse_request(&b[..n]).is_err());
++        }
++    }
++
++    /// MetalHorizon: the live catalog answers for Forza Horizon 6 (9NR1R1XWLCNB): its own entry, and its add-ons by
++    /// the associated-products query the in-game marketplace makes. Network only, no account. `cargo test -- --ignored`.
++    #[tokio::test]
++    #[ignore]
++    async fn forza_horizon_6_and_its_add_ons_come_back_from_the_live_catalog() {
++        let own = Request { kinds: 31, associated: false, parent: "9NR1R1XWLCNB".into(), market: "US".into(),
++                            language: "en-US".into(), ids: vec!["9NR1R1XWLCNB".into()], actions: vec![] };
++        let bytes = fetch(&own).await.expect("the game's own entry");
++        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
++        assert_eq!(count, 1, "one product for the game itself");
++        let addons = Request { kinds: 31, associated: true, parent: "9NR1R1XWLCNB".into(), market: "US".into(),
++                               language: "en-US".into(), ids: vec![], actions: vec![] };
++        let bytes = fetch(&addons).await.expect("its add-ons");
++        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
++        eprintln!("Forza Horizon 6 add-ons in the US catalog: {count}");
++        assert!(count > 0, "the game has add-ons (VIP, Car Pass, expansions)");
++    }
++}
+diff -ruN a/crates/xodus-service/src/connection/license.rs b/crates/xodus-service/src/connection/license.rs
+--- a/crates/xodus-service/src/connection/license.rs	1970-01-01 01:00:00
++++ b/crates/xodus-service/src/connection/license.rs	2026-11-20 13:17:14
+@@ -0,0 +1,199 @@
++//! Store licence tokens (`XStoreQueryLicenseTokenAsync`), asked by the runtime with message type 7.
++//!
++//! The game hands the token to its own servers, which read from it what the account owns: for Forza Horizon 6 the
++//! VIP membership, the Car Pass and the expansions of a Premium edition. Without it they see none of that (issue
++//! #18: "VIP status not showing, car pass cars"). The flow is Ferestre's (icex/xodus, `connection/license.rs`, GPL-3.0
++//! like the rest of xodus), whose xgameruntime this engine runs: `POST /v8.0/licenseToken` with the game's Store ID,
++//! `enforceSellableBy`, `relatedProductIds` as a string holding a JSON array, and the title's custom developer string,
++//! authorized and signed with the title's XSTS token for licensing.mp.microsoft.com, as Windows' game runtime does.
++//!
++//! What differs from Ferestre: one account plays and owns here, and the only title this service ever runs is the one
++//! MetalHorizon starts, so the binding is the game's Store ID alone (`XODUS_STORE_PRODUCT`, from its
++//! MicrosoftGame.config). Neither the token nor the authorization behind it is logged.
++use crate::simple_context::SimpleContext;
++use base64::Engine;
++use base64::engine::general_purpose::STANDARD;
++use std::time::Duration;
++use xodus::models::licensing::LicenseTokenResponse;
++use xodus::models::xgameruntime::xuser::{LicenseTokenIpcRequest, XSTSTokenRequest};
++
++pub(super) const URL: &str = "https://licensing.mp.microsoft.com/v8.0/licenseToken";
++const MAX_RESPONSE: usize = 65536;
++/// Fits the reply frame (a 16-bit length) and the runtime's result buffer.
++const MAX_TOKEN: usize = 60000;
++const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
++
++fn valid_product(s: &str) -> bool {
++    matches!(s.len(), 12 | 16) && s.bytes().all(|c| c.is_ascii_alphanumeric())
++}
++
++/// The request's own checks, before anything goes out: Store IDs only, a custom string, and, when the launcher bound
++/// the service to a game, that game's Store ID as the parent.
++fn check(req: &LicenseTokenIpcRequest, bound: Option<&str>) -> Result<(), String> {
++    if !valid_product(&req.parent_product_id) {
++        return Err(format!("{:?} is not a Store product ID", req.parent_product_id));
++    }
++    if req.product_ids.ids.len() > 256 {
++        return Err(format!("{} product IDs in one request", req.product_ids.ids.len()));
++    }
++    if let Some(id) = req.product_ids.ids.iter().find(|id| !valid_product(id)) {
++        return Err(format!("{id:?} is not a Store product ID"));
++    }
++    if let Some(bound) = bound
++        && !req.parent_product_id.eq_ignore_ascii_case(bound)
++    {
++        return Err(format!(
++            "refused a licence token for {:?}: this service answers for {bound}",
++            req.parent_product_id
++        ));
++    }
++    Ok(())
++}
++
++fn body(req: &LicenseTokenIpcRequest) -> Result<Vec<u8>, String> {
++    let custom = STANDARD
++        .decode(&req.custom_base64)
++        .map_err(|_| "the custom developer string is not base64".to_string())?;
++    let custom = std::str::from_utf8(&custom).map_err(|_| "the custom developer string is not UTF-8".to_string())?;
++    if custom.is_empty() {
++        return Err("empty custom developer string".into());
++    }
++    let ids = serde_json::to_string(&req.product_ids.ids).map_err(|e| e.to_string())?;
++    serde_json::to_vec(&serde_json::json!({
++        "parentProductId": req.parent_product_id,
++        "enforceSellableBy": true,
++        "relatedProductIds": ids,
++        "customDeveloperString": custom,
++    }))
++    .map_err(|e| e.to_string())
++}
++
++fn parse_response(bytes: &[u8]) -> Result<String, String> {
++    let response: LicenseTokenResponse =
++        serde_json::from_slice(bytes).map_err(|_| "the licence service's answer is not a token".to_string())?;
++    let token = response.license_token;
++    if token.is_empty()
++        || token.len() > MAX_TOKEN
++        || !token.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
++    {
++        return Err("the licence service answered with an empty or malformed token".into());
++    }
++    Ok(token)
++}
++
++async fn post(url: &str, body: Vec<u8>, authorization: &str, signature: &str) -> Result<String, String> {
++    if authorization.is_empty() {
++        return Err("no XSTS token for the licence service".into());
++    }
++    if signature.is_empty() {
++        return Err("the licence request could not be signed".into());
++    }
++    let client = reqwest::Client::builder()
++        .user_agent("XboxGameRuntime")
++        .redirect(reqwest::redirect::Policy::none())
++        .connect_timeout(Duration::from_secs(10))
++        .timeout(HTTP_TIMEOUT)
++        .build()
++        .map_err(|e| e.to_string())?;
++    let mut response = client
++        .post(url)
++        .header("Authorization", authorization)
++        .header("Signature", signature)
++        .header("Content-Type", "application/json; charset=UTF-8")
++        .header("Cache-Control", "no-cache")
++        .body(body)
++        .send()
++        .await
++        .map_err(|e| format!("the licence service could not be reached ({})", e.without_url()))?;
++    let status = response.status();
++    if status != reqwest::StatusCode::OK {
++        // Status only: the body can carry account details.
++        return Err(format!("the licence service answered HTTP {status}"));
++    }
++    if response.content_length().is_some_and(|n| n > MAX_RESPONSE as u64) {
++        return Err("the licence service's answer is too large".into());
++    }
++    let mut bytes = Vec::new();
++    while let Some(chunk) = response.chunk().await.map_err(|e| e.without_url().to_string())? {
++        if chunk.len() > MAX_RESPONSE - bytes.len() {
++            return Err("the licence service's answer is too large".into());
++        }
++        bytes.extend_from_slice(&chunk);
++    }
++    parse_response(&bytes)
++}
++
++pub(super) async fn fetch(context: &SimpleContext, xml: &[u8]) -> Result<String, String> {
++    let text = std::str::from_utf8(xml).map_err(|_| "the licence request is not UTF-8".to_string())?;
++    let req: LicenseTokenIpcRequest =
++        quick_xml::de::from_str(text).map_err(|e| format!("the licence request does not parse: {e}"))?;
++    check(&req, crate::binding::store_product().as_deref())?;
++    let bytes = body(&req)?;
++    tracing::info!(
++        "Licence token for {} and {} add-on(s)",
++        req.parent_product_id,
++        req.product_ids.ids.len()
++    );
++    // The same signed-XSTS path the title's own requests take, for this exact body.
++    let auth = super::xml::xsts_response(
++        context,
++        &XSTSTokenRequest {
++            url: URL.into(),
++            relying_party: String::new(),
++            method: "POST".into(),
++            body_base64: STANDARD.encode(&bytes),
++            title_id: req.title_id.clone(),
++            title_client_id: req.title_client_id.clone(),
++        },
++    )
++    .await
++    .map_err(|e| format!("no XSTS token for the licence service: {e}"))?;
++    let token = post(URL, bytes, &auth.token, &auth.signature).await?;
++    tracing::info!("Licence token issued ({} bytes)", token.len());
++    Ok(token)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use xodus::models::xgameruntime::xuser::LicenseProductIds;
++
++    fn request(parent: &str, ids: &[&str], custom: &str) -> LicenseTokenIpcRequest {
++        LicenseTokenIpcRequest {
++            parent_product_id: parent.into(),
++            product_ids: LicenseProductIds { ids: ids.iter().map(|s| s.to_string()).collect() },
++            custom_base64: STANDARD.encode(custom),
++            title_id: "2079757188".into(),
++            title_client_id: "000000004CE146F7".into(),
++        }
++    }
++
++    #[test]
++    fn the_body_is_what_the_licence_service_takes() {
++        let bytes = body(&request("9TESTSTORE01", &["9TESTADDON00", "9TESTADDON01"], "nonce-1")).unwrap();
++        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
++        assert_eq!(value["parentProductId"], "9TESTSTORE01");
++        assert_eq!(value["enforceSellableBy"], true);
++        // a string holding a JSON array, as Windows sends it
++        assert_eq!(value["relatedProductIds"], "[\"9TESTADDON00\",\"9TESTADDON01\"]");
++        assert_eq!(value["customDeveloperString"], "nonce-1");
++        assert!(body(&request("9TESTSTORE01", &[], "")).is_err());
++    }
++
++    #[test]
++    fn only_the_bound_game_and_store_ids_are_asked_for() {
++        assert!(check(&request("9TESTSTORE01", &["9TESTADDON00"], "x"), Some("9teststore01")).is_ok());
++        assert!(check(&request("9TESTSTORE01", &["9TESTADDON00"], "x"), None).is_ok());
++        assert!(check(&request("9OTHERGAME00", &["9TESTADDON00"], "x"), Some("9TESTSTORE01")).is_err());
++        assert!(check(&request("9TESTSTORE01", &["not an id"], "x"), None).is_err());
++        assert!(check(&request("../etc", &[], "x"), None).is_err());
++    }
++
++    #[test]
++    fn only_a_well_formed_token_is_handed_over() {
++        assert_eq!(parse_response(br#"{"licenseToken":"aaa.bbb.ccc"}"#).unwrap(), "aaa.bbb.ccc");
++        assert!(parse_response(br#"{"licenseToken":""}"#).is_err());
++        assert!(parse_response(br#"{"licenseToken":"a b"}"#).is_err());
++        assert!(parse_response(b"<html>").is_err());
++    }
++}
+diff -ruN a/crates/xodus-service/src/connection/mod.rs b/crates/xodus-service/src/connection/mod.rs
+--- a/crates/xodus-service/src/connection/mod.rs	2026-11-20 12:58:24
++++ b/crates/xodus-service/src/connection/mod.rs	2026-11-20 13:17:14
+@@ -1,9 +1,11 @@
++pub mod catalog;
++pub mod license;
+ pub mod proto;
+ pub mod router;
+ pub mod xml;
+ 
+ pub fn encode_message(magic: u32, msg_type: u16, message_buffer: Vec<u8>) -> Vec<u8> {
+-    let mut buffer = Vec::with_capacity(8);
++    let mut buffer = Vec::with_capacity(8 + message_buffer.len());
+     let size = message_buffer.len() as u16;
+     buffer.extend(magic.to_le_bytes());
+     buffer.extend(msg_type.to_le_bytes());
+diff -ruN a/crates/xodus-service/src/connection/proto.rs b/crates/xodus-service/src/connection/proto.rs
+--- a/crates/xodus-service/src/connection/proto.rs	2026-11-20 12:58:24
++++ b/crates/xodus-service/src/connection/proto.rs	2026-11-20 13:17:14
+@@ -1,8 +1,10 @@
+ use crate::simple_context::SimpleContext;
+ 
++/// The protobuf framing is not implemented: refuse it instead of panicking the connection's task.
+ pub async fn handle(
+     _socket: &mut tokio::net::UnixStream,
+     _context: &mut SimpleContext,
+ ) -> tokio::io::Result<()> {
+-    unimplemented!("Protobuf path isnt implemented yet");
++    tracing::warn!("A protobuf-framed request arrived; this service only speaks the XML framing");
++    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "protobuf framing is not implemented"))
+ }
+diff -ruN a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
+--- a/crates/xodus-service/src/connection/router.rs	2026-11-20 12:58:24
++++ b/crates/xodus-service/src/connection/router.rs	2026-11-20 13:27:02
+@@ -1,12 +1,19 @@
+ use std::sync::Arc;
+ 
+-use tokio::io::AsyncReadExt;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio_util::sync::CancellationToken;
+ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ 
+ use crate::simple_context::SimpleContext;
+ 
++/// Frames the runtime (Ferestre's xgameruntime, which this engine runs) sends besides the XML ones. Each was answered
++/// "Unknown magic" before, and the connection closed: the game's own licence query, its Store catalog and its
++/// sign-in roles all failed (issue #18).
++const ROLES_MAGIC: u32 = 0x58445341; // "ASDX": who is signed in, version 1
++const CATALOG_MAGIC: u32 = 0x58445343; // "CSDX": Store catalog query
++const ENTITLEMENT_MAGIC: u32 = 0x58445345; // "ESDX": is this Store product licensed, version 1
++
+ pub async fn route(
+     mut socket: tokio::net::UnixStream,
+     token: CancellationToken,
+@@ -16,7 +23,8 @@
+     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
+     tracing::debug!("Connection from pid {cred:?}");
+ 
+-    let mut context = SimpleContext::new(device_token, tokens);
++    // the device ticket renewed in this service, if Microsoft refused the one it started with
++    let mut context = SimpleContext::new(crate::device::current(&device_token), tokens);
+     loop {
+         let mut read_magic = [0; 4];
+         if token.is_cancelled() {
+@@ -24,7 +32,13 @@
+         }
+         let read = socket.read_exact(&mut read_magic).await;
+         if let Err(err) = read {
+-            tracing::error!("Failed to read magic: {err:?}");
++            // The runtime opens one connection per request and closes it once answered: an end of file here is that
++            // close, not a fault (issue #18 read the hundreds of "early eof" lines as the cause of its problems).
++            if err.kind() == std::io::ErrorKind::UnexpectedEof {
++                tracing::debug!("Connection closed by the game");
++            } else {
++                tracing::warn!("Connection ended: {err}");
++            }
+             return;
+         }
+ 
+@@ -32,14 +46,158 @@
+         let res = match magic {
+             crate::XML_MAGIC => super::xml::handle(&mut socket, &mut context).await,
+             crate::PROTO_MAGIC => super::proto::handle(&mut socket, &mut context).await,
++            ROLES_MAGIC => roles(&mut socket, &context).await,
++            ENTITLEMENT_MAGIC => entitlement(&mut socket, &context).await,
++            CATALOG_MAGIC => super::catalog::handle(&mut socket).await,
+             _ => {
+-                tracing::error!("Unknown magic");
++                tracing::warn!("Unknown message {magic:#010x} from the game; closing its connection");
+                 return;
+             }
+         };
+ 
++        // After a failed exchange the stream's position is unknown: the game reconnects for its next request.
+         if let Err(err) = res {
+-            tracing::error!("There was an error handling the message: {err}");
++            tracing::warn!("There was an error handling the message: {err}");
++            return;
+         }
++    }
++}
++
++fn signed_in(context: &SimpleContext) -> bool {
++    context.tokens().get_user().is_ok() && context.tokens().get_user_sts_token().is_ok()
++}
++
++/// Account roles, version 1: `[1, store signed in, player signed in, same account]`. One account owns and plays here.
++async fn roles(socket: &mut tokio::net::UnixStream, context: &SimpleContext) -> tokio::io::Result<()> {
++    let version = read_u32(socket).await?;
++    if version != 1 {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            format!("account roles version {version}"),
++        ));
++    }
++    let on = signed_in(context) as u32;
++    write_u32s(socket, &[1, on, on, on]).await
++}
++
++/// Store entitlement, version 1: `[1, 12]` then the 12-character Store ID; the answer is `[1, licensed]`. The runtime
++/// asks it for the game's own Store ID, which is what `XStoreQueryGameLicenseAsync` reports.
++///
++/// The game only runs after `xodus-cli run` got its package licence from Microsoft for this account (it cannot decrypt
++/// its files otherwise), so for the bound game the answer is whether that account is still signed in. Any other
++/// product is not licensed through this path, as in Ferestre's service.
++async fn entitlement(socket: &mut tokio::net::UnixStream, context: &SimpleContext) -> tokio::io::Result<()> {
++    let version = read_u32(socket).await?;
++    let length = read_u32(socket).await?;
++    if version != 1 || length != 12 {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            format!("entitlement request version {version}, length {length}"),
++        ));
++    }
++    let mut product = [0u8; 12];
++    tokio::time::timeout(std::time::Duration::from_secs(5), socket.read_exact(&mut product))
++        .await
++        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
++    let product = String::from_utf8_lossy(&product).to_string();
++    let bound = crate::binding::store_product();
++    let licensed = bound.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(&product)) && signed_in(context);
++    match &bound {
++        None => tracing::info!("Licence query for {product}: no game bound (XODUS_STORE_PRODUCT), answering no"),
++        Some(_) => tracing::debug!("Licence query for {product}: {}", if licensed { "licensed" } else { "not licensed" }),
++    }
++    write_u32s(socket, &[1, licensed as u32]).await
++}
++
++async fn read_u32(socket: &mut tokio::net::UnixStream) -> tokio::io::Result<u32> {
++    let mut b = [0u8; 4];
++    tokio::time::timeout(std::time::Duration::from_secs(5), socket.read_exact(&mut b))
++        .await
++        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
++    Ok(u32::from_le_bytes(b))
++}
++
++async fn write_u32s(socket: &mut tokio::net::UnixStream, values: &[u32]) -> tokio::io::Result<()> {
++    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
++    socket.write_all(&bytes).await
++}
++
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn the_frame_names_are_the_runtimes() {
++        assert_eq!(&super::ROLES_MAGIC.to_le_bytes(), b"ASDX");
++        assert_eq!(&super::CATALOG_MAGIC.to_le_bytes(), b"CSDX");
++        assert_eq!(&super::ENTITLEMENT_MAGIC.to_le_bytes(), b"ESDX");
++    }
++}
++
++/// The frames as the runtime sends them, against a service with nobody signed in: every exchange is answered in the
++/// shape the runtime checks (never a closed connection), and says no.
++#[cfg(test)]
++mod wire {
++    use super::*;
++    use xodus::models::secrets::LegacyToken;
++    use xodus::models::soap::Timestamp;
++
++    async fn service() -> tokio::net::UnixStream {
++        let (client, server) = tokio::net::UnixStream::pair().unwrap();
++        let device = LegacyToken {
++            key_name: None,
++            token: "test-device".into(),
++            binary_secret: None,
++            tpm_key: None,
++            lifetime: Timestamp { id: None, created: String::new(), expires: String::new() },
++        };
++        tokio::spawn(route(server, CancellationToken::new(), device, Arc::new(TokenManager::with_memory())));
++        client
++    }
++
++    async fn u32s(socket: &mut tokio::net::UnixStream, n: usize) -> Vec<u32> {
++        let mut b = vec![0u8; 4 * n];
++        socket.read_exact(&mut b).await.unwrap();
++        b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
++    }
++
++    #[tokio::test]
++    async fn roles_and_entitlement_answer_in_the_runtimes_shape() {
++        let mut s = service().await;
++        s.write_all(&[ROLES_MAGIC, 1].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).await.unwrap();
++        assert_eq!(u32s(&mut s, 4).await, vec![1, 0, 0, 0], "nobody signed in");
++        // the same connection carries the next request
++        let mut req: Vec<u8> = [ENTITLEMENT_MAGIC, 1, 12].iter().flat_map(|v| v.to_le_bytes()).collect();
++        req.extend_from_slice(b"9NR1R1XWLCNB");
++        s.write_all(&req).await.unwrap();
++        assert_eq!(u32s(&mut s, 2).await, vec![1, 0], "not licensed while nobody is signed in");
++    }
++
++    #[tokio::test]
++    async fn a_licence_request_gets_a_type_8_answer_even_when_it_fails() {
++        let mut s = service().await;
++        let xml = b"<LicenseTokenRequest><ParentProductId>9NR1R1XWLCNB</ParentProductId><CustomBase64>bm9uY2U=</CustomBase64><TitleId>2079757188</TitleId><TitleClientId>000000004CE146F7</TitleClientId><ProductIds><ProductId>9P0VIPTEST00</ProductId></ProductIds></LicenseTokenRequest>";
++        let mut frame = Vec::new();
++        frame.extend_from_slice(b"XSDX");
++        frame.extend_from_slice(&7u16.to_le_bytes());
++        frame.extend_from_slice(&(xml.len() as u16).to_le_bytes());
++        frame.extend_from_slice(xml);
++        s.write_all(&frame).await.unwrap();
++        let mut header = [0u8; 8];
++        s.read_exact(&mut header).await.unwrap();
++        assert_eq!(&header[..4], b"XSDX");
++        assert_eq!(u16::from_le_bytes([header[4], header[5]]), 8, "the runtime checks for type 8");
++        assert_eq!(u16::from_le_bytes([header[6], header[7]]), 0, "an empty frame is the runtime's failure");
++    }
++
++    #[tokio::test]
++    async fn an_unknown_xml_type_still_gets_its_type_plus_one() {
++        let mut s = service().await;
++        let mut frame = Vec::new();
++        frame.extend_from_slice(b"XSDX");
++        frame.extend_from_slice(&41u16.to_le_bytes());
++        frame.extend_from_slice(&0u16.to_le_bytes());
++        s.write_all(&frame).await.unwrap();
++        let mut header = [0u8; 8];
++        s.read_exact(&mut header).await.unwrap();
++        assert_eq!(u16::from_le_bytes([header[4], header[5]]), 42);
+     }
+ }
+diff -ruN a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+--- a/crates/xodus-service/src/connection/xml.rs	2026-11-20 12:58:24
++++ b/crates/xodus-service/src/connection/xml.rs	2026-11-20 13:27:02
+@@ -246,23 +246,37 @@
+     context: &mut SimpleContext,
+ ) -> tokio::io::Result<()> {
+     tracing::debug!("Parsing XML");
+-    let message_type = socket.read_u16_le().await?;
+-    let message_size = socket.read_u16_le().await?;
+-    let mut buffer = vec![0; message_size as usize];
++    let raw_type = socket.read_u16_le().await?;
++    let mut message_size = socket.read_u16_le().await? as usize;
++    // A request whose body is over 64 KiB (an XSTS request carrying a large signed body) sets the type's top bit and
++    // follows the header with its real 32-bit size, as the runtime frames it.
++    if raw_type & 0x8000 != 0 {
++        message_size = socket.read_u32_le().await? as usize;
++        if message_size > 8 * 1024 * 1024 {
++            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "XML request over 8 MiB"));
++        }
++    }
++    let raw_type = raw_type & 0x7fff;
++    let mut buffer = vec![0; message_size];
+     tracing::debug!("Reading buffer {message_size}");
+     socket.read_exact(&mut buffer).await?;
+     tracing::debug!("Read buffer");
+-    let message_type = XodusMessageType::try_from(message_type as i32).unwrap_or_default();
++    let message_type = XodusMessageType::try_from(raw_type as i32).unwrap_or_default();
+ 
+     let out_buf = match parse_message(context, message_type, buffer).await {
+         Ok(buf) => buf,
+         Err(err) => {
+-            tracing::error!("Failed parsing message: {err}");
++            tracing::warn!("Failed parsing message {raw_type}: {err}");
+             vec![]
+         }
+     };
++    if out_buf.len() > u16::MAX as usize {
++        tracing::warn!("Answer to message {raw_type} is {} bytes, over the frame's limit; sending none", out_buf.len());
++    }
++    let out_buf = if out_buf.len() > u16::MAX as usize { Vec::new() } else { out_buf };
+ 
+-    let data = super::encode_message(XML_MAGIC, message_type as u16 + 1, out_buf);
++    // The answer's type is the request's plus one, even for a type this service does not know: the runtime checks it.
++    let data = super::encode_message(XML_MAGIC, raw_type + 1, out_buf);
+     socket.write_all(&data).await
+ }
+ 
+@@ -303,6 +317,168 @@
+     )
+ }
+ 
++/// The XSTS token a request needs, and the request's signature when its endpoint takes one: minted as the title
++/// first (what Windows does), the user-only token as the fallback. The title's own requests and the licence token
++/// path share it: a licence token is asked of licensing.mp.microsoft.com with exactly such a token.
++pub(super) async fn xsts_response(
++    context: &SimpleContext,
++    req: &XSTSTokenRequest,
++) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
++    tracing::debug!("XSTS token request for {}", req.url);
++
++    // As the title first (what Windows does); the user-only token below stays the fallback.
++    let default_rp = async {
++        let endpoints = endpoints_for(&context.client).await;
++        let host = reqwest::Url::parse(&req.url)
++            .ok()
++            .and_then(|u| u.host_str().map(str::to_owned))
++            .unwrap_or_default();
++        endpoints.as_ref().and_then(|list| {
++            xodus::api::xbox::title::get_endpoint(&req.url, list)
++                .and_then(|e| e.relying_party.clone())
++                .or_else(|| {
++                    // per-title PlayFab hosts: the list only names the bare domain
++                    list.end_points
++                        .iter()
++                        .filter(|e| {
++                            e.relying_party.is_some()
++                                && !e.host.contains('*')
++                                && host.ends_with(&format!(".{}", e.host))
++                        })
++                        .max_by_key(|e| e.host.len())
++                        .and_then(|e| e.relying_party.clone())
++                })
++        })
++        .unwrap_or_else(|| "http://xboxlive.com".to_string())
++    };
++    if let Some(payload) = title_token(context, req, default_rp).await {
++        return Ok(payload);
++    }
++
++    // Which relying party this URL authenticates against. The
++    // title-management endpoint list is authoritative; its PlayFab entry
++    // is the bare domain, so fall back to a suffix match for the
++    // per-title hosts (b980a380.minecraft.playfabapi.com and friends).
++    let relying_party = if !req.relying_party.is_empty() {
++        req.relying_party.clone()
++    } else {
++        let endpoints = ENDPOINTS
++            .get_or_init(|| async {
++                xodus::api::xbox::title::get_title_management(&context.client)
++                    .await
++                    .ok()
++            })
++            .await;
++        let from_list = endpoints.as_ref().and_then(|list| {
++            xodus::api::xbox::title::get_endpoint(&req.url, list)
++                .and_then(|e| e.relying_party.clone())
++        });
++        match from_list {
++            Some(rp) => rp,
++            None => {
++                let host = reqwest::Url::parse(&req.url)
++                    .ok()
++                    .and_then(|u| u.host_str().map(str::to_owned))
++                    .unwrap_or_default();
++                let fallback = endpoints.as_ref().and_then(|list| {
++                    list.end_points
++                        .iter()
++                        .filter(|e| {
++                            e.relying_party.is_some()
++                                && !e.host.contains('*')
++                                && host.ends_with(&format!(".{}", e.host))
++                        })
++                        .max_by_key(|e| e.host.len())
++                        .and_then(|e| e.relying_party.clone())
++                });
++                fallback.unwrap_or_else(|| "http://xboxlive.com".to_string())
++            }
++        }
++    };
++    tracing::debug!("Relying party: {relying_party}");
++
++    // Re-use a still-valid token rather than paying for the whole
++    // chain again; keep a minute of headroom so one never expires in
++    // flight.
++    let now = chrono::Utc::now().timestamp();
++    if let Some(hit) = XSTS_CACHE
++        .lock()
++        .ok()
++        .and_then(|c| c.get(&relying_party).cloned())
++        .filter(|c| c.expiry > now + 60)
++    {
++        tracing::debug!("Re-using cached token for {relying_party}");
++        let signature = sign_for(req, &hit.token, &endpoints_for(&context.client).await);
++        let payload = XSTSTokenResponse {
++            token: hit.token,
++            xuid: hit.xuid,
++            gamertag: hit.gamertag,
++            expiry: hit.expiry,
++            signature,
++        };
++        return Ok(payload);
++    }
++
++    let Token::Legacy(user_token) = context.tokens().get_user_sts_token()? else {
++        return Err("the signed-in account has no user STS token".into());
++    };
++    let device_token = context.device_token.as_ref().unwrap().clone();
++
++    let first = xodus::api::xbox::try_run_with_signer(
++        &context.client,
++        device_token,
++        user_token.clone(),
++        &relying_party,
++        Some(&SIGNER),
++    )
++    .await;
++    // Microsoft's ticket exchange refused: the device ticket is renewed once from the stored device key and the
++    // request tried again (crate::device). A refusal of the user himself fails the same way the second time.
++    let attempt = match first {
++        Err(err) if crate::device::worth_renewing(&err) => match crate::device::renew(&context.client, context.tokens()).await {
++            Ok(renewed) => {
++                tracing::warn!("Microsoft's ticket exchange failed ({err}); trying again with a renewed device ticket");
++                xodus::api::xbox::try_run_with_signer(&context.client, renewed, user_token, &relying_party, Some(&SIGNER)).await
++            }
++            Err(why) => {
++                tracing::warn!("The device ticket could not be renewed: {why}");
++                Err(err)
++            }
++        },
++        other => other,
++    };
++    let xsts = match attempt {
++        Ok(xsts) => xsts,
++        Err(err) => {
++            // said once per request in the log the app reads; the game gets an empty answer, not a dead service
++            eprintln!("Failed to authenticate Xbox user: {err}");
++            return Err(format!("Xbox did not authenticate the user: {err}").into());
++        }
++    };
++
++    let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
++    let signature = sign_for(req, &token, &endpoints_for(&context.client).await);
++    let payload = XSTSTokenResponse {
++        xuid: xsts.xuid().unwrap_or_default().to_string(),
++        gamertag: xsts.gamertag().unwrap_or_default().to_string(),
++        expiry: xsts.not_after.timestamp(),
++        token,
++        signature,
++    };
++    if let Ok(mut cache) = XSTS_CACHE.lock() {
++        cache.insert(
++            relying_party.clone(),
++            CachedToken {
++                token: payload.token.clone(),
++                xuid: payload.xuid.clone(),
++                gamertag: payload.gamertag.clone(),
++                expiry: payload.expiry,
++            },
++        );
++    }
++    Ok(payload)
++}
++
+ pub async fn parse_message(
+     context: &mut SimpleContext,
+     message_type: XodusMessageType,
+@@ -399,144 +575,35 @@
+         }
+         XodusMessageType::XstsTokenRequest => {
+             let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
+-            tracing::debug!("XSTS token request for {}", req.url);
+-
+-            // As the title first (what Windows does); the user-only token below stays the fallback.
+-            let default_rp = async {
+-                let endpoints = endpoints_for(&context.client).await;
+-                let host = reqwest::Url::parse(&req.url)
+-                    .ok()
+-                    .and_then(|u| u.host_str().map(str::to_owned))
+-                    .unwrap_or_default();
+-                endpoints.as_ref().and_then(|list| {
+-                    xodus::api::xbox::title::get_endpoint(&req.url, list)
+-                        .and_then(|e| e.relying_party.clone())
+-                        .or_else(|| {
+-                            // per-title PlayFab hosts: the list only names the bare domain
+-                            list.end_points
+-                                .iter()
+-                                .filter(|e| {
+-                                    e.relying_party.is_some()
+-                                        && !e.host.contains('*')
+-                                        && host.ends_with(&format!(".{}", e.host))
+-                                })
+-                                .max_by_key(|e| e.host.len())
+-                                .and_then(|e| e.relying_party.clone())
+-                        })
+-                })
+-                .unwrap_or_else(|| "http://xboxlive.com".to_string())
+-            };
+-            if let Some(payload) = title_token(context, &req, default_rp).await {
+-                return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
+-            }
+-
+-            // Which relying party this URL authenticates against. The
+-            // title-management endpoint list is authoritative; its PlayFab entry
+-            // is the bare domain, so fall back to a suffix match for the
+-            // per-title hosts (b980a380.minecraft.playfabapi.com and friends).
+-            let relying_party = if !req.relying_party.is_empty() {
+-                req.relying_party.clone()
+-            } else {
+-                let endpoints = ENDPOINTS
+-                    .get_or_init(|| async {
+-                        xodus::api::xbox::title::get_title_management(&context.client)
+-                            .await
+-                            .ok()
+-                    })
+-                    .await;
+-                let from_list = endpoints.as_ref().and_then(|list| {
+-                    xodus::api::xbox::title::get_endpoint(&req.url, list)
+-                        .and_then(|e| e.relying_party.clone())
+-                });
+-                match from_list {
+-                    Some(rp) => rp,
+-                    None => {
+-                        let host = reqwest::Url::parse(&req.url)
+-                            .ok()
+-                            .and_then(|u| u.host_str().map(str::to_owned))
+-                            .unwrap_or_default();
+-                        let fallback = endpoints.as_ref().and_then(|list| {
+-                            list.end_points
+-                                .iter()
+-                                .filter(|e| {
+-                                    e.relying_party.is_some()
+-                                        && !e.host.contains('*')
+-                                        && host.ends_with(&format!(".{}", e.host))
+-                                })
+-                                .max_by_key(|e| e.host.len())
+-                                .and_then(|e| e.relying_party.clone())
+-                        });
+-                        fallback.unwrap_or_else(|| "http://xboxlive.com".to_string())
+-                    }
++            match xsts_response(context, &req).await {
++                Ok(payload) => Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec()),
++                // the title gets an empty answer, not a dead service; a refusal by Xbox is in the log already
++                Err(err) => {
++                    tracing::warn!("No XSTS token for {}: {err}", req.url);
++                    Ok(vec![])
+                 }
+-            };
+-            tracing::debug!("Relying party: {relying_party}");
+-
+-            // Re-use a still-valid token rather than paying for the whole
+-            // chain again; keep a minute of headroom so one never expires in
+-            // flight.
+-            let now = chrono::Utc::now().timestamp();
+-            if let Some(hit) = XSTS_CACHE
+-                .lock()
+-                .ok()
+-                .and_then(|c| c.get(&relying_party).cloned())
+-                .filter(|c| c.expiry > now + 60)
+-            {
+-                tracing::debug!("Re-using cached token for {relying_party}");
+-                let signature = sign_for(&req, &hit.token, &endpoints_for(&context.client).await);
+-                let payload = XSTSTokenResponse {
+-                    token: hit.token,
+-                    xuid: hit.xuid,
+-                    gamertag: hit.gamertag,
+-                    expiry: hit.expiry,
+-                    signature,
+-                };
+-                return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
+             }
+-
+-            let Token::Legacy(user_token) = context.tokens().get_user_sts_token()? else {
+-                return Ok(vec![]);
+-            };
+-            let device_token = context.device_token.as_ref().unwrap().clone();
+-
+-            let xsts = match xodus::api::xbox::try_run_with_signer(
+-                &context.client,
+-                device_token,
+-                user_token,
+-                &relying_party,
+-                Some(&SIGNER),
++        }
++        XodusMessageType::LicenseTokenRequest => {
++            // XStoreQueryLicenseTokenAsync: the answer is the bare licence token (a JWT), which the game hands to its
++            // own servers to prove what the account owns (VIP, Car Pass, expansions). An empty frame is a failure.
++            // Neither the token nor the authorization behind it is ever logged.
++            match tokio::time::timeout(
++                std::time::Duration::from_secs(45),
++                super::license::fetch(context, &buffer),
+             )
+             .await
+             {
+-                Ok(xsts) => xsts,
+-                Err(err) => {
+-                    // said once per request in the log the app reads; the game gets an empty answer, not a dead service
+-                    eprintln!("Failed to authenticate Xbox user: {err}");
+-                    return Ok(vec![]);
++                Ok(Ok(token)) => Ok(token.into_bytes()),
++                Ok(Err(err)) => {
++                    tracing::warn!("Licence token request failed: {err}");
++                    Ok(vec![])
+                 }
+-            };
+-
+-            let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+-            let signature = sign_for(&req, &token, &endpoints_for(&context.client).await);
+-            let payload = XSTSTokenResponse {
+-                xuid: xsts.xuid().unwrap_or_default().to_string(),
+-                gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+-                expiry: xsts.not_after.timestamp(),
+-                token,
+-                signature,
+-            };
+-            if let Ok(mut cache) = XSTS_CACHE.lock() {
+-                cache.insert(
+-                    relying_party.clone(),
+-                    CachedToken {
+-                        token: payload.token.clone(),
+-                        xuid: payload.xuid.clone(),
+-                        gamertag: payload.gamertag.clone(),
+-                        expiry: payload.expiry,
+-                    },
+-                );
++                Err(_) => {
++                    tracing::warn!("Licence token request did not finish in 45 s");
++                    Ok(vec![])
++                }
+             }
+-            Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec())
+         }
+         _ => Err("Unimplemented".into()),
+     }
+diff -ruN a/crates/xodus-service/src/device.rs b/crates/xodus-service/src/device.rs
+--- a/crates/xodus-service/src/device.rs	1970-01-01 01:00:00
++++ b/crates/xodus-service/src/device.rs	2026-11-20 13:27:02
+@@ -0,0 +1,85 @@
++//! The device ticket, renewed when Microsoft refuses it.
++//!
++//! Every Xbox request starts with Microsoft's ticket exchange, which takes this Mac's device ticket along with the
++//! user's. When Microsoft stops accepting the device ticket (it aged, or was revoked), every request fails, the game
++//! says Initialization Failed (E:0-c2-4), and signing in again does not help: the user was never the problem. Ferestre
++//! renews a rejected device ticket once from the device key the sign-in stored (icex/xodus e35bde1); so does this
++//! service, without any user step. The renewed ticket is kept in memory for this service only: nothing is written to
++//! the Keychain, so no new macOS window can appear in the middle of a game.
++use xodus::models::secrets::{LegacyToken, Token};
++use xodus::models::soap::BodyContent;
++use xodus::tokens::TokenManager;
++
++static RENEWED: std::sync::RwLock<Option<LegacyToken>> = std::sync::RwLock::new(None);
++
++/// The device ticket to use: the one renewed in this service, else the one it started with.
++pub fn current(started_with: &LegacyToken) -> LegacyToken {
++    RENEWED
++        .read()
++        .ok()
++        .and_then(|renewed| renewed.clone())
++        .unwrap_or_else(|| started_with.clone())
++}
++
++/// Whether a failed sign-in is worth one more try with a renewed device ticket: Microsoft's ticket exchange (the step
++/// that takes the device ticket) refused or failed. Xbox's own refusals of the account (XErr) are not.
++pub fn worth_renewing(error: &str) -> bool {
++    error.contains("ticket exchange")
++}
++
++/// A fresh device ticket from Microsoft, with the device key the sign-in stored: no user step, nothing written.
++pub async fn renew(client: &reqwest::Client, tokens: &TokenManager) -> Result<LegacyToken, String> {
++    let license = tokens
++        .get_device_license()
++        .map_err(|_| "the stored device credentials cannot be read".to_string())?;
++    let sp = xodus::licensing::splicense::SPLicense::parse_base64(&license.splicense)
++        .map_err(|_| "the stored device licence is invalid".to_string())?;
++    let state = sp
++        .clep_sign_state
++        .ok_or_else(|| "the stored device licence has no signing key".to_string())?;
++    let key = xodus::licensing::utils::parse_bcrypt_rsa_private(&state.get_rsa_key())
++        .map_err(|_| "the stored device key is invalid".to_string())?;
++    let answer = xodus::api::live::authenticate_device(client, license.username, key)
++        .await
++        .map_err(|err| format!("Microsoft did not renew the device ticket: {err}"))?;
++    let BodyContent::RequestSecurityTokenResponse(response) = answer.body.body else {
++        return Err("Microsoft answered without a device ticket".into());
++    };
++    let Token::Legacy(ticket) = (*response).into() else {
++        return Err("Microsoft answered with a device ticket of another kind".into());
++    };
++    if ticket.binary_secret.is_none() {
++        return Err("the renewed device ticket has no signing secret".into());
++    }
++    if let Ok(mut renewed) = RENEWED.write() {
++        *renewed = Some(ticket.clone());
++    }
++    tracing::info!("Device ticket renewed (valid until {})", ticket.lifetime.expires);
++    Ok(ticket)
++}
++
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn only_the_ticket_exchange_is_worth_a_renewed_device_ticket() {
++        assert!(super::worth_renewing(
++            "Microsoft refused the saved sign-in (a fault on the ticket exchange): sign in again"
++        ));
++        assert!(super::worth_renewing("the Microsoft ticket exchange failed: error sending request"));
++        assert!(!super::worth_renewing("the XSTS token: HTTP status client error (401 Unauthorized)"));
++    }
++
++    #[test]
++    fn without_a_renewal_the_starting_ticket_is_used() {
++        use xodus::models::secrets::LegacyToken;
++        use xodus::models::soap::Timestamp;
++        let start = LegacyToken {
++            key_name: None,
++            token: "start".into(),
++            binary_secret: None,
++            tpm_key: None,
++            lifetime: Timestamp { id: None, created: String::new(), expires: String::new() },
++        };
++        assert_eq!(super::current(&start).token, "start");
++    }
++}
+diff -ruN a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+--- a/crates/xodus-service/src/main.rs	2026-11-20 13:17:14
++++ b/crates/xodus-service/src/main.rs	2026-11-20 13:27:02
+@@ -9,7 +9,9 @@
+ use tracing_subscriber::util::SubscriberInitExt;
+ use xodus::tokens::TokenManager;
+ 
++mod binding;
+ mod connection;
++mod device;
+ mod simple_context;
+ mod utils;
+ 
+@@ -50,6 +52,82 @@
+     // --check: the Xbox sign-in tried once, the way the game's requests go (the signed path), then exit. MetalHorizon
+     // runs it after a sign-in and before Play, so a refused account is known before the game starts. Prints one
+     // CHECK line and nothing of the account. Exit 0: accepted; 2: refused or unreachable; 3: no sign-in saved.
++    // --latest-version <content id>: the version Microsoft publishes for the game's package, from the authenticated
++    // package service (the public catalog reports every package as version 0). MetalHorizon compares it with the
++    // installed one: an outdated game finds no online session and its cloud profile can come back "invalid"
++    // (E:43-1b-4). Prints one LATEST line and nothing of the account. Exit 0: found; 2: refused, unreachable or not
++    // found; 3: no sign-in saved.
++    let args: Vec<String> = std::env::args().collect();
++    if let Some(i) = args.iter().position(|a| a == "--latest-version") {
++        let content = args.get(i + 1).cloned().unwrap_or_default();
++        let uuid = content.len() == 36
++            && content.bytes().enumerate().all(|(n, c)| if matches!(n, 8 | 13 | 18 | 23) { c == b'-' } else { c.is_ascii_hexdigit() });
++        if !uuid {
++            println!("LATEST failed: {content:?} is not a content ID");
++            std::process::exit(2);
++        }
++        let user = match tokens.get_user_sts_token() {
++            Ok(xodus::models::secrets::Token::Legacy(user)) => user,
++            _ => {
++                println!("LATEST no-sign-in: no Microsoft sign-in is saved");
++                std::process::exit(3);
++            }
++        };
++        let client = reqwest::Client::builder()
++            .timeout(std::time::Duration::from_secs(30))
++            .build()
++            .unwrap_or_default();
++        let xsts = match xodus::api::xbox::try_run_with_signer(
++            &client,
++            device_token.clone(),
++            user,
++            "http://update.xboxlive.com",
++            None,
++        )
++        .await
++        {
++            Ok(xsts) => xsts,
++            Err(err) => {
++                println!("LATEST failed: {err}");
++                std::process::exit(2);
++            }
++        };
++        let answer = client
++            .get(format!("{}/GetBasePackage/{content}", xodus::XBOX_LIVE_PACKAGES_PC))
++            .header("x-xbl-contract-version", "3")
++            .header("Authorization", xodus::api::xbox::get_xsts_auth_header(xsts))
++            .send()
++            .await;
++        let value: Option<serde_json::Value> = match answer {
++            Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
++            Ok(resp) => {
++                println!("LATEST failed: the package service answered HTTP {}", resp.status());
++                std::process::exit(2);
++            }
++            Err(err) => {
++                println!("LATEST failed: the package service could not be reached ({})", err.without_url());
++                std::process::exit(2);
++            }
++        };
++        // "3.688.109.0" or "3.688.109.0.<build id>": the first four numbers, as the game's manifest writes them
++        let version = value
++            .as_ref()
++            .and_then(|v| v.get("Version"))
++            .and_then(|v| v.as_str())
++            .map(|v| v.trim().split('.').take(4).collect::<Vec<_>>())
++            .filter(|parts| parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
++            .map(|parts| parts.join("."));
++        match version {
++            Some(version) => {
++                println!("LATEST {version}");
++                std::process::exit(0);
++            }
++            None => {
++                println!("LATEST failed: the package service gave no version (is the game owned by this account?)");
++                std::process::exit(2);
++            }
++        }
++    }
+     if std::env::args().any(|a| a == "--check") {
+         let user = match tokens.get_user_sts_token() {
+             Ok(xodus::models::secrets::Token::Legacy(user)) => user,
+@@ -59,14 +137,24 @@
+             }
+         };
+         let signer = xodus::api::xbox::RequestSigner::generate();
+-        match xodus::api::xbox::try_run_with_signer(
+-            &reqwest::Client::new(),
++        let client = reqwest::Client::new();
++        let mut result = xodus::api::xbox::try_run_with_signer(
++            &client,
+             device_token.clone(),
+-            user,
++            user.clone(),
+             "http://xboxlive.com",
+             Some(&signer),
+         )
+-        .await
++        .await;
++        // a refused device ticket is renewed once from the stored device key, as the service does
++        if let Err(err) = &result
++            && device::worth_renewing(err)
++            && let Ok(renewed) = device::renew(&client, &tokens).await
++        {
++            eprintln!("CHECK note: Microsoft's ticket exchange failed ({err}); trying again with a renewed device ticket");
++            result = xodus::api::xbox::try_run_with_signer(&client, renewed, user, "http://xboxlive.com", Some(&signer)).await;
++        }
++        match result
+         {
+             Ok(_) => {
+                 println!("CHECK ok: Xbox accepted the account");

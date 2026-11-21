@@ -69,7 +69,7 @@ struct MetalHorizonApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("MetalHorizon") {
+        WindowGroup("MetalHorizon X") {
             LauncherView(model: model)
                 .frame(minWidth: 680, minHeight: 560)
                 .sheet(isPresented: $showAssistant) { AssistantSheet() }
@@ -77,7 +77,7 @@ struct MetalHorizonApp: App {
                 .tint(Theme.accent)
         }
         .defaultSize(width: 980, height: 680)
-        .windowToolbarStyle(.unified)
+        .windowStyle(.hiddenTitleBar)   // no title bar: the window is black glass to its top edge
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About MetalHorizon") { showAbout() }
@@ -161,7 +161,7 @@ struct MetalHorizonApp: App {
 
     private func showAbout() {
         let credits = NSAttributedString(string: """
-            1.0 Final Beta. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
+            MetalHorizon X 2.0. Unofficial: not affiliated with or endorsed by Microsoft, Xbox, Valve, Playground Games, Apple or CodeWeavers. \
             Built on Highball (its native arm64 route, FEX patches and signed loader), Ferestre, xodus, Wine, FEX, KosmicKrisp, \
             vkd3d-proton, DXVK, DXMT, SDL and Apple's D3DMetal: see the Thanks menu.
             """, attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
@@ -175,7 +175,7 @@ enum Activity { case idle, signIn, install, download, game, steam, preparing }
 enum LogView: String, CaseIterable, Identifiable {
     case activity, game
     var id: String { rawValue }
-    var title: String { self == .activity ? "Activity" : "Game Output" }
+    var title: String { self == .activity ? tr("Activity") : tr("Game Output") }
 }
 
 @MainActor
@@ -244,6 +244,10 @@ final class LauncherModel: ObservableObject {
     /// is to do again, and a new sign-in clears it.
     @Published var signInExpired = fileExists(signInExpiredMarker.path)
     @Published var installFraction: Double?
+    /// The game's download in numbers, from xodus-cli's progress lines; nil until the first one (or with an older
+    /// xodus-cli, which prints none: the bar stays indeterminate).
+    @Published var downloadMeter: DownloadMeter?
+    private var progressLinesSeen = 0
     @Published var steamStatus = SteamStatus()
     @Published var findings: [Finding] = []
     @Published var preflight: [PreflightItem] = []
@@ -322,6 +326,16 @@ final class LauncherModel: ObservableObject {
         refreshSavedAccountStatus()
         refreshChecks()
         showLastSession()
+        // MH_SNAPSHOT_DOWNLOAD=1: a picture of the window during the game's download (12.3 GB of 158 GB at 45 MB/s)
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] != nil, ProcessInfo.processInfo.environment["MH_SNAPSHOT_DOWNLOAD"] == "1" {
+            var meter = DownloadMeter()
+            let start = Date()
+            meter.add(DownloadSample(done: 12_210_000_000, total: 158_000_000_000), at: start)
+            meter.add(DownloadSample(done: 12_300_000_000, total: 158_000_000_000), at: start.addingTimeInterval(2))
+            activity = .download
+            status = "Downloading Forza Horizon 6 from the Xbox servers…"
+            downloadMeter = meter
+        }
         if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil, let pending = CrashReport.pending(edition: edition) {
             offerCrashReport(pending)
         }
@@ -950,7 +964,9 @@ final class LauncherModel: ObservableObject {
         guard canDownload, let resources = Bundle.main.resourceURL else { return }
         let cli = Setup.xodusCLI(resources: resources)
         // xodus checks the licence on the signed-in account: only an owned game downloads.
-        run(executable: cli, arguments: ["streaming", storeProductID, gameDirectory], environment: ["RUST_BACKTRACE": "1"],
+        // XODUS_PROGRESS=lines: "progress <done> <total>" lines for the bar (patches/xodus-cli/0006)
+        run(executable: cli, arguments: ["streaming", storeProductID, gameDirectory],
+            environment: ["RUST_BACKTRACE": "1", "XODUS_PROGRESS": "lines"],
             activity: .download, statusText: "Downloading Forza Horizon 6 from the Xbox servers…", logName: "download") { code in
             code == 0 ? "Download finished." : "The download stopped (error \(code)). See the activity log."
         }
@@ -1135,6 +1151,8 @@ final class LauncherModel: ObservableObject {
         outputTail.reset(newSession.output)
         gameTail.reset(newSession.game)
         logLines = []
+        downloadMeter = nil
+        progressLinesSeen = 0
         activity = newActivity
         status = statusText
         findings = []
@@ -1150,6 +1168,7 @@ final class LauncherModel: ObservableObject {
                 try? logHandle.close()
                 self.refreshRunOutput()
                 self.activity = .idle
+                self.downloadMeter = nil
                 self.process = nil
                 let code = done.terminationStatus
                 let duration = Date().timeIntervalSince(newSession.started)
@@ -1242,11 +1261,24 @@ final class LauncherModel: ObservableObject {
         let changed = logView == .activity ? outputTail.poll() : gameTail.poll()
         if logView == .activity { gameTail.poll() } else { outputTail.poll() }
         if changed || logLines.isEmpty { reloadLogView() }
+        readDownloadProgress()
         // A script's NOTE line is something the player has to do now (a macOS dialog waiting): it becomes the status.
         if isBusy, let note = outputTail.lines.last(where: { $0.hasPrefix("NOTE: ") }), note != lastNote {
             lastNote = note
             status = String(note.dropFirst(6))
         }
+    }
+
+    /// The newest of the progress lines xodus-cli printed since the last look, into the download's meter.
+    private func readDownloadProgress() {
+        guard activity == .download else { return }
+        let fresh = outputTail.totalLines - progressLinesSeen
+        progressLinesSeen = outputTail.totalLines
+        guard fresh > 0,
+              let sample = outputTail.lines.suffix(fresh).reversed().lazy.compactMap(DownloadProgress.parse).first else { return }
+        var meter = downloadMeter ?? DownloadMeter()
+        meter.add(sample, at: Date())
+        downloadMeter = meter
     }
 
     private func reloadLogView() {
@@ -1360,9 +1392,9 @@ struct CrashReportSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Text(CrashReport.endpoint == nil
+            Text(tr(CrashReport.endpoint == nil
                  ? "Send to the Developer opens a GitHub issue with this report filled in and shows a zip of the logs to attach. Passwords, tokens, e-mail addresses, Xbox and Steam IDs are removed first."
-                 : "Send to the Developer uploads this report and a zip of the logs. Passwords, tokens, e-mail addresses, Xbox and Steam IDs are removed first.")
+                 : "Send to the Developer uploads this report and a zip of the logs. Passwords, tokens, e-mail addresses, Xbox and Steam IDs are removed first."))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

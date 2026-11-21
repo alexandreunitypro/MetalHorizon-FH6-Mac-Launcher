@@ -180,7 +180,8 @@ enum LogFilter {
         #"The following \d+ Vulkan extensions are supported"#, #"Created VkInstance for Vulkan version"#,
         #"FHTRACE"#, #"fh6fault:fh6_fault_report (stack|r[0-9a-z]+ ->|slot|code from)"#,
         #"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+ --:--:--"#,   // curl's progress meter
-        #"^\s*% Total\s+% Received"#, #"^\s*Dload\s+Upload"#
+        #"^\s*% Total\s+% Received"#, #"^\s*Dload\s+Upload"#,
+        DownloadProgress.linePattern                            // xodus-cli's progress lines: the bar shows them
     ].compactMap { try? NSRegularExpression(pattern: $0) }
 
     private static let problem = try? NSRegularExpression(

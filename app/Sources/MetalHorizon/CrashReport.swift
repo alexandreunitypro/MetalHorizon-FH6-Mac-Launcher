@@ -17,9 +17,9 @@ enum CrashReportMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .ask: return "Ask Me"
-        case .automatic: return "Send Automatically"
-        case .never: return "Never"
+        case .ask: return tr("Ask Me")
+        case .automatic: return tr("Send Automatically")
+        case .never: return tr("Never")
         }
     }
 }

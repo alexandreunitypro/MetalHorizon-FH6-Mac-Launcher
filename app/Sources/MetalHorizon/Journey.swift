@@ -35,13 +35,13 @@ extension LauncherModel {
         let done: [(String, String, Bool)]
         switch edition {
         case .xbox:
-            done = [("engine", "Engine", componentsDone),
-                    ("account", "Account", accountSaved && !signInExpired),
-                    ("game", "Game", setup.gameCheck.ok)]
+            done = [("engine", tr("Engine"), componentsDone),
+                    ("account", tr("Account"), accountSaved && !signInExpired),
+                    ("game", tr("Game"), setup.gameCheck.ok)]
         case .steam:
-            done = [("engine", "Engine", componentsDone),
-                    ("steam", "Steam", setup.steam.installed),
-                    ("library", "Library", steamLibraryDone)]
+            done = [("engine", tr("Engine"), componentsDone),
+                    ("steam", tr("Steam"), setup.steam.installed),
+                    ("library", tr("Library"), steamLibraryDone)]
         }
         var current = done.firstIndex { !$0.2 } ?? done.count
         if activity == .game { current = done.count }
@@ -49,54 +49,54 @@ extension LauncherModel {
             JourneyStep(id: step.0, title: step.1,
                         state: step.2 && index != current ? .done : index == current ? .current : .upcoming)
         }
-        steps.append(JourneyStep(id: "play", title: "Play", state: current >= done.count ? .current : .upcoming))
+        steps.append(JourneyStep(id: "play", title: tr("Play"), state: current >= done.count ? .current : .upcoming))
         return steps
     }
 
     var next: NextStep {
-        let quit = edition == .xbox ? "Quit from the game's own menu, then give the cloud save 30 seconds."
-                                    : "Quit from the game's own menu. Steam stays open in the background."
+        let quit = edition == .xbox ? tr("Quit from the game's own menu, then give the cloud save 30 seconds.")
+                                    : tr("Quit from the game's own menu. Steam stays open in the background.")
         if !componentsDone {
-            return NextStep(action: .installComponents, title: "Install the Engine", symbol: "arrow.down.circle",
-                            hint: "Blackwell Engine and Apple's D3DMetal, set up by MetalHorizon. Nothing to download by hand.")
+            return NextStep(action: .installComponents, title: tr("Install the Engine"), symbol: "arrow.down.circle",
+                            hint: tr("Blackwell Engine and Apple's D3DMetal, set up by MetalHorizon. Nothing to download by hand."))
         }
         switch edition {
         case .xbox:
             if signInExpired {
-                return NextStep(action: .signIn, title: "Sign In Again", symbol: "person.crop.circle.badge.exclamationmark",
-                                hint: "Xbox no longer accepts the saved sign-in. Your profile and saves are safe; sign in again on Microsoft's page.")
+                return NextStep(action: .signIn, title: tr("Sign In Again"), symbol: "person.crop.circle.badge.exclamationmark",
+                                hint: tr("Xbox no longer accepts the saved sign-in. Your profile and saves are safe; sign in again on Microsoft's page."))
             }
             if !accountSaved {
-                return NextStep(action: .signIn, title: "Sign In with Microsoft", symbol: "person.crop.circle",
+                return NextStep(action: .signIn, title: tr("Sign In with Microsoft"), symbol: "person.crop.circle",
                                 hint: ownership == .gamePass
-                                    ? "With the account that has PC Game Pass or Game Pass Ultimate, on Microsoft's own page. MetalHorizon never sees your password."
-                                    : "On Microsoft's own page. MetalHorizon never sees your password.")
+                                    ? tr("With the account that has PC Game Pass or Game Pass Ultimate, on Microsoft's own page. MetalHorizon never sees your password.")
+                                    : tr("On Microsoft's own page. MetalHorizon never sees your password."))
             }
             if !setup.gameCheck.ok {
-                return NextStep(action: .download, title: "Download the Game", symbol: "icloud.and.arrow.down",
+                return NextStep(action: .download, title: tr("Download the Game"), symbol: "icloud.and.arrow.down",
                                 hint: ownership == .gamePass
-                                    ? "About 160 GB into \(Setup.tildePath(gameDirectory)). Your Game Pass plan must include PC games."
-                                    : "About 160 GB into \(Setup.tildePath(gameDirectory)). Your account must own the game.")
+                                    ? tr("About 160 GB into %@. Your Game Pass plan must include PC games.", Setup.tildePath(gameDirectory))
+                                    : tr("About 160 GB into %@. Your account must own the game.", Setup.tildePath(gameDirectory)))
             }
         case .steam:
             if !setup.steam.installed {
-                return NextStep(action: .installSteam, title: "Install Steam", symbol: "arrow.down.circle",
-                                hint: "Valve's installer, in a space of its own on this Mac. About 30 seconds.")
+                return NextStep(action: .installSteam, title: tr("Install Steam"), symbol: "arrow.down.circle",
+                                hint: tr("Valve's installer, in a space of its own on this Mac. About 30 seconds."))
             }
             if !setup.steam.signedInOnce {
-                return NextStep(action: .openSteam, title: "Open Steam", symbol: "macwindow",
-                                hint: "Sign in in Steam's window; its first start updates Steam and can take 20 minutes. The game's install window follows by itself.")
+                return NextStep(action: .openSteam, title: tr("Open Steam"), symbol: "macwindow",
+                                hint: tr("Sign in in Steam's window; its first start updates Steam and can take 20 minutes. The game's install window follows by itself."))
             }
             if !setup.steamGameCheck.ok {
                 if setup.steam.manifest != nil {
-                    return NextStep(action: .openSteam, title: "Open Steam", symbol: "macwindow",
-                                    hint: "Steam is downloading Forza Horizon 6. Play lights up when it is done.")
+                    return NextStep(action: .openSteam, title: tr("Open Steam"), symbol: "macwindow",
+                                    hint: tr("Steam is downloading Forza Horizon 6. Play lights up when it is done."))
                 }
-                return NextStep(action: .openSteam, title: "Install the Game", symbol: "icloud.and.arrow.down",
-                                hint: "Steam's own install window for Forza Horizon 6. Click Install there.")
+                return NextStep(action: .openSteam, title: tr("Install the Game"), symbol: "icloud.and.arrow.down",
+                                hint: tr("Steam's own install window for Forza Horizon 6. Click Install there."))
             }
         }
-        return NextStep(action: .play, title: "Play", symbol: "play.fill", hint: quit)
+        return NextStep(action: .play, title: tr("Play"), symbol: "play.fill", hint: quit)
     }
 
     func performNext() {
@@ -114,12 +114,12 @@ extension LauncherModel {
     var busyTitle: String {
         switch activity {
         case .idle: return ""
-        case .signIn: return "Signing In…"
-        case .install: return "Installing…"
-        case .download: return "Downloading…"
-        case .game: return "Playing"
-        case .steam: return "Steam Is Working…"
-        case .preparing: return "Getting Ready…"
+        case .signIn: return tr("Signing In…")
+        case .install: return tr("Installing…")
+        case .download: return tr("Downloading…")
+        case .game: return tr("Playing")
+        case .steam: return tr("Steam Is Working…")
+        case .preparing: return tr("Getting Ready…")
         }
     }
 

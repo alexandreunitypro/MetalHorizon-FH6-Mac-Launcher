@@ -1,0 +1,196 @@
+From: FORZA-LAUNCHER-FOR-MAC-BLACKWELL-PROJECT
+Subject: [PATCH] streaming: progress lines for a launcher (XODUS_PROGRESS=lines)
+
+MetalHorizon 1.1.1. MetalHorizon runs `xodus-cli streaming` with its output going to a log file, where indicatif
+draws nothing: the game's download showed only an indeterminate bar. With XODUS_PROGRESS=lines, the bars are hidden
+and stdout gets `progress <bytes done> <bytes total>`: once when the files to fetch are known (done 0), at most twice
+a second while they download, and once at the end (the run waits for that last line before it exits). Only the
+files this run fetches count (the package's metadata, read before, does not): an update or a download started again
+counts the files that differ from the last complete download. Without the variable nothing changes.
+
+Applies to the tree MetalHorizon bundles xodus-cli from (work/xodus, app/build-app.sh XODUS_CLI_SRC) with patch -p1;
+crates/xodus-cli/src/commands/streaming.rs is the same in work/xodus-ferestre, where it applies too.
+Build: cargo build --release --offline -p xodus-cli. Tests: cargo test --release --offline -p xodus-cli streaming.
+---
+diff --git a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+index 6d6640c..48b61fd 100644
+--- a/crates/xodus-cli/src/commands/streaming.rs
++++ b/crates/xodus-cli/src/commands/streaming.rs
+@@ -1,11 +1,13 @@
+ use std::collections::HashMap;
++use std::io::Write;
+ use std::path::Path;
+ use std::process::ExitCode;
++use std::time::{Duration, Instant};
+ use std::vec;
+ 
+ use fs2::available_space;
+ use futures_util::{StreamExt, stream};
+-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
++use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+ use msixvc::streaming;
+ use msixvc::xvd::{SegmentFile, XvdFile};
+ use tokio::fs::{File, OpenOptions};
+@@ -28,6 +30,68 @@ enum ProgressEvent {
+     Finished { id: usize },
+     UpdateRemaining { name: String, total: u64 },
+     UpdateStatus { name: String },
++    /// The download is over: the last progress line is written, then `ack` answers.
++    Done { ack: tokio::sync::oneshot::Sender<()> },
++}
++
++/// Progress for a launcher (XODUS_PROGRESS=lines). indicatif draws nothing when the output is a pipe or a file, so a
++/// launcher reading it got no progress at all. In this mode the bars are hidden and stdout gets
++/// `progress <bytes done> <bytes total>`: once when the files to fetch are known (done 0), at most twice a second
++/// while they download, and once at the end. Only the files this run fetches count: an update or a download started
++/// again counts the files that differ from the last complete download, not the whole package.
++#[derive(Default)]
++struct ProgressLines {
++    base: u64,
++    total: Option<u64>,
++    last: Option<Instant>,
++}
++
++impl ProgressLines {
++    const INTERVAL: Duration = Duration::from_millis(500);
++
++    fn enabled() -> bool {
++        std::env::var("XODUS_PROGRESS").is_ok_and(|v| v == "lines")
++    }
++
++    fn line(done: u64, total: u64) -> String {
++        format!("progress {done} {total}")
++    }
++
++    fn done(&self, position: u64, total: u64) -> u64 {
++        position.saturating_sub(self.base).min(total)
++    }
++
++    /// The files to fetch are known: `position` is the total bar's position then (the package's metadata).
++    fn start(&mut self, position: u64, total: u64, now: Instant) -> String {
++        self.base = position;
++        self.total = Some(total);
++        self.last = Some(now);
++        Self::line(0, total)
++    }
++
++    fn advance(&mut self, position: u64, now: Instant) -> Option<String> {
++        let total = self.total?;
++        if let Some(last) = self.last {
++            if now.duration_since(last) < Self::INTERVAL {
++                return None;
++            }
++        }
++        self.last = Some(now);
++        Some(Self::line(self.done(position, total), total))
++    }
++
++    fn finish(&self, position: u64) -> Option<String> {
++        let total = self.total?;
++        Some(Self::line(self.done(position, total), total))
++    }
++
++    fn print(line: Option<String>) {
++        if let Some(line) = line {
++            let mut out = std::io::stdout().lock();
++            writeln!(out, "{line}").ok();
++            out.flush().ok();
++        }
++    }
+ }
+ 
+ pub async fn run(
+@@ -167,8 +231,13 @@ async fn run_cli_reader<Reader>(
+ where
+     Reader: AsyncRead + Unpin,
+ {
++    let lines_enabled = ProgressLines::enabled();
+     tokio::spawn(async move {
+         let multi_progress = MultiProgress::new();
++        let mut lines = ProgressLines::default();
++        if lines_enabled {
++            multi_progress.set_draw_target(ProgressDrawTarget::hidden());
++        }
+         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(
+             ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
+             .progress_chars("#>-")
+@@ -192,6 +261,9 @@ where
+                         bar.inc(delta);
+                     }
+                     total_progess.inc(delta);
++                    if lines_enabled {
++                        ProgressLines::print(lines.advance(total_progess.position(), Instant::now()));
++                    }
+                 }
+                 ProgressEvent::Finished { id } => {
+                     if let Some(bar) = bars.remove(&id) {
+@@ -201,10 +273,19 @@ where
+                 ProgressEvent::UpdateRemaining { name, total } => {
+                     total_progess.set_message(name);
+                     total_progess.set_length(total_progess.position() + total);
++                    if lines_enabled {
++                        ProgressLines::print(Some(lines.start(total_progess.position(), total, Instant::now())));
++                    }
+                 }
+                 ProgressEvent::UpdateStatus { name } => {
+                     total_progess.set_message(name);
+                 }
++                ProgressEvent::Done { ack } => {
++                    if lines_enabled {
++                        ProgressLines::print(lines.finish(total_progess.position()));
++                    }
++                    ack.send(()).ok();
++                }
+             }
+         }
+ 
+@@ -222,7 +303,12 @@ where
+         url,
+         tx,
+     )
+-    .await
++    .await;
++    // the last line before the process exits (the channel is in order: every byte counted is in it)
++    let (ack, acked) = tokio::sync::oneshot::channel();
++    if tx.send(ProgressEvent::Done { ack }).await.is_ok() {
++        acked.await.ok();
++    }
+ }
+ 
+ async fn run_reader<Reader>(
+@@ -459,3 +545,35 @@ where
+     std::fs::remove_file(&final_path).ok();
+     std::fs::rename(&cache_path, &final_path).expect("ok");
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn progress_lines_count_only_the_files_fetched() {
++        let t0 = Instant::now();
++        let mut lines = ProgressLines::default();
++        // nothing before the files to fetch are known
++        assert_eq!(lines.advance(5_000, t0), None);
++        assert_eq!(lines.finish(5_000), None);
++        // 5000 bytes of metadata already read, then 1 GB of files
++        assert_eq!(lines.start(5_000, 1_000_000_000, t0), "progress 0 1000000000");
++        // at most twice a second
++        assert_eq!(lines.advance(10_000, t0 + Duration::from_millis(100)), None);
++        assert_eq!(
++            lines.advance(250_005_000, t0 + Duration::from_millis(600)),
++            Some("progress 250000000 1000000000".to_owned())
++        );
++        assert_eq!(lines.advance(260_005_000, t0 + Duration::from_millis(900)), None);
++        // the last line always, never past the total
++        assert_eq!(lines.finish(2_000_000_000), Some("progress 1000000000 1000000000".to_owned()));
++    }
++
++    #[test]
++    fn progress_lines_nothing_to_fetch() {
++        let mut lines = ProgressLines::default();
++        assert_eq!(lines.start(42, 0, Instant::now()), "progress 0 0");
++        assert_eq!(lines.finish(42), Some("progress 0 0".to_owned()));
++    }
++}

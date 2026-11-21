@@ -7,7 +7,7 @@
 # Nothing from Apple or CrossOver goes into the app: the user picks D3DMetal from Apple's Game Porting Toolkit.
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION="${1:-0.1.0}"
+VERSION="${1:-2.0.0}"
 WORK="${WORK:-/Users/alexandre/Documents/Codex/2026-10-19/goal-reprend-son-travail-on-invente/work}"
 XODUS_CLI="${XODUS_CLI:-$WORK/xodus/target/release/xodus-cli}"
 # The service is built from the Ferestre tree (its source below), with patches/xodus-cli/0003 (compact JWE tickets as
@@ -32,6 +32,7 @@ done
 [ -f components.json ] || { echo "STOP: no app/components.json (bash app/update-components.sh)"; exit 1; }
 cp components.json "$RES/components.json"
 cp Resources/fh6-native-UserConfigSelections.xml "$RES/"   # the native route's first-start graphics settings
+cp -R Localization/*.lproj "$RES/"   # the screens in the Mac's language (Localization/generate.py)
 cp "$XODUS_CLI" "$RES/xodus-cli"; cp "$XODUS_SERVICE" "$RES/xodus-service"
 chmod 755 "$RES/xodus-cli" "$RES/xodus-service"
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -41,8 +42,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleExecutable</key><string>MetalHorizon</string>
     <key>CFBundleIdentifier</key><string>io.github.alexandreunitypro.metalhorizon</string>
-    <key>CFBundleName</key><string>MetalHorizon</string>
-    <key>CFBundleDisplayName</key><string>MetalHorizon</string>
+    <key>CFBundleName</key><string>MetalHorizon X</string>
+    <key>CFBundleDisplayName</key><string>MetalHorizon X</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>

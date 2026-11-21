@@ -1,0 +1,116 @@
+diff --git a/crates/xodus/src/models/secrets.rs b/crates/xodus/src/models/secrets.rs
+--- a/crates/xodus/src/models/secrets.rs
++++ b/crates/xodus/src/models/secrets.rs
+@@ -58,15 +58,107 @@
+                     .unwrap()
+                     .value,
+             ),
+-            "urn:passport:delegationcompact" => Self::Compact(format!(
+-                "d={}",
+-                value
++            "urn:passport:delegationcompact" => {
++                let ticket = value
+                     .requested_security_token
+                     .binary_security_token
+                     .unwrap()
+-                    .value
+-            )),
++                    .value;
++                Self::Compact(delegation_ticket(ticket))
++            },
+             _ => unreachable!(),
++        }
++    }
++}
++
++
++// Xbox sign-in expects compact JWE delegation tickets as `t=`.
++// Keep the previous `d=` form for opaque and other delegation tickets.
++fn delegation_ticket(value: String) -> String {
++    if is_compact_jwe(&value) {
++        format!("t={value}")
++    } else {
++        format!("d={value}")
++    }
++}
++
++// Check the five-part compact JWE structure and its protected header.
++// This checks the encoding only; Microsoft still validates the ticket.
++fn is_compact_jwe(value: &str) -> bool {
++    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
++
++    let mut segments = value.split('.');
++    let Some(header) = segments.next() else { return false; };
++    if header.is_empty() || header.len() > 8192 {
++        return false;
++    }
++
++    let Some(key) = segments.next() else { return false; };
++    let Some(iv) = segments.next() else { return false; };
++    let Some(ciphertext) = segments.next() else { return false; };
++    let Some(tag) = segments.next() else { return false; };
++
++    // The encrypted key can legitimately be empty.
++    if segments.next().is_some()
++        || iv.is_empty()
++        || ciphertext.is_empty()
++        || tag.is_empty()
++    {
++        return false;
++    }
++
++    if ![header, key, iv, ciphertext, tag].iter().all(|part| {
++        part.len() % 4 != 1
++            && part.bytes().all(|b| {
++                b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
++            })
++    }) {
++        return false;
++    }
++
++    let Ok(decoded_header) = URL_SAFE_NO_PAD.decode(header) else {
++        return false;
++    };
++    let Ok(header_json) =
++        serde_json::from_slice::<serde_json::Value>(&decoded_header)
++    else {
++        return false;
++    };
++
++    ["alg", "enc"].iter().all(|key| {
++        header_json
++            .get(*key)
++            .and_then(|v| v.as_str())
++            .is_some_and(|v| !v.is_empty())
++    })
++}
++
++#[cfg(test)]
++mod compact_jwe_tests {
++    use super::{delegation_ticket, is_compact_jwe};
++
++    const JWE: &str =
++        "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..aXY.Y2lwaGVyX2RhdGE.dGFn";
++
++    #[test]
++    fn compact_jwe_uses_t_prefix() {
++        assert!(is_compact_jwe(JWE));
++        assert_eq!(delegation_ticket(JWE.to_string()), format!("t={JWE}"));
++    }
++
++    #[test]
++    fn other_ticket_formats_keep_d_prefix() {
++        for ticket in [
++            "opaque",
++            "eyJ.abc",
++            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln",
++            "opaque..iv.ciphertext.tag",
++        ] {
++            assert!(!is_compact_jwe(ticket));
++            assert_eq!(
++                delegation_ticket(ticket.to_string()),
++                format!("d={ticket}")
++            );
+         }
+     }
+ }

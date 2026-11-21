@@ -14,9 +14,9 @@ enum ControllerMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .automatic: return "Automatic"
-        case .on: return "Always On"
-        case .off: return "Off"
+        case .automatic: return tr("Automatic")
+        case .on: return tr("Always On")
+        case .off: return tr("Off")
         }
     }
 }

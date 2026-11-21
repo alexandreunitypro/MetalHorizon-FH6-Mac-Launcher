@@ -1,0 +1,329 @@
+xodus-service (Ferestre tree): compact JWE delegation tickets as t= (0003, for the service's tree), the Xbox sign-in as a
+result with three attempts and Xbox's answer logged instead of a panic, and --check (the sign-in tried once, then exit).
+Apply with patch -p1 in the xodus-service source tree.
+
+--- a/crates/xodus/src/models/secrets.rs
++++ b/crates/xodus/src/models/secrets.rs
+@@ -58,19 +58,110 @@
+                     .unwrap()
+                     .value,
+             ),
+-            "urn:passport:delegationcompact" => Self::Compact(format!(
+-                "d={}",
+-                value
++            "urn:passport:delegationcompact" => {
++                let ticket = value
+                     .requested_security_token
+                     .binary_security_token
+                     .unwrap()
+-                    .value
+-            )),
++                    .value;
++                Self::Compact(delegation_ticket(ticket))
++            }
+             _ => unreachable!(),
+         }
+     }
+ }
+ 
++// Xbox sign-in expects compact JWE delegation tickets as `t=`.
++// Keep the previous `d=` form for opaque and other delegation tickets.
++fn delegation_ticket(value: String) -> String {
++    if is_compact_jwe(&value) {
++        format!("t={value}")
++    } else {
++        format!("d={value}")
++    }
++}
++
++// Check the five-part compact JWE structure and its protected header.
++// This checks the encoding only; Microsoft still validates the ticket.
++fn is_compact_jwe(value: &str) -> bool {
++    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
++
++    let mut segments = value.split('.');
++    let Some(header) = segments.next() else { return false; };
++    if header.is_empty() || header.len() > 8192 {
++        return false;
++    }
++
++    let Some(key) = segments.next() else { return false; };
++    let Some(iv) = segments.next() else { return false; };
++    let Some(ciphertext) = segments.next() else { return false; };
++    let Some(tag) = segments.next() else { return false; };
++
++    // The encrypted key can legitimately be empty.
++    if segments.next().is_some()
++        || iv.is_empty()
++        || ciphertext.is_empty()
++        || tag.is_empty()
++    {
++        return false;
++    }
++
++    if ![header, key, iv, ciphertext, tag].iter().all(|part| {
++        part.len() % 4 != 1
++            && part.bytes().all(|b| {
++                b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
++            })
++    }) {
++        return false;
++    }
++
++    let Ok(decoded_header) = URL_SAFE_NO_PAD.decode(header) else {
++        return false;
++    };
++    let Ok(header_json) =
++        serde_json::from_slice::<serde_json::Value>(&decoded_header)
++    else {
++        return false;
++    };
++
++    ["alg", "enc"].iter().all(|key| {
++        header_json
++            .get(*key)
++            .and_then(|v| v.as_str())
++            .is_some_and(|v| !v.is_empty())
++    })
++}
++
++#[cfg(test)]
++mod compact_jwe_tests {
++    use super::{delegation_ticket, is_compact_jwe};
++
++    const JWE: &str =
++        "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..aXY.Y2lwaGVyX2RhdGE.dGFn";
++
++    #[test]
++    fn compact_jwe_uses_t_prefix() {
++        assert!(is_compact_jwe(JWE));
++        assert_eq!(delegation_ticket(JWE.to_string()), format!("t={JWE}"));
++    }
++
++    #[test]
++    fn other_ticket_formats_keep_d_prefix() {
++        for ticket in [
++            "opaque",
++            "eyJ.abc",
++            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln",
++            "opaque..iv.ciphertext.tag",
++        ] {
++            assert!(!is_compact_jwe(ticket));
++            assert_eq!(
++                delegation_ticket(ticket.to_string()),
++                format!("d={ticket}")
++            );
++        }
++    }
++}
++
+ #[derive(Debug, Serialize, Deserialize)]
+ pub struct TokenStore {
+     #[serde(flatten)]
+--- a/crates/xodus/src/api/xbox/auth.rs
++++ b/crates/xodus/src/api/xbox/auth.rs
+@@ -24,12 +24,32 @@
+         .header("x-xbl-contract-version", "1")
+         .json(&body)
+         .send()
+-        .await?
+-        .error_for_status()?;
++        .await?;
++    let resp = explain_failure(resp, "user.auth.xboxlive.com").await?;
+ 
+     resp.json().await
+ }
+ 
++/// A refused request says why in its headers and body (an XErr code, a message): logged, with no token in it, so a
++/// failure is no longer a bare "Status(400, None)".
++async fn explain_failure(resp: reqwest::Response, what: &str) -> reqwest::Result<reqwest::Response> {
++    if resp.status().is_success() {
++        return Ok(resp);
++    }
++    let err = resp.error_for_status_ref().unwrap_err();
++    let status = resp.status();
++    let www = resp
++        .headers()
++        .get("www-authenticate")
++        .and_then(|v| v.to_str().ok())
++        .unwrap_or("")
++        .to_owned();
++    let body = resp.text().await.unwrap_or_default();
++    let body: String = body.chars().take(600).collect();
++    eprintln!("Xbox answered {status} to {what}: {body} {www}");
++    Err(err)
++}
++
+ pub async fn request_xsts_token(
+     client: &reqwest::Client,
+     token: String,
+@@ -52,8 +72,8 @@
+         .header("x-xbl-contract-version", "1")
+         .json(&body)
+         .send()
+-        .await?
+-        .error_for_status()?;
++        .await?;
++    let resp = explain_failure(resp, "xsts.auth.xboxlive.com").await?;
+ 
+     resp.json().await
+ }
+--- a/crates/xodus/src/api/xbox/mod.rs
++++ b/crates/xodus/src/api/xbox/mod.rs
+@@ -27,6 +27,44 @@
+     relying_party: &str,
+     signer: Option<&signing::RequestSigner>,
+ ) -> XstsResponse {
++    try_run_with_signer(client, dev_token, legacy, relying_party, signer)
++        .await
++        .unwrap_or_else(|err| panic!("Failed to authenticate Xbox user: {err}"))
++}
++
++/// The Xbox sign-in for one relying party, as a result instead of a panic: the Microsoft ticket exchange, the Xbox
++/// user token, then the XSTS token. A refusal or a network error is tried again twice, a few seconds apart (Xbox
++/// Live answers 5xx or times out at times); what it answered is in the error.
++pub async fn try_run_with_signer(
++    client: &reqwest::Client,
++    dev_token: LegacyToken,
++    legacy: LegacyToken,
++    relying_party: &str,
++    signer: Option<&signing::RequestSigner>,
++) -> Result<XstsResponse, String> {
++    let mut last = String::new();
++    for attempt in 1..=3u32 {
++        match attempt_run(client, dev_token.clone(), legacy.clone(), relying_party, signer).await {
++            Ok(xsts) => return Ok(xsts),
++            Err(err) => {
++                eprintln!("Xbox sign-in for {relying_party}, attempt {attempt} of 3: {err}");
++                last = err;
++            }
++        }
++        if attempt < 3 {
++            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
++        }
++    }
++    Err(last)
++}
++
++async fn attempt_run(
++    client: &reqwest::Client,
++    dev_token: LegacyToken,
++    legacy: LegacyToken,
++    relying_party: &str,
++    signer: Option<&signing::RequestSigner>,
++) -> Result<XstsResponse, String> {
+     let user_token = crate::api::live::exchange_user_token(
+         client,
+         legacy,
+@@ -41,33 +79,33 @@
+         )],
+     )
+     .await
+-    .expect("Failed to get ms user token");
++    .map_err(|err| format!("the Microsoft ticket exchange failed: {err}"))?;
+ 
+     let user_token: Token = match user_token {
+         ExchangeUserTokenOutcome::Fault(_) => {
+-            eprintln!("Failed to get exchange MS token");
+-            panic!("TODO");
++            return Err("Microsoft refused the saved sign-in (a fault on the ticket exchange): sign in again".to_string());
+         }
+         ExchangeUserTokenOutcome::Issued(
+             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+         ) => {
+-            let token = collection.security_tokens.remove(0);
+-            token.into()
++            if collection.security_tokens.is_empty() {
++                return Err("Microsoft returned no ticket".to_string());
++            }
++            collection.security_tokens.remove(0).into()
+         }
+         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+             token,
+         )) => (*token).into(),
+-        _ => unreachable!("Only responses are handled"),
++        _ => return Err("an unexpected answer to the ticket exchange".to_string()),
+     };
+     let Token::Compact(user_token) = user_token else {
+-        eprintln!("Unsupported token");
+-        panic!("TODO");
++        return Err("Microsoft returned a ticket of an unsupported kind".to_string());
+     };
+     let resp = authenticate_xbox_user(client, user_token, signer.map(|s| s.proof_key()))
+         .await
+-        .expect("Failed to authenticate Xbox user");
++        .map_err(|err| format!("the Xbox user token: {err}"))?;
+ 
+     request_xsts_token(client, resp.token, relying_party)
+         .await
+-        .expect("Failed to authenticate Xbox user")
++        .map_err(|err| format!("the XSTS token: {err}"))
+ }
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -47,6 +47,38 @@
+         panic!("Device token isnt legacy")
+     };
+ 
++    // --check: the Xbox sign-in tried once, the way the game's requests go (the signed path), then exit. MetalHorizon
++    // runs it after a sign-in and before Play, so a refused account is known before the game starts. Prints one
++    // CHECK line and nothing of the account. Exit 0: accepted; 2: refused or unreachable; 3: no sign-in saved.
++    if std::env::args().any(|a| a == "--check") {
++        let user = match tokens.get_user_sts_token() {
++            Ok(xodus::models::secrets::Token::Legacy(user)) => user,
++            _ => {
++                println!("CHECK no-sign-in: no Microsoft sign-in is saved");
++                std::process::exit(3);
++            }
++        };
++        let signer = xodus::api::xbox::RequestSigner::generate();
++        match xodus::api::xbox::try_run_with_signer(
++            &reqwest::Client::new(),
++            device_token.clone(),
++            user,
++            "http://xboxlive.com",
++            Some(&signer),
++        )
++        .await
++        {
++            Ok(_) => {
++                println!("CHECK ok: Xbox accepted the account");
++                std::process::exit(0);
++            }
++            Err(err) => {
++                println!("CHECK failed: {err}");
++                std::process::exit(2);
++            }
++        }
++    }
++
+     let runtime_dir = utils::get_runtime_dir();
+     let cancellation = CancellationToken::new();
+     let socket_path = format!("{runtime_dir}/xodus.sock");
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -499,14 +499,22 @@
+             };
+             let device_token = context.device_token.as_ref().unwrap().clone();
+ 
+-            let xsts = xodus::api::xbox::run_with_signer(
++            let xsts = match xodus::api::xbox::try_run_with_signer(
+                 &context.client,
+                 device_token,
+                 user_token,
+                 &relying_party,
+                 Some(&SIGNER),
+             )
+-            .await;
++            .await
++            {
++                Ok(xsts) => xsts,
++                Err(err) => {
++                    // said once per request in the log the app reads; the game gets an empty answer, not a dead service
++                    eprintln!("Failed to authenticate Xbox user: {err}");
++                    return Ok(vec![]);
++                }
++            };
+ 
+             let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+             let signature = sign_for(&req, &token, &endpoints_for(&context.client).await);

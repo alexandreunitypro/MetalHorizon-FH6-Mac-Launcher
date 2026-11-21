@@ -18,9 +18,9 @@ enum EngineRoute: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .automatic: return "Automatic"
-        case .native: return "Native Apple silicon"
-        case .d3dmetal: return "D3DMetal (Rosetta)"
+        case .automatic: return tr("Automatic")
+        case .native: return tr("Native Apple silicon")
+        case .d3dmetal: return tr("D3DMetal (Rosetta)")
         }
     }
 }
@@ -28,11 +28,11 @@ enum EngineRoute: String, CaseIterable, Identifiable {
 /// The two engines a run can actually use.
 enum ResolvedRoute: String {
     case native, d3dmetal
-    var title: String { self == .native ? "Native Apple silicon" : "D3DMetal" }
+    var title: String { self == .native ? tr("Native Apple silicon") : "D3DMetal" }
     var shortExplanation: String {
         self == .native
-            ? "Steady 30 frames a second, no hitch every second."
-            : "Up to 50 frames a second, with a short hitch about once a second."
+            ? tr("Steady 30 frames a second, no hitch every second.")
+            : tr("Up to 50 frames a second, with a short hitch about once a second.")
     }
 }
 

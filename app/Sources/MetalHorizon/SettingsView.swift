@@ -31,14 +31,14 @@ private struct CheckRow: View {
     var body: some View {
         LabeledContent {
             HStack(spacing: 8) {
-                if let button, let action { Button(button, action: action) }
+                if let button, let action { Button(tr(button), action: action) }
             }
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: check.ok ? (check.fix == nil ? "checkmark.circle.fill" : "exclamationmark.circle.fill") : "xmark.circle.fill")
                     .foregroundStyle(check.ok ? (check.fix == nil ? Color.green : Color.orange) : Color.red)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
+                    Text(tr(title))
                     Text(check.text)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -58,14 +58,14 @@ private struct GeneralSettings: View {
         Form {
             Section {
                 Picker("Edition", selection: $model.edition) {
-                    ForEach(Edition.allCases) { Text($0.title).tag($0) }
+                    ForEach(Edition.allCases) { Text(tr($0.title)).tag($0) }
                 }
                 .disabled(model.isBusy)
             }
             Section("Game") {
                 if model.edition == .xbox {
                     Picker("You have the game", selection: $model.ownership) {
-                        ForEach(XboxOwnership.allCases) { Text($0.title).tag($0) }
+                        ForEach(XboxOwnership.allCases) { Text(tr($0.title)).tag($0) }
                     }
                     if model.ownership == .gamePass {
                         Text("Game Pass gives a licence at every start: the Mac needs the internet when you press Play, and the plan must include PC games (PC Game Pass or Ultimate).")
@@ -83,7 +83,7 @@ private struct GeneralSettings: View {
                             Button("Choose…", action: model.chooseSteamPrefix)
                         }
                     }
-                    Text(Setup.tildePath(model.setup.steamPrefixPath) + ". An existing Highball, CrossOver or Whisky bottle with Steam works too.")
+                    Text(tr("%@. An existing Highball, CrossOver or Whisky bottle with Steam works too.", Setup.tildePath(model.setup.steamPrefixPath)))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -101,8 +101,8 @@ private struct GeneralSettings: View {
             }
             if model.edition == .xbox {
                 Section("Xbox account") {
-                    LabeledContent(model.accountSaved ? "Signed in, kept in the macOS Keychain" : "Not signed in") {
-                        Button(model.accountSaved ? "Sign In Again…" : "Sign In…", action: model.connectMicrosoft)
+                    LabeledContent(model.accountSaved ? tr("Signed in, kept in the macOS Keychain") : tr("Not signed in")) {
+                        Button(model.accountSaved ? tr("Sign In Again…") : tr("Sign In…"), action: model.connectMicrosoft)
                             .disabled(model.isBusy)
                     }
                 }
@@ -123,9 +123,9 @@ private struct GraphicsSettings: View {
                     ForEach(EngineRoute.allCases) { Text($0.title).tag($0) }
                 }
                 .disabled(model.isBusy || model.edition == .steam)
-                Text(model.edition == .steam
+                Text(tr(model.edition == .steam
                      ? "The Steam edition runs on D3DMetal in this version."
-                     : "Native Apple silicon: a steady 30 frames a second without the hitch every second (Highball's native route). D3DMetal: up to 50 frames a second with a short hitch about once a second. Automatic picks the native engine on a Mac with macOS 27 and 24 GB or more, and moves to D3DMetal by itself if the native engine stops the game twice in a day.")
+                     : "Native Apple silicon: a steady 30 frames a second without the hitch every second (Highball's native route). D3DMetal: up to 50 frames a second with a short hitch about once a second. Automatic picks the native engine on a Mac with macOS 27 and 24 GB or more, and moves to D3DMetal by itself if the native engine stops the game twice in a day."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -134,7 +134,7 @@ private struct GraphicsSettings: View {
                 }
                 .help(model.routeDecision.reason)
                 if RouteHealth.load().isBenched(.native) {
-                    LabeledContent(RouteHealth.load().native.benchReason ?? "The Autopilot keeps the native engine aside.") {
+                    LabeledContent(RouteHealth.load().native.benchReason ?? tr("The Autopilot keeps the native engine aside.")) {
                         Button("Use It Again") { model.clearNativeBench() }
                     }
                 }
