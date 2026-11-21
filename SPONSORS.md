@@ -10,15 +10,12 @@ getting the Xbox edition of Forza Horizon 6 right on a Mac takes.
 - No game content behind a paywall: no sponsor-only videos or game files.
 - Sponsoring never buys help with piracy, cheating or getting around the game's protection.
 
-## Goal: $100/month
 
 What the money goes to, in this order:
 
 1. **Apple Developer Program ($99/year).** A signed and notarized launcher, so macOS opens it without a
    Gatekeeper warning.
-2. **A used 8–16 GB Apple Silicon Mac (M1 or M2).** "Will it run on my Mac?" is the most asked question. Today
-   the only test machine is an M5 Pro with 48 GB.
-3. **Time**: frame pacing, the black foliage, crashes, then a launcher that works on any Mac.
+2. **Time**: frame pacing, the black foliage, crashes, then a launcher that works on any Mac.
 
 A short public note each month says what came in and where it went.
 
