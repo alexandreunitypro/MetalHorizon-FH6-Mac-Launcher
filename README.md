@@ -1,6 +1,6 @@
 # MetalHorizon – FH6 Mac Launcher – The world most advanced launcher and translator tools to run Forza horizon 6 on Mac 
 
-**Run your own copy of Forza Horizon 6 on an Apple Silicon Mac: Xbox / Microsoft Store AND STEAM!**
+**Run your own copy of Forza Horizon 6 on an Apple Silicon Mac: Xbox / Microsoft Store, STEAM And even GAME PASS!**
 
 **I am committed to patching as many bugs as possible and resolving as many issues as I can; please report them in the "issues" section, and I will release a fix within 24 hours.**
 
