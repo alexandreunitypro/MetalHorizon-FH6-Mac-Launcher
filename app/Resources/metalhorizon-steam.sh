@@ -90,7 +90,18 @@ runtime_copies_aside
 # What the programs of this prefix get, as one number: raised when it changes, so that a Steam client started by an
 # older MetalHorizon, whose environment the game would inherit, is restarted before it starts the game.
 # 2: xgameruntime native only and no package identity (2.2.0). 3: native only, with the package identity (2.2.1).
-STEAM_ENV=3
+# 4: the Xbox sign-in's requests in the game log (2.2.2).
+STEAM_ENV=4
+# The Xbox sign-in (issue #21): the game's own Gaming Runtime talks to login.live.com and the Xbox services through
+# WinHTTP. Each request's host and path and each answer's status (and Microsoft's X-WLID-Error) go to the game log, for
+# Export Diagnostics; the rest of WinHTTP's trace, headers and bodies, is dropped here. No token is in what is kept.
+SIGNIN_TRACE="${MH_WINEDEBUG:--all},trace+winhttp"
+signin_filter() {
+    awk '!/trace:winhttp:/ { print; fflush(); next }
+         /WinHttpConnect .*L"|WinHttpOpenRequest .*L"/ { sub(/^[0-9a-f]+:trace:winhttp:/, "xbox-signin: "); print; fflush(); next }
+         /read_reply version/ { sub(/^[0-9a-f]+:trace:winhttp:read_reply version \["HTTP\/1.1"\] /, "xbox-signin: answer "); print; fflush(); next }
+         /X-WLID-Error: / { if (match($0, /X-WLID-Error: 0x[0-9A-Fa-f]+/)) { print "xbox-signin: " substr($0, RSTART, RLENGTH); fflush() } next }'
+}
 mkdir -p "$LOGS" 2>/dev/null
 
 # --- processes of this prefix -------------------------------------------------------------------------------------
@@ -328,8 +339,8 @@ play_applaunch() {
             # while no client runs, as Steam records them once shown (Highball's SteamLaunchNotice).
             [ -x "${MH_APP_BINARY:-}" ] && "$MH_APP_BINARY" --steam-notices-seen "$STEAM_DIR" "$APPID" 2>/dev/null | sed 's/^/  /'
             mark game msync
-            ( cd "$STEAM_DIR" && exec "$ENGINE/bin/wine" "$STEAM_WIN" -silent -cef-disable-gpu -cef-disable-gpu-compositing \
-                -applaunch "$APPID" >> "$GAME_LOG" 2>&1 & )
+            ( cd "$STEAM_DIR" && export WINEDEBUG="$SIGNIN_TRACE" && "$ENGINE/bin/wine" "$STEAM_WIN" -silent -cef-disable-gpu -cef-disable-gpu-compositing \
+                -applaunch "$APPID" 2>&1 | signin_filter >> "$GAME_LOG" & )
         fi
         wait_for_game "$GAME_LOG" "$offset" "$minutes"; code=$?
         if [ "$code" -eq 4 ] && [ "$notices_handled" -eq 0 ]; then
@@ -378,7 +389,7 @@ play_direct() {
         : >> "$GAME_LOG"; offset=$(mh_size "$GAME_LOG")
         echo "== launch $attempt: MetalHorizon starts the game (D3DMetal), Steam beside it"
         runtime_copies_aside
-        ( cd "$STEAM_DIR/steamapps/common/$dir" && exec "$ENGINE/bin/wine" "C:\\Program Files (x86)\\Steam\\steamapps\\common\\$dir\\forzahorizon6.exe" >> "$GAME_LOG" 2>&1 & )
+        ( cd "$STEAM_DIR/steamapps/common/$dir" && export WINEDEBUG="$SIGNIN_TRACE" && "$ENGINE/bin/wine" "C:\\Program Files (x86)\\Steam\\steamapps\\common\\$dir\\forzahorizon6.exe" 2>&1 | signin_filter >> "$GAME_LOG" & )
         wait_for_game "$GAME_LOG" "$offset" 2; code=$?
         if [ "$code" -ne 0 ]; then mh_tail_errors "$GAME_LOG"; mh_fail "the game did not start"; fi
         echo "== game started. Quit it from its own menu; Steam stays open in the background."

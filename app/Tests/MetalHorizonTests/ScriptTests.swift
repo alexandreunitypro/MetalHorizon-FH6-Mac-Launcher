@@ -155,7 +155,7 @@ final class ScriptTests: XCTestCase {
         // the client is written down with the environment it got: Play restarts one an older MetalHorizon started,
         // since the game would inherit its environment (issue #21)
         let marker = try String(contentsOfFile: env["MH_PREFIX"]! + "/.metalhorizon-steam-mode", encoding: .utf8)
-        XCTAssertEqual(marker.trimmingCharacters(in: .whitespacesAndNewlines), "window none 3")
+        XCTAssertEqual(marker.trimmingCharacters(in: .whitespacesAndNewlines), "window none 4")
         env["MH_STEAM_URL"] = "https://example.com/x"
         (code, out) = try run("metalhorizon-steam.sh", ["open"], env: env)
         XCTAssertEqual(code, 0, out)
