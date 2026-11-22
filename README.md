@@ -10,7 +10,7 @@ The best tool in the world to run Forza Horizon 6 on a Mac: the most stable solu
 
 Forza Horizon 5,4,3,2 and 1 support is coming very soon!! Also Forza Motorsport 2023 as a world first
 
-**[☕ Support it on Buy Me a Coffee](https://buymeacoffee.com/zaidalexandre)**
+##**[☕ Support it on Buy Me a Coffee](https://buymeacoffee.com/zaidalexandre)**
 
 ## Download
 
