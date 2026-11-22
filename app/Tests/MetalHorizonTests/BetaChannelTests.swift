@@ -57,6 +57,32 @@ final class BetaChannelTests: XCTestCase {
         XCTAssertEqual(setup(.steam, .beta).engine, installedSteamBetaEngineDirectory)
     }
 
+    /// Blackwell Engine 1.4 is Beta 1.4a2 made public: the public engine whose record says "rosettaLine" gets the
+    /// pacer, the Trap Boost and the 8 processors, as the beta did; an engine without it (1.3.1) gets none.
+    func testThePublicEngineWithTheRosettaLineGetsItsSettings() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("rosetta-line-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let record = folder.appendingPathComponent("metalhorizon.json")
+        try Data(#"{"name": "Blackwell Engine", "version": "1.3.1"}"#.utf8).write(to: record)
+        let older = setup(.xbox, .stable, override: folder.path)
+        XCTAssertFalse(older.rosettaLineInEngine)
+        XCTAssertEqual(older.optionsEnvironment(gameInput: false)["BW_PACER"], "")
+        XCTAssertNil(older.optionsEnvironment(gameInput: false)["BW_TRAP_BOOST"])
+        try Data(#"{"name": "Blackwell Engine", "version": "1.4", "channel": "public", "rosettaLine": "pacer"}"#.utf8).write(to: record)
+        let public14 = setup(.xbox, .stable, override: folder.path)
+        XCTAssertTrue(public14.rosettaLineInEngine)
+        XCTAssertFalse(public14.betaEngineInUse, "public, not the beta channel")
+        XCTAssertEqual(public14.optionsEnvironment(gameInput: false)["BW_PACER"], "auto")
+        XCTAssertEqual(public14.optionsEnvironment(gameInput: false)["BW_TRAP_BOOST"], "1")
+        if ProcessInfo.processInfo.activeProcessorCount > 8 {
+            XCTAssertEqual(public14.optionsEnvironment(gameInput: false)["WINENCPU"], "8")
+        }
+        let facts = MachineFacts(appleSilicon: true, macOSMajor: 27, macOSMinor: 2, memoryGB: 48)
+        XCTAssertFalse(public14.routeDecision(facts: facts, health: RouteHealth()).reason.contains("Beta engine"),
+                       "the public engine does not take the native route's place on Automatic")
+    }
+
     func testOnAutomaticTheBetaEnginePlaysOnD3DMetal() throws {
         try pretendInstalled("engine-beta")
         var s = setup(.xbox, .beta)

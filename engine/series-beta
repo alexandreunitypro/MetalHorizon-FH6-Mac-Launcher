@@ -33,16 +33,17 @@
 # The GameInput dispatcher (since engine 1.3.1, MetalHorizon 2.1.1, issue #15): a game can run GameInput's callbacks
 # itself, as on Windows; CreateDispatcher answered E_NOTIMPL. Tested without the game: tests/gameinput-pads.
 0019-gameinput-dispatcher.patch
-# Highball 0025 (closing async I/O no longer crashes) is NOT in the engine that runs the game today: only
-# its test half reached the dev tree. Turn it on after an in-game test.
-# ../../tools/forza-patches/0025-ntdll-threadpool-io-release-once.patch
-# --- Beta (alpha) engine: only in MetalHorizon beta mode, never installed for the public channel ---
-# Highball's Rosetta-line patches not in the public engine (copied verbatim from
-# https://github.com/gauthierpiarrette/highball-engine/tree/main/patches, LGPL-2.1-or-later; see patches/ORIGIN-beta.md)
+# The Rosetta line (since engine 1.4, MetalHorizon 2.1.2; Beta 1.4a1 and 1.4a2 before it): against the freezes and
+# the hitches under Rosetta, in forzahorizon6.exe only. Highball's Rosetta-line patches, copied verbatim from
+# https://github.com/gauthierpiarrette/highball-engine/tree/main/patches (LGPL-2.1-or-later; see patches/ORIGIN-beta.md),
+# 0025 among them (closing async I/O no longer crashes):
 hb-0005-ntdll-yield-after-auto-event-set.patch
 hb-0014-msync-unregister-early-return.patch
 hb-0015-winecoreaudio-io-buffer-under-half-a-period.patch
 hb-0025-ntdll-threadpool-io-release-once.patch
 hb-0028-ntdll-crash-on-faults-in-foreign-threads.patch
-# Blackwell Pacer and Trap Boost: Rosetta's translator stops kept short (BW_PACER=auto), its exception server raised (BW_TRAP_BOOST=1)
+# The Blackwell Pacer and the Trap Boost: Rosetta's translator stops kept short (BW_PACER=auto) and its exception
+# server raised (BW_TRAP_BOOST=1). MetalHorizon sets both when the engine's record (metalhorizon.json) has "rosettaLine".
 0016-ntdll-blackwell-pacer.patch
+# --- Beta (alpha) engine: only in MetalHorizon beta mode, never installed for the public channel ---
+# None yet: Beta 1.4a2's patches became the public engine 1.4 (above). build-beta.sh needs at least one patch here.

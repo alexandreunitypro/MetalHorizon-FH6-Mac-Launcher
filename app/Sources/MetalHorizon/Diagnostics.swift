@@ -397,7 +397,7 @@ enum Diagnostics {
             "options": ["metal_hud": setup.metalHUD, "controllers": setup.controllerMode.rawValue, "metalfx": setup.metalFX,
                         "max_fps": setup.maxFPS, "auto_retry": setup.autoRetry, "engine_route": setup.engineRoute.rawValue,
                         "plain_sync": setup.plainSync, "engine_channel": setup.engineChannel.rawValue,
-                        "beta_engine_in_use": setup.betaEngineInUse],
+                        "beta_engine_in_use": setup.betaEngineInUse, "rosetta_line": setup.rosettaLineInEngine],
             "engine": {
                 let facts = MachineFacts.current
                 let health = RouteHealth.load()

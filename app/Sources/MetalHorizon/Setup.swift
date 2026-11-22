@@ -156,6 +156,15 @@ struct Setup {
     var betaEngineInUse: Bool {
         engineChannel == .beta && engineDirectory.isEmpty && Component.named(betaComponentID)?.isInstalled == true
     }
+    /// The Rosetta engine that plays has the Rosetta line (the Blackwell Pacer, the Trap Boost and Highball's five
+    /// fixes): the beta engine, and the public one since Blackwell Engine 1.4, whose record says "rosettaLine".
+    var rosettaLineInEngine: Bool { betaEngineInUse || Self.engineHasRosettaLine(engine) }
+
+    static func engineHasRosettaLine(_ engine: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: engine + "/metalhorizon.json"),
+              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return record["rosettaLine"] != nil || record["channel"] as? String == "beta"
+    }
     var d3dmetal: String { d3dmetalDirectory.isEmpty ? installedD3DMetalDirectory : d3dmetalDirectory }
     var steamPrefixPath: String { steamPrefix.isEmpty ? defaultSteamPrefix : steamPrefix }
     var steam: SteamFiles { SteamFiles(prefix: steamPrefixPath) }
@@ -409,6 +418,7 @@ struct Setup {
 
     /// The options every script reads (metalhorizon-common.sh).
     func optionsEnvironment(gameInput: Bool) -> [String: String] {
+        let rosettaLine = rosettaLineInEngine
         var env: [String: String] = [
             "MH_ENGINE": engine,
             "MH_D3DMETAL": d3dmetal,
@@ -423,11 +433,11 @@ struct Setup {
             "MH_RETRIES": autoRetry ? "2" : "0",
             "MH_SYNC": plainSync ? "plain" : "msync",
             "MH_LOGS": logDirectory.path,
-            // the beta engine's pacer, in the game's process only (BW_PACER_EXE, forzahorizon6.exe by default); the
-            // public engine has none, and an empty value starts none
-            "BW_PACER": betaEngineInUse ? "auto" : ""
+            // the Rosetta line's pacer (Blackwell Engine 1.4 and the beta), in the game's process only (BW_PACER_EXE,
+            // forzahorizon6.exe by default); an engine without it, and an empty value, start none
+            "BW_PACER": rosettaLine ? "auto" : ""
         ]
-        if betaEngineInUse {
+        if rosettaLine {
             // Rosetta's exception server raised for the game's traps (bw_trapboost.h), and the game shown at most 8
             // processors: fewer of its worker threads compete for the translator, and the Mac runs cooler (MacGameFix)
             env["BW_TRAP_BOOST"] = "1"

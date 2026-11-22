@@ -38,3 +38,15 @@
 0019-gameinput-dispatcher.patch
 # The 32-bit half: 0005's FH6 diagnostics read x86_64 registers, kept to the 64-bit build.
 0013-i386-build-guards.patch
+# The Rosetta line (since engine 1.4, MetalHorizon 2.1.2; Beta 1.4a1 and 1.4a2 before it): against the freezes and
+# the hitches under Rosetta, in forzahorizon6.exe only. Highball's Rosetta-line patches, copied verbatim from
+# https://github.com/gauthierpiarrette/highball-engine/tree/main/patches (LGPL-2.1-or-later; see patches/ORIGIN-beta.md),
+# 0025 among them (closing async I/O no longer crashes):
+hb-0005-ntdll-yield-after-auto-event-set.patch
+hb-0014-msync-unregister-early-return.patch
+hb-0015-winecoreaudio-io-buffer-under-half-a-period.patch
+hb-0025-ntdll-threadpool-io-release-once.patch
+hb-0028-ntdll-crash-on-faults-in-foreign-threads.patch
+# The Blackwell Pacer and the Trap Boost: Rosetta's translator stops kept short (BW_PACER=auto) and its exception
+# server raised (BW_TRAP_BOOST=1). MetalHorizon sets both when the engine's record (metalhorizon.json) has "rosettaLine".
+0016-ntdll-blackwell-pacer.patch
