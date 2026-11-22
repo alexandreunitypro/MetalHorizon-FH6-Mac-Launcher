@@ -121,19 +121,6 @@ controllers and the components, change settings with the user's agreement, and e
 
 Everything below is built on the Mac. Each script keeps a `.bak` of what it replaces and has `--undo`.
 
-| Component | Built with | Script |
-|---|---|---|
-| **Wine engine**: CrossOver 26.3 sources + [Ferestre](https://github.com/icex/ferestre) 0006/0009/0010/0013 | Xcode Command Line Tools, llvm-mingw 20260908 | your own build, then the scripts below |
-| Wine patches from this repo, [`patches/wine/`](patches/wine/): mapped image reopen (0001), WebSocket (0002), `SIO_UDP_NETRESET` (0003), `SendARP` (0004), diagnostic channels (0005), dual-stack IPv4 options (0006) | same | 0001: `tools/mac_apply_wine_fix.sh`; the others: `git apply`, then rebuild the DLL they touch |
-| Highball's Forza patches, [`tools/forza-patches/`](tools/forza-patches/): 0017–0020, 0022–0025 | same | `tools/mac_apply_forza_patches.sh`, `tools/mac_fix_audio_surround.sh` |
-| Wine fixes: FreeType, GnuTLS, `WinHttpQueryHeaders`, leaf unwind, fonts | same | `tools/mac_enable_freetype.sh`, `tools/mac_enable_gnutls.sh`, `tools/mac_fix_winhttp_headers.sh`, `tools/mac_fix_leaf_unwind.sh`, `tools/mac_fix_fonts.sh` |
-| `xgameruntime.dll`: async completions after the call returns, as on Windows | llvm-mingw | `tools/mac_fix_xasync_inline.sh` |
-| Unix-side fault report in `ntdll.so` (diagnostic only) | Xcode CLT | `tools/mac_trace_faults.sh` |
-| **xodus-cli / xodus-service** + [`patches/xodus-cli/`](patches/xodus-cli/): named decrypted image on macOS (0001), title-authenticated XSTS for online play (0002) | Rust (`cargo build --release`) | `tools/mac_apply_xodus_fix.sh` |
-| **DirectX 12 shim** `d3d12.dll`: Highball's [`tsshim`](tools/tsshim/) + `dxil_shadingrate.c` + `inspect.c` | llvm-mingw | `tools/mac_setup_tsshim.sh` |
-| Replacement shaders (skid marks) | D3DMetal's own DXC | `tools/mac_shader_fixes.sh` |
-| `dxilbench`: native shader bench using D3DMetal's compiler and Metal IR converter | `clang++ -arch x86_64` | `tools/mac_vrs_probe.sh`, `tools/mac_shader_fixes.sh`, `tools/mac_pso_report.sh` |
-| Test programs that run without the game: `d3d12probe`, `vrsprobe`, `inspectprobe`, `gpuprobe`, `fontprobe`, `audioprobe`, `httpprobe`, `wsprobe`, `asyncprobe`, `excprobe`, `cpuidprobe`, `selfread`, `winlist` | llvm-mingw | the matching `tools/mac_*_probe.sh` |
 
 An experimental launch on [Mullion](https://github.com/dttdrv/mullion) (a DXMT fork) instead of D3DMetal is in
 `tools/mac_launch_fh6_mullion.sh`. No result yet.
