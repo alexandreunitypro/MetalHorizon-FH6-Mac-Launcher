@@ -9,6 +9,9 @@ Blackwell Engine (Wine) + xodus or Steam + Apple's D3DMetal, open source, no Cro
 The best tool in the world to run Forza Horizon 6 on a Mac: the most stable solution, offering exclusive features like multiplayer and significantly better graphics and work with Xbox copy of the game even game pass!.
 
 Forza Horizon 5,4,3,2 and 1 support is coming very soon!! Also Forza Motorsport 2023 as a world first
+
+**[☕ Support it on Buy Me a Coffee](https://buymeacoffee.com/zaidalexandre)**
+
 ## Download
 
 **[MetalHorizon 1.0 (Final Beta)](../../releases)**: unzip, move **MetalHorizon** to Applications, then
