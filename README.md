@@ -14,7 +14,7 @@ Forza Horizon 5, 4, 3, 2 and 1 support is coming very soon, and Forza Motorsport
 
 On a MacBook Pro with an **M5 Pro** (48 GB, macOS 27.2.1), the Xbox edition holds its **60 fps** cap on
 **Blackwell Engine Native**, online, with other players around: Metal HUD at 60 fps, GPU at 90 %, over a 35-minute
-session (22 November 2026, 1920×1080, the Very Low preset and FSR Quality MetalHorizon starts the game with).
+session (22 November 2026, 1920×1080, the Very High preset MetalHorizon starts the game with).
 
 Blackwell Engine Native is the best engine there is to play Forza on a Mac: Wine for arm64 with FEX, vkd3d-proton
 and KosmicKrisp on Metal 4, Highball's native route, plus MetalHorizon's Xbox patches. No Rosetta, so none of the
