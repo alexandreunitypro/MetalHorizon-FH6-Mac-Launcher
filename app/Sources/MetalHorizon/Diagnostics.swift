@@ -79,7 +79,7 @@ enum Diagnostics {
         KnownIssue(id: "steam-auth", title: "The game got no sign-in (E:0-0-L-8)",
                    patterns: [#"E:0-0-L-8"#, #"Initialization failed"#, #"初始化失败"#, #"Steam has to start it"#],
                    explanation: "The game started without receiving its account: on Steam, the ticket the Steam client hands it; on Xbox, the session xodus-service passes on. It then shows its own sign-in prompt and fails with E:0-0-L-8, or stays on 'Welcome, Player'.",
-                   fix: "Start it with Play in MetalHorizon. Steam: update MetalHorizon (1.0.5 lets the game sign in to Xbox by itself); the first time, the game shows a code: enter it at microsoft.com/link with your Microsoft account, and the game keeps the sign-in after that. Sign in once in Steam's window too. Xbox: sign in again with Microsoft. If it stays, send the diagnostics (Activity › Export Diagnostics)."),
+                   fix: "Start it with Play in MetalHorizon. Steam: update MetalHorizon (after 2.1.2 the game signs in to Xbox with the Gaming Runtime it ships; 1.1.0 to 2.1.2 kept it from loading, and the game showed 'Sign In Required'); the first time, the game shows a code: enter it at microsoft.com/link with your Microsoft account, and the game keeps the sign-in after that. Sign in once in Steam's window too. Xbox: sign in again with Microsoft. If it stays, send the diagnostics (Activity › Export Diagnostics)."),
         KnownIssue(id: "steam-unresponsive", title: "Steam's web helper hung",
                    patterns: [#"killing unresponsive browser"#, #"steamwebhelper is not responding"#],
                    explanation: "Steam's interface hangs under msync or esync.",

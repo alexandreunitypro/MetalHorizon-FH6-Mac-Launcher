@@ -60,13 +60,47 @@ case "$ACTION" in status) ;; *)
 esac
 mh_engine_env
 export WINEPREFIX="$PREFIX"
-# The Steam edition signs in to Xbox by itself, with its own sign-in library (a code at microsoft.com/link the first
-# time, kept in Windows' credential store after), as it does on a Windows PC without the Xbox app's Gaming Runtime.
-# The engine's xgameruntime is the Xbox edition's, whose sign-in is xodus-service: found by the Steam game, it took the
-# sign-in over with no service behind it, said someone was signed in and then had no Xbox token to give (E:0-0-L-8,
-# issues #9, #13, #16, #17, and the 20 November report). Highball's engine, where the Steam game signs in, has no
-# xgameruntime at all; here it is off for every program of the Steam prefix.
-export WINEDLLOVERRIDES="xgameruntime=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+# The Steam edition signs in to Xbox with the Gaming Runtime it ships in its own folder: "When building for Steam, you
+# must include xgameruntime.dll in your game directory" (Microsoft's GDK since October 2025, PlayFab Game Saves,
+# "October 2025 GDK changes"). That copy signs in with a code at microsoft.com/link the first time and keeps it in
+# Windows' credential store. The engine's xgameruntime is the Xbox edition's, whose sign-in is xodus-service, and Wine
+# prefers its builtin to the game's copy: up to 1.0.4 it took the sign-in over with no service behind it (E:0-0-L-8,
+# issues #9, #13, #16, #17); off (=d) from 1.1.0 to 2.1.2, it took the game's own copy with it, and the game had no
+# Xbox sign-in at all ("Sign In Required", issue #21). Native only: the game's own copy loads and the builtin never
+# does, as in Highball's engine, which has no xgameruntime.
+export WINEDLLOVERRIDES="xgameruntime=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+# A Steam game has no package identity on Windows. The engine gives one to a program with a MicrosoftGame.config beside
+# it (engine patch 0002, for the Xbox edition), and the Steam build ships one too: the Steam game passed for the
+# Microsoft Store copy (Microsoft.ForteBaseGame_..._8wekyb3d8bbwe). Pointed at a manifest without an <Identity>, the
+# engine gives none to any program of this prefix. The file has to exist: without it the engine looks beside the
+# program again.
+NO_IDENTITY="$PREFIX/drive_c/metalhorizon/no-package-identity.xml"
+export WINE_PACKAGE_MANIFEST='C:\metalhorizon\no-package-identity.xml'
+no_package_identity() {
+    [ -d "$PREFIX/drive_c" ] || return 0
+    grep -q '<MetalHorizon/>' "$NO_IDENTITY" 2>/dev/null && return 0
+    mkdir -p "$(dirname "$NO_IDENTITY")" 2>/dev/null
+    printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' \
+        '<!-- MetalHorizon: no package identity for the programs of the Steam prefix, as on a Windows PC. -->' \
+        '<MetalHorizon/>' > "$NO_IDENTITY" 2>/dev/null || echo "WARN: could not write $NO_IDENTITY"
+}
+no_package_identity
+# wineboot copies every builtin DLL of the engine into the prefix's system folders, xgameruntime among them, where
+# Windows without the Xbox app, Proton and Highball's engine have none: a game looking for a system Gaming Runtime would
+# find one there that cannot load (native only, above). Set aside, and again during Play, since wineboot brings it back
+# after an engine update (the client's first start).
+runtime_copies_aside() {
+    local f
+    for f in "$PREFIX/drive_c/windows/system32/xgameruntime.dll" "$PREFIX/drive_c/windows/syswow64/xgameruntime.dll"; do
+        [ -f "$f" ] && mv -f "$f" "$f.metalhorizon-aside" 2>/dev/null
+    done
+    return 0
+}
+runtime_copies_aside
+# What the programs of this prefix get, as one number: raised when it changes, so that a Steam client started by an
+# older MetalHorizon, whose environment the game would inherit, is restarted before it starts the game.
+# 2: xgameruntime native only and no package identity (the version after 2.1.2).
+STEAM_ENV=2
 mkdir -p "$LOGS" 2>/dev/null
 
 # --- processes of this prefix -------------------------------------------------------------------------------------
@@ -96,7 +130,11 @@ live_sync() {   # msync or none: the mode of the server running in the prefix; e
     [ -n "$(prefix_pids)" ] || return 0
     if [ "$(cut -d' ' -f2 "$MARKER" 2>/dev/null)" = msync ]; then echo msync; else echo none; fi
 }
-mark() { echo "$1 $2" > "$MARKER"; }   # mark <window|game> <msync|none>, when a client is started
+mark() { echo "$1 $2 $STEAM_ENV" > "$MARKER"; }   # mark <window|game|direct> <msync|none>, when a client is started
+client_env_current() {   # the running client got this script's environment (STEAM_ENV); true when none runs
+    [ -n "$(client_pids)" ] || return 0
+    [ "$(cut -d' ' -f3 "$MARKER" 2>/dev/null)" = "$STEAM_ENV" ]
+}
 # A new process must use the sync mode of the server already running in the prefix, or it dies at start.
 join_live_sync() {
     case "$(live_sync)" in
@@ -156,6 +194,7 @@ cmd_prefix() {
     ( export WINEMSYNC=0 WINEESYNC=0; "$ENGINE/bin/wine" wineboot -i >> "$LOGS/steam-prefix.log" 2>&1; "$ENGINE/bin/wineserver" -w )
     [ -f "$PREFIX/system.reg" ] || mh_fail "wineboot did not create the prefix (see $LOGS/steam-prefix.log)"
     [ -f "$PREFIX/drive_c/windows/syswow64/ntdll.dll" ] || echo "WARN: the prefix has no 32-bit system folder"
+    no_package_identity
     echo "prefix ready"
 }
 
@@ -242,6 +281,7 @@ client_aborted() {
 wait_for_game() {
     local log="$1" offset="$2" limit=$(( $3 * 60 )) waited=0 gone=0
     until [ -n "$(game_pids)" ]; do
+        runtime_copies_aside   # brought back by wineboot when the client's start updated the prefix
         sleep 2; waited=$((waited + 2))
         [ $((waited % 60)) -eq 0 ] && echo "  waiting for the game to start ($((waited / 60)) min; Steam may be updating or signing in)"
         client_aborted "$log" "$offset" && { echo "  the Steam client stopped with an error"; return 1; }
@@ -348,6 +388,7 @@ play_direct() {
         attempt=$((attempt + 1)); start=$(date +%s)
         : >> "$GAME_LOG"; offset=$(mh_size "$GAME_LOG")
         echo "== launch $attempt: MetalHorizon starts the game (D3DMetal), Steam beside it"
+        runtime_copies_aside
         ( cd "$STEAM_DIR/steamapps/common/$dir" && exec "$ENGINE/bin/wine" "C:\\Program Files (x86)\\Steam\\steamapps\\common\\$dir\\forzahorizon6.exe" >> "$GAME_LOG" 2>&1 & )
         wait_for_game "$GAME_LOG" "$offset" 2; code=$?
         if [ "$code" -ne 0 ]; then mh_tail_errors "$GAME_LOG"; mh_fail "the game did not start"; fi
@@ -377,7 +418,12 @@ cmd_play() {
     if [ -n "$(game_pids)" ]; then
         echo "Forza Horizon 6 is already running: waiting for it to close."
     else
-        if [ "$(client_mode)" = window ]; then stop_client; fi
+        if [ "$(client_mode)" = window ]; then stop_client
+        elif ! client_env_current; then
+            # the game inherits the client's environment: an older one would give it the old sign-in (issue #21)
+            echo "== the running Steam client was started by an older MetalHorizon: restarting it with this version's settings"
+            stop_client
+        fi
         end_leftovers msync
         mh_crash_to_log
         local strategy

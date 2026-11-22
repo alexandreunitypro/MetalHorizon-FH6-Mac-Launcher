@@ -7,7 +7,7 @@
 # Nothing from Apple or CrossOver goes into the app: the user picks D3DMetal from Apple's Game Porting Toolkit.
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION="${1:-2.1.2}"
+VERSION="${1:-2.2.0}"
 WORK="${WORK:-/Users/alexandre/Documents/Codex/2026-10-19/goal-reprend-son-travail-on-invente/work}"
 XODUS_CLI="${XODUS_CLI:-$WORK/xodus/target/release/xodus-cli}"
 # The service is built from the Ferestre tree (its source below), with patches/xodus-cli/0003 (compact JWE tickets as
@@ -33,6 +33,16 @@ done
 cp components.json "$RES/components.json"
 cp Resources/fh6-native-UserConfigSelections.xml "$RES/"   # the native route's first-start graphics settings
 cp -R Localization/*.lproj "$RES/"   # the screens in the Mac's language (Localization/generate.py)
+# Where the players' reports go: the developer's Mac (tools/reports-receiver writes app/report-endpoint.json, kept out of
+# git). Without it, the app keeps the feedback window and opens a GitHub issue for a problem report.
+if [ -f report-endpoint.json ]; then
+    python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["kind"] == "metalhorizon" and d["url"].startswith("https://") and len(d["key"]) >= 32' \
+        report-endpoint.json || { echo "STOP: app/report-endpoint.json is not a metalhorizon endpoint over https"; exit 1; }
+    cp report-endpoint.json "$RES/report-endpoint.json"
+    echo "== reports go to $(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["url"])' report-endpoint.json)"
+else
+    echo "== no app/report-endpoint.json: reports open a GitHub issue (tools/reports-receiver/README.md)"
+fi
 cp "$XODUS_CLI" "$RES/xodus-cli"; cp "$XODUS_SERVICE" "$RES/xodus-service"
 chmod 755 "$RES/xodus-cli" "$RES/xodus-service"
 cat > "$APP/Contents/Info.plist" <<PLIST

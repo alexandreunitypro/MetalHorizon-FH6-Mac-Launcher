@@ -110,6 +110,9 @@ final class ScriptTests: XCTestCase {
         XCTAssertTrue(out.contains("not in this prefix's Steam library"), out)
         try touch("Steam prefix/drive_c/Program Files (x86)/Steam/steamapps/appmanifest_2483190.acf",
                   contents: "\"AppState\"\n{\n\t\"StateFlags\"\t\t\"4\"\n\t\"buildid\"\t\t\"26422872\"\n}\n")
+        // wineboot's copy of the engine's xgameruntime in the prefix's system folders, where Windows has none
+        try touch("Steam prefix/drive_c/windows/system32/xgameruntime.dll", contents: "Wine builtin DLL")
+        try touch("Steam prefix/drive_c/windows/syswow64/xgameruntime.dll", contents: "Wine builtin DLL")
         var dry = env
         dry["MH_DRY_RUN"] = "1"
         (code, out) = try run("metalhorizon-steam.sh", ["play"], env: dry)
@@ -120,8 +123,20 @@ final class ScriptTests: XCTestCase {
         XCTAssertTrue(out.contains("CX_GRAPHICS_BACKEND=\"d3dmetal\""), out)
         XCTAssertTrue(out.contains("WINE_GAMEINPUT=\"1\""), out)
         XCTAssertTrue(out.contains("gameoverlayrenderer64,gameoverlayrenderer=d"), out)
-        // the Steam game signs in to Xbox itself: the Xbox edition's runtime stays out of its way (E:0-0-L-8)
-        XCTAssertTrue(out.contains("xgameruntime=d"), out)
+        // the Steam game signs in to Xbox with the xgameruntime.dll it ships: native only, so the engine's builtin never
+        // takes its place (E:0-0-L-8) and the game's own copy is not turned off with it ("Sign In Required", #21)
+        XCTAssertTrue(out.contains("xgameruntime=n;"), out)
+        XCTAssertFalse(out.contains("xgameruntime=d"), out)
+        // and no package identity, as on Windows: the engine is pointed at a manifest without an <Identity>
+        XCTAssertTrue(out.contains(#"WINE_PACKAGE_MANIFEST="C:\\metalhorizon\\no-package-identity.xml""#), out)
+        let manifest = try String(contentsOfFile: prefix + "/drive_c/metalhorizon/no-package-identity.xml", encoding: .utf8)
+        XCTAssertTrue(manifest.contains("<MetalHorizon/>") && !manifest.contains("<Identity"), manifest)
+        // and no system Gaming Runtime for the game to find: wineboot's copies are set aside, not deleted
+        for folder in ["system32", "syswow64"] {
+            let copy = prefix + "/drive_c/windows/\(folder)/xgameruntime.dll"
+            XCTAssertFalse(FileManager.default.fileExists(atPath: copy), copy)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: copy + ".metalhorizon-aside"), copy)
+        }
         (code, out) = try run("metalhorizon-steam.sh", ["status"], env: env)
         status = SteamStatus.parse(out)
         XCTAssertTrue(out.contains("steam_installed=yes") && out.contains("game_installed=yes") && out.contains("game_build=26422872"), out)
@@ -138,6 +153,10 @@ final class ScriptTests: XCTestCase {
         var (code, out) = try run("metalhorizon-steam.sh", ["open"], env: env)
         XCTAssertEqual(code, 0, out)
         XCTAssertTrue(try String(contentsOf: log, encoding: .utf8).contains("steam://install/2483190"))
+        // the client is written down with the environment it got: Play restarts one an older MetalHorizon started,
+        // since the game would inherit its environment (issue #21)
+        let marker = try String(contentsOfFile: env["MH_PREFIX"]! + "/.metalhorizon-steam-mode", encoding: .utf8)
+        XCTAssertEqual(marker.trimmingCharacters(in: .whitespacesAndNewlines), "window none 2")
         env["MH_STEAM_URL"] = "https://example.com/x"
         (code, out) = try run("metalhorizon-steam.sh", ["open"], env: env)
         XCTAssertEqual(code, 0, out)

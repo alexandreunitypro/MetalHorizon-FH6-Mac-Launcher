@@ -1110,12 +1110,19 @@ enum MCPServer {
         (#"(?i)(Bienvenue,?|Welcome,?|欢迎，?)\s*[^\s<]+"#, "$1 <gamertag>")
     ].compactMap { pattern, template in (try? NSRegularExpression(pattern: pattern)).map { ($0, template) } }
 
-    /// Removes what must never reach an assistant: tokens, keys, e-mail addresses, XUIDs, Steam IDs and account names,
-    /// gamertags.
+    /// Removes what must never reach an assistant or a report: tokens, keys, e-mail addresses, XUIDs, Steam IDs and
+    /// account names, gamertags, and the Mac's user name in paths.
     static func redact(_ text: String) -> String {
-        redactions.reduce(text) { result, rule in
+        redactUserName(redactions.reduce(text) { result, rule in
             rule.0.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: rule.1)
-        }
+        })
+    }
+
+    /// The Mac's user name, in its paths (/Users/<name>) and in the Wine prefix's (C:\users\<name>): /Users/<user>.
+    static func redactUserName(_ text: String, name: String = NSUserName()) -> String {
+        guard name.count >= 2 else { return text }
+        return text.replacingOccurrences(of: "/Users/\(name)", with: "/Users/<user>", options: .caseInsensitive)
+            .replacingOccurrences(of: "\\users\\\(name)", with: "\\users\\<user>", options: .caseInsensitive)
     }
 
     // MARK: - Prompts

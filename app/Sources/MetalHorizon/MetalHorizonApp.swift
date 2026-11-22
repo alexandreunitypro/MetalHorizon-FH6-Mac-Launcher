@@ -106,6 +106,8 @@ struct MetalHorizonApp: App {
                     .keyboardShortcut("e", modifiers: [.command, .shift])
                 Button("Report an Issue on GitHub…") { model.reportIssue() }
                 Button("Send the Last Crash Report…") { model.showLastCrashReport() }
+                Button("Rate the Last Game…") { model.rateLastGame() }
+                Button("Report a Problem…") { model.reportProblem() }
                 Divider()
                 Button("Show Logs in Finder") { model.revealLogs() }
                 Button("Open the Wine Prefix in Finder") { model.revealPrefix() }
@@ -118,6 +120,7 @@ struct MetalHorizonApp: App {
                     .disabled(model.edition != .steam)
             }
             CommandGroup(after: .help) {
+                Button("Report a Problem…") { model.reportProblem() }
                 Button("Connect an AI Assistant (MCP)…") { showAssistant = true }
                 Button("MetalHorizon on GitHub") { NSWorkspace.shared.open(issuesURL.deletingLastPathComponent()) }
             }
@@ -240,7 +243,11 @@ final class LauncherModel: ObservableObject {
     }
     @Published var activity = Activity.idle {
         // frame generation (MetalDuck, Settings › Graphics) runs while the game does
-        didSet { if (activity == .game) != (oldValue == .game) { FrameGeneration.shared.gameStateChanged(playing: activity == .game) } }
+        didSet {
+            if (activity == .game) != (oldValue == .game) { FrameGeneration.shared.gameStateChanged(playing: activity == .game) }
+            // the reports wait while the game runs or downloads (Feedback/ReportOutbox.swift)
+            ReportOutbox.shared.paused = activity == .game || activity == .download
+        }
     }
     @Published var status = "Ready."
     @Published var accountSaved = false
@@ -273,6 +280,9 @@ final class LauncherModel: ObservableObject {
     @Published var crashReportMode = CrashReport.mode {
         didSet { CrashReport.mode = crashReportMode }
     }
+    /// The feedback window (Feedback/): after a game, or Report a Problem.
+    @Published var feedback: FeedbackRequest?
+    @Published var feedbackSending = false
 
     private var process: Process?
     private var session: LogSession?
@@ -343,7 +353,18 @@ final class LauncherModel: ObservableObject {
         if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil, let pending = CrashReport.pending(edition: edition) {
             offerCrashReport(pending)
         }
+        // MH_SNAPSHOT_SHEET=feedback or problem: the feedback window after a run of 1 h 12 min on the native engine
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] != nil,
+           let sheet = ProcessInfo.processInfo.environment["MH_SNAPSHOT_SHEET"], sheet == "feedback" || sheet == "problem" {
+            let run = SessionInfo(id: "2026-11-22T10-00-00-play", directory: logDirectory, kind: "play", date: Date(), bytes: 0,
+                                  exitCode: 0, findings: [], duration: 4320, route: "native")
+            feedback = FeedbackRequest(kind: sheet == "problem" ? .problem : .feedback, session: run)
+        }
         startSteamPolling()
+        // reports the player sent wait in the outbox until the developer's Mac takes them
+        if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil && NSClassFromString("XCTestCase") == nil {
+            ReportOutbox.shared.start()
+        }
         // Blackwell Engine and D3DMetal install by themselves (D3DMetal after Apple's licence is accepted); then the
         // Doctor looks at everything once, and again every quarter of an hour while nothing runs.
         if ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil && !showWelcome {
@@ -1322,10 +1343,11 @@ final class LauncherModel: ObservableObject {
                         self.startGame(route: next)
                     }
                 } else if logName == "play" || logName == "steam-play",
-                   let info = LogStore.sessions().first(where: { $0.id == newSession.id }),
-                   let report = CrashReport.make(info, edition: self.edition) {
-                    self.offerCrashReport(report)
+                   let info = LogStore.sessions().first(where: { $0.id == newSession.id }) {
+                    if let report = CrashReport.make(info, edition: self.edition) { self.offerCrashReport(report) }
+                    else { self.offerFeedback(after: info) }
                 }
+                if logName == "play" || logName == "steam-play" { PlayTotals.add(seconds: Int(duration)) }
                 self.refreshSavedAccountStatus()
                 self.refreshChecks()
                 self.refreshSteamStatus()
@@ -1431,12 +1453,72 @@ final class LauncherModel: ObservableObject {
         NSWorkspace.shared.open(Diagnostics.issueURL(setup, findings: findings))
     }
 
+    // MARK: - Feedback
+
+    /// After a run that did not crash: its summary in "Send Automatically" mode, and the question unless turned off.
+    private func offerFeedback(after session: SessionInfo) {
+        switch CrashReport.mode {
+        case .never: return
+        case .automatic: FeedbackSender.sendSessionSummary(session, setup: setup)
+        case .ask: break
+        }
+        if FeedbackPreferences.askAfterGames { feedback = FeedbackRequest(kind: .feedback, session: session) }
+    }
+
+    /// Tools › Rate the Last Game…
+    func rateLastGame() {
+        guard let session = LogStore.sessions().first(where: { $0.kind == "play" || $0.kind == "steam-play" }) else {
+            status = "No game run yet."
+            return
+        }
+        feedback = FeedbackRequest(kind: .feedback, session: session)
+    }
+
+    /// Tools › Report a Problem… (and Help): at any time, about the last run if there is one.
+    func reportProblem() {
+        feedback = FeedbackRequest(kind: .problem, session: LogStore.sessions().first { $0.kind == "play" || $0.kind == "steam-play" })
+    }
+
+    func sendFeedback(_ request: FeedbackRequest, answers: FeedbackAnswers, choice: FeedbackChoice) {
+        apply(choice)
+        let current = setup
+        feedbackSending = true
+        status = "Sending your report…"
+        Task {
+            let result = await FeedbackSender.send(request, answers: answers, setup: current)
+            feedbackSending = false
+            feedback = nil
+            status = result
+        }
+    }
+
+    func dismissFeedback(_ choice: FeedbackChoice) {
+        apply(choice)
+        feedback = nil
+    }
+
+    /// What the player chose for next time, in the feedback window.
+    private func apply(_ choice: FeedbackChoice) {
+        guard choice != FeedbackChoice.current else { return }
+        switch choice {
+        case .ask:
+            FeedbackPreferences.askAfterGames = true
+            if crashReportMode == .never { crashReportMode = .ask }
+        case .automatic:
+            FeedbackPreferences.askAfterGames = false
+            crashReportMode = .automatic
+        case .quiet:
+            FeedbackPreferences.askAfterGames = false
+            if crashReportMode == .automatic { crashReportMode = .ask }
+        }
+    }
+
     // MARK: - Crash reports
 
     private func offerCrashReport(_ report: CrashReport) {
         switch CrashReport.mode {
         case .never: return
-        case .automatic where CrashReport.endpoint != nil: sendCrashReport(report)
+        case .automatic where ReportEndpoint.bundled != nil || CrashReport.endpoint != nil: sendCrashReport(report)
         default: crashReport = report
         }
     }

@@ -202,7 +202,16 @@ struct CrashReport: Identifiable {
         } catch {
             return "Could not write the report: \(error)"
         }
-        if let endpoint = CrashReport.endpoint {
+        if ReportEndpoint.bundled != nil {
+            do {
+                try await MainActor.run { try FeedbackSender.sendCrash(self, text: body, zip: zip, setup: setup) }
+                CrashReport.markHandled(id)
+                return "Thank you! The report is on its way: it reaches the developer as soon as their Mac answers."
+            } catch {
+                return "Could not keep the report: \(error.localizedDescription)"
+            }
+        }
+        if let endpoint = CrashReport.endpoint, endpoint.kind != "metalhorizon" {
             do {
                 try await CrashReport.upload(body: body, zip: zip, to: endpoint)
                 CrashReport.markHandled(id)

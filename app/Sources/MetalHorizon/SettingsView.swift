@@ -13,6 +13,8 @@ struct SettingsView: View {
                 .tabItem { Label("Graphics", systemImage: "display") }
             ControllerSettings(model: model)
                 .tabItem { Label("Controllers", systemImage: "gamecontroller") }
+            FeedbackSettings(model: model)
+                .tabItem { Label("Feedback", systemImage: "star.bubble") }
             AdvancedSettings(model: model)
                 .tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
         }

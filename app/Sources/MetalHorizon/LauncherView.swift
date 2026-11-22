@@ -107,6 +107,13 @@ struct LauncherView: View {
             CrashReportSheet(report: report, sending: model.crashReportSending,
                              send: { model.sendCrashReport(report) }, dismiss: model.dismissCrashReport)
         }
+        .sheet(item: Binding(get: { model.licenseText == nil && !model.showWelcome && model.crashReport == nil ? model.feedback : nil },
+                             set: { if $0 == nil && model.feedback != nil && !model.feedbackSending { model.dismissFeedback(FeedbackChoice.current) } })) { request in
+            FeedbackSheet(request: request, edition: model.edition, frameGeneration: FrameGenerationSettings.load().enabled,
+                          sending: model.feedbackSending,
+                          send: { answers, choice in model.sendFeedback(request, answers: answers, choice: choice) },
+                          dismiss: { choice in model.dismissFeedback(choice) })
+        }
     }
 
     // MARK: Header

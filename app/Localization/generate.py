@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Builds app/Localization/<language>.lproj/Localizable.strings from batches/*.json (one list of translations per
-# language, in the order of en-keys.json, the English texts). Checks that each translation keeps the same values
+# Builds app/Localization/<language>.lproj/Localizable.strings from batches/batch*.json (one list of translations per
+# language, in the order of en-keys.json, the English texts) and batches/extra-*.json (the texts added since). Checks that each translation keeps the same values
 # (%@, %lld) and is not empty. Run: python3 app/Localization/generate.py. build-app.sh copies the .lproj folders.
 import json, glob, re, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -11,6 +11,11 @@ def esc(s): return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\
 langs = {}
 for f in sorted(glob.glob(f"{HERE}/batches/batch*.json")):
     langs.update(json.load(open(f)))
+# texts added later (batches/extra-NN-*.json): each language's translations of the next keys of en-keys.json, appended
+# in file order (extra-01 before extra-02), one file holding some of the languages
+for f in sorted(glob.glob(f"{HERE}/batches/extra-*.json")):
+    for lang, vals in json.load(open(f)).items():
+        langs.setdefault(lang, []).extend(vals)
 bad = 0
 for lang, vals in langs.items():
     if len(vals) != len(keys): print(lang, "count", len(vals)); bad += 1; continue

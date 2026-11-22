@@ -56,9 +56,11 @@ enum Edition: String, CaseIterable, Identifiable {
     var shortTitle: String { self == .xbox ? "Xbox" : "Steam" }
 }
 
-/// The app's settings. Run from a development build (no bundle identifier), the same domain is used by name.
+/// The app's settings. Run from a development build (no bundle identifier), the same domain is used by name;
+/// MH_SETTINGS_SUITE names another one (the tests use a throwaway domain).
 func settingsStore() -> UserDefaults {
-    Bundle.main.bundleIdentifier == appBundleID ? .standard : (UserDefaults(suiteName: appBundleID) ?? .standard)
+    if let suite = ProcessInfo.processInfo.environment["MH_SETTINGS_SUITE"], let defaults = UserDefaults(suiteName: suite) { return defaults }
+    return Bundle.main.bundleIdentifier == appBundleID ? .standard : (UserDefaults(suiteName: appBundleID) ?? .standard)
 }
 
 func fileExists(_ path: String) -> Bool { FileManager.default.fileExists(atPath: path) }
