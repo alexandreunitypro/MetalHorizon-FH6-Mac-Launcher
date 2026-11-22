@@ -125,27 +125,7 @@ Everything below is built on the Mac. Each script keeps a `.bak` of what it repl
 An experimental launch on [Mullion](https://github.com/dttdrv/mullion) (a DXMT fork) instead of D3DMetal is in
 `tools/mac_launch_fh6_mullion.sh`. No result yet.
 
-## Rendering notes
 
-What was found while fixing the graphics, 24–25 October 2026. Details and evidence: [`docs/PASSATION-IA.md`](docs/PASSATION-IA.md) (French).
-
-**Missing objects: 221 pipelines → 0.** D3DMetal marked 221 pipelines as "no-op" and skipped every draw that used them.
-
-1. **`SV_ShadingRate` (148 pipelines).** D3DMetal already reports no variable-rate shading (tier 0), but some
-   pixel shaders still read `SV_ShadingRate`. Metal's converter turns it into an input the vertex shader never
-   writes, and Metal refuses the pipeline. The shim relabels that input as `SV_ViewportArrayIndex` in the DXIL
-   (Metal provides it; 0 means 1×1, the value without VRS). **Trap:** D3DMetal caches its translations on disk
-   under the shader's `HASH` part, not its bytes, so the shim rewrites `HASH` too, or the broken translation comes
-   back from the cache.
-2. **Dual-source blending without a color target (65 pipelines).** Shadow passes of glass, water, ocean and
-   dithered materials keep the material's `SRC1` blend with no color target. D3DMetal then forces dual-source
-   blending, which the converter refuses. The shim turns that unused blend off.
-3. **Skid marks (8 pipelines).** Real dual-source blending, but the pixel shader writes three outputs and Metal
-   wants exactly two. The same shader also serves a three-target decal pass, so only the dual-source pipelines get
-   a replacement shader without the third output, built by `tools/mac_shader_fixes.sh`. A game update changes the
-   shader hashes: the fix then stops applying, with no other effect.
-
-Result in game (6 minutes with the inspector): 22,875 pipelines, 0 refused, 0 skipped.
 
 **Black near foliage: cause narrowed down, not fixed.** The inspector (`HB_TSSHIM_INSPECT=1`) wraps draws in
 occlusion queries and replays them through invisible "twin" pipelines to see where pixels are lost. The near-foliage
