@@ -127,10 +127,9 @@ final class ScriptTests: XCTestCase {
         // takes its place (E:0-0-L-8) and the game's own copy is not turned off with it ("Sign In Required", #21)
         XCTAssertTrue(out.contains("xgameruntime=n;"), out)
         XCTAssertFalse(out.contains("xgameruntime=d"), out)
-        // and no package identity, as on Windows: the engine is pointed at a manifest without an <Identity>
-        XCTAssertTrue(out.contains(#"WINE_PACKAGE_MANIFEST="C:\\metalhorizon\\no-package-identity.xml""#), out)
-        let manifest = try String(contentsOfFile: prefix + "/drive_c/metalhorizon/no-package-identity.xml", encoding: .utf8)
-        XCTAssertTrue(manifest.contains("<MetalHorizon/>") && !manifest.contains("<Identity"), manifest)
+        // and it keeps the package identity from its MicrosoftGame.config: Microsoft's runtime finds the game's
+        // configuration through it (without it, 2.2.0: E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT, still "Sign In Required")
+        XCTAssertFalse(out.contains("WINE_PACKAGE_MANIFEST"), out)
         // and no system Gaming Runtime for the game to find: wineboot's copies are set aside, not deleted
         for folder in ["system32", "syswow64"] {
             let copy = prefix + "/drive_c/windows/\(folder)/xgameruntime.dll"
@@ -156,7 +155,7 @@ final class ScriptTests: XCTestCase {
         // the client is written down with the environment it got: Play restarts one an older MetalHorizon started,
         // since the game would inherit its environment (issue #21)
         let marker = try String(contentsOfFile: env["MH_PREFIX"]! + "/.metalhorizon-steam-mode", encoding: .utf8)
-        XCTAssertEqual(marker.trimmingCharacters(in: .whitespacesAndNewlines), "window none 2")
+        XCTAssertEqual(marker.trimmingCharacters(in: .whitespacesAndNewlines), "window none 3")
         env["MH_STEAM_URL"] = "https://example.com/x"
         (code, out) = try run("metalhorizon-steam.sh", ["open"], env: env)
         XCTAssertEqual(code, 0, out)
