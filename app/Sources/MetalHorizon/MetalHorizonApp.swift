@@ -504,7 +504,8 @@ final class LauncherModel: ObservableObject {
             let needsNetwork = (moment == .beforePlay || moment == .afterAction) && edition == .xbox
             let net = needsNetwork ? Sys.reachMicrosoft() : (online: true, skew: nil)
             // the account itself, tried for real, when the network is there and a sign-in is saved
-            let check = needsNetwork && net.online && account ? AccountCheck.run(resources: Bundle.main.resourceURL) : nil
+            // asked again on a network failure, an accepted answer kept 5 minutes (XodusSupervisor.swift)
+            let check = needsNetwork && net.online && account ? AccountCheck.checked(resources: Bundle.main.resourceURL) : nil
             var patient = Patient(setup: current, facts: .current, moment: moment, runs: Array(runs),
                            gameRunning: Sys.pgrep("forzahorizon6\\.exe"),
                            serviceRunning: Sys.pgrep("xodus-service"),
@@ -744,7 +745,14 @@ final class LauncherModel: ObservableObject {
 
     private func refreshSavedAccountStatus(continueAfterSignIn: Bool = false) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let saved = xboxAccountSaved()
+            var saved = xboxAccountSaved()
+            // right after a sign-in, the Keychain can take a moment to show the new account: looked for 3 more times
+            if continueAfterSignIn {
+                for _ in 0..<3 where !saved {
+                    Thread.sleep(forTimeInterval: 1)
+                    saved = xboxAccountSaved()
+                }
+            }
             Task { @MainActor in
                 guard let self else { return }
                 self.accountSaved = saved
@@ -772,13 +780,30 @@ final class LauncherModel: ObservableObject {
             status = "The sign-in helper is missing from this app."
             return
         }
+        activity = .signIn
+        status = "Checking the connection to Microsoft…"
+        // Microsoft reachable and the clock right before the window opens (an empty window, or a sign-in Microsoft
+        // refuses at the end, otherwise); a sign-in window left from an earlier try closed (XodusSupervisor.swift)
+        Task {
+            let problem = await Task.detached(priority: .userInitiated) { SignInPreflight.problem() }.value
+            if let problem {
+                activity = .idle
+                status = problem
+                return
+            }
+            SignInHelper.closeLeftovers()
+            SignInHelper.clearStatus(loginStatusFile)
+            SignInWatch.shared.reset()
+            openLoginHelper(loginApp, attempt: 1)
+        }
+    }
+
+    private func openLoginHelper(_ loginApp: URL, attempt: Int) {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.arguments = ["login"]
-        try? FileManager.default.removeItem(at: loginStatusFile)
         // xodus-cli reports its sign-in progress in this file (the variable name comes from the prototype).
         configuration.environment = ["BLACKWELL_LOGIN_STATUS_FILE": loginStatusFile.path]
         configuration.activates = true
-        activity = .signIn
         status = "Opening Microsoft sign-in…"
         loginStatusTimer?.invalidate()
         loginStatusTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
@@ -788,9 +813,16 @@ final class LauncherModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if let error {
-                    self.activity = .idle
                     self.loginStatusTimer?.invalidate()
                     self.loginStatusTimer = nil
+                    // the helper is tried once more before giving up (macOS can refuse a launch for a moment)
+                    if attempt == 1 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                            self?.openLoginHelper(loginApp, attempt: 2)
+                        }
+                        return
+                    }
+                    self.activity = .idle
                     self.status = "Could not open Microsoft sign-in: \(error.localizedDescription)"
                     return
                 }
@@ -807,18 +839,21 @@ final class LauncherModel: ObservableObject {
         guard activity == .signIn else { return }
         loginStatusTimer?.invalidate()
         loginStatusTimer = nil
-        readLoginStatus()
+        if signInStuck {
+            status = "The sign-in did not move for 15 minutes, so it was closed. Press Sign In to start again."
+        } else {
+            readLoginStatus()
+        }
         if let app = loginApplication, !app.isTerminated { app.terminate() }
         loginApplication = nil
         activity = .idle
         let connected = status == "Xbox account connected."
-        if !connected
-            && status != "Microsoft sign-in returned a response Xbox could not accept."
-            && status != "Xbox token exchange failed; the sign-in window has stopped."
-            && status != "Microsoft sign-in was cancelled." {
+        if !connected && !SignInStates.terminalMessages.contains(status) && !signInStuck {
             status = "The sign-in window closed before Xbox accepted the account."
         }
+        signInStuck = false
         if connected {
+            AccountCheck.forget()   // the next account check asks Microsoft about the new sign-in
             try? FileManager.default.removeItem(at: signInExpiredMarker)
             signInExpired = false
             // the running xodus-service still holds the old session: the next Play starts a fresh one
@@ -832,32 +867,25 @@ final class LauncherModel: ObservableObject {
         Task { await examine(.afterAction) }   // a wrong clock or no network fails a sign-in too
     }
 
-    /// The helper's end states: the sign-in is over whether or not its window is still open.
-    private static let loginEndStates: Set<String> = ["complete", "cancelled", "exchange_rejected", "exchange_failed"]
+    /// The sign-in ended for showing no change for 15 minutes (SignInWatch): its message is kept.
+    private var signInStuck = false
 
     private func pollLogin() {
         readLoginStatus()
         let raw = (try? String(contentsOf: loginStatusFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if Self.loginEndStates.contains(raw) || loginApplication?.isTerminated == true {
+        if SignInStates.end.contains(raw) || loginApplication?.isTerminated == true {
+            finishSignIn()
+        } else if SignInWatch.shared.stuck(state: raw) {
+            signInStuck = true
             finishSignIn()
         }
     }
 
     private func readLoginStatus() {
-        guard let rawStatus = try? String(contentsOf: loginStatusFile, encoding: .utf8) else { return }
-        switch rawStatus.trimmingCharacters(in: .whitespacesAndNewlines) {
-        case "starting": status = "Preparing Xbox sign-in…"
-        case "waiting_for_microsoft": status = "Enter your Microsoft account in the sign-in window."
-        case "received_response": status = "Microsoft responded; checking the Xbox account…"
-        case "exchange_pending": status = "Exchanging the Microsoft response for Xbox access…"
-        case "exchange_failed": status = "Xbox token exchange failed; the sign-in window has stopped."
-        case "approval_required": status = "Microsoft requires an additional approval step."
-        case "account_accepted": status = "Xbox accepted the account; saving the sign-in…"
-        case "complete": status = "Xbox account connected."
-        case "exchange_rejected": status = "Microsoft sign-in returned a response Xbox could not accept."
-        case "cancelled": status = "Microsoft sign-in was cancelled."
-        default: break
-        }
+        // the helper's states and what the window says for each, new ones included (XodusSupervisor.swift)
+        guard let rawStatus = try? String(contentsOf: loginStatusFile, encoding: .utf8),
+              let text = SignInStates.message(rawStatus.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
+        status = text
     }
 
     // MARK: - Steam
@@ -964,27 +992,80 @@ final class LauncherModel: ObservableObject {
 
     // MARK: - Download and Play
 
-    func download() {
-        guard canDownload, let resources = Bundle.main.resourceURL else { return }
+    /// The game's download (Download the Game), or `resuming` it by itself after a stop it can come back from: the
+    /// DownloadSupervisor keeps the Mac awake, resumes after a transient failure once the network is back, restarts
+    /// xodus when nothing moves, and Stop pauses (XodusSupervisor.swift, docs/XODUS-ROBUSTNESS.md).
+    func download(resuming: Bool = false) {
+        let supervisor = DownloadSupervisor.shared
+        guard canDownload, let resources = Bundle.main.resourceURL else {
+            if resuming { supervisor.release() }
+            return
+        }
+        // an Xbox account saved, a folder that can be written and is not in iCloud Drive
+        if let problem = DownloadPreflight.problem(folder: gameDirectory, accountSaved: accountSaved) {
+            supervisor.release()
+            status = problem
+            return
+        }
         // A first download needs the game's whole size where it goes: refused here at once, rather than after xodus
         // has fetched the package's index (about 1 GB) to find the disk short of room. An update (the game already
         // there) needs less, and xodus checks it.
         if !setup.gameCheck.ok, let free = DownloadProgress.availableBytes(at: gameDirectory), free < DownloadProgress.gameBytes {
+            supervisor.release()
             status = DownloadProgress.notEnoughSpaceMessage(need: DownloadProgress.gameBytes, free: free,
                                                             folder: Setup.tildePath(gameDirectory))
             return
         }
+        if !resuming { supervisor.begin() }
+        // offline: the download starts as soon as the Mac is back online
+        guard NetworkWatch.shared.isOnline else {
+            status = "No network: the download starts as soon as the Mac is back online…"
+            NetworkWatch.shared.whenOnline(waiting: {}) { [weak self] in self?.download(resuming: true) }
+            return
+        }
+        let done = ResumeJournal.filesDone(in: gameDirectory)
+        let statusText = done > 0 ? XodusMessages.phase("resume \(done)") ?? "Resuming the download…"
+                                  : "Downloading Forza Horizon 6 from the Xbox servers…"
         let cli = Setup.xodusCLI(resources: resources)
         // xodus checks the licence on the signed-in account: only an owned game downloads.
-        // XODUS_PROGRESS=lines: "progress <done> <total>" lines for the bar (patches/xodus-cli/0006)
+        // XODUS_PROGRESS=lines: "progress <done> <total>" lines for the bar (patches/xodus-cli/0006), and the
+        // "status" and "error" lines of 0008
         run(executable: cli, arguments: ["streaming", storeProductID, gameDirectory],
             environment: ["RUST_BACKTRACE": "1", "XODUS_PROGRESS": "lines"],
-            activity: .download, statusText: "Downloading Forza Horizon 6 from the Xbox servers…", logName: "download") { [weak self] code in
-            // finished only when the game is there: xodus said so (not enough room...) and an older xodus-cli exited
-            // with 0 anyway (DownloadProgress.outcome)
-            guard let self else { return code == 0 ? "Download finished." : "The download stopped (error \(code))." }
-            return DownloadProgress.outcome(exitCode: code, gameReady: self.setup.gameCheck.ok, log: self.outputTail.lines,
-                                            folder: Setup.tildePath(self.gameDirectory))
+            activity: .download, statusText: statusText, logName: "download") { [weak self] code in
+            let supervisor = DownloadSupervisor.shared
+            // finished only when the game is there: xodus said why it stopped, and an older xodus-cli exited with 0
+            // anyway (DownloadSupervisor.decide, DownloadProgress.outcome)
+            guard let self else {
+                supervisor.ended(resuming: false)
+                return code == 0 ? "Download finished." : "The download stopped (error \(code))."
+            }
+            let decision = DownloadSupervisor.decide(DownloadEnd(
+                exitCode: code, gameReady: self.setup.gameCheck.ok, log: self.outputTail.lines,
+                folder: Setup.tildePath(self.gameDirectory), retriesDone: supervisor.retriesDone,
+                userStopped: supervisor.userStopped, stalled: supervisor.stalled, missingFetched: supervisor.missingFetched))
+            let waiting: () -> Void = { [weak self] in
+                self?.status = "Waiting for the network: the download resumes as soon as the Mac is back online…"
+            }
+            switch decision {
+            case .finished(let text), .paused(let text), .failed(let text):
+                supervisor.ended(resuming: false)
+                return text
+            case .retry(let delay, let text):
+                supervisor.ended(resuming: true)
+                supervisor.scheduleResume(after: delay, missing: false, waiting: waiting) { [weak self] in self?.download(resuming: true) }
+                return text
+            case .fetchMissing(let text):
+                supervisor.ended(resuming: true)
+                supervisor.scheduleResume(after: 5, missing: true, waiting: waiting) { [weak self] in self?.download(resuming: true) }
+                return text
+            }
+        }
+        if activity == .download {
+            // Stop and the watchdog ask xodus to stop cleanly (SIGINT): what is done stays done
+            supervisor.started(interrupt: { [weak self] in self?.process?.interrupt() })
+        } else {
+            supervisor.release()
         }
     }
 
@@ -1114,6 +1195,12 @@ final class LauncherModel: ObservableObject {
             ]) { _, new in new }
             try? kill.run()
             status = "Force-quitting the game…"
+            return
+        }
+        // the download pauses: xodus stops cleanly (SIGINT) and keeps what is done; Download the Game resumes it
+        if activity == .download {
+            DownloadSupervisor.shared.stopRequested()
+            status = "Pausing the download…"
             return
         }
         process?.terminate()
@@ -1290,8 +1377,20 @@ final class LauncherModel: ObservableObject {
         guard activity == .download else { return }
         let fresh = outputTail.totalLines - progressLinesSeen
         progressLinesSeen = outputTail.totalLines
-        guard fresh > 0,
-              let sample = outputTail.lines.suffix(fresh).reversed().lazy.compactMap(DownloadProgress.parse).first else { return }
+        guard fresh > 0 else { return }
+        let newLines = outputTail.lines.suffix(fresh)
+        let sample = newLines.reversed().lazy.compactMap(DownloadProgress.parse).first
+        // anything new keeps the watchdog quiet; the files' progress lines tighten its limit
+        DownloadSupervisor.shared.sawSign(files: sample != nil)
+        // xodus' step ("Reading the package's index…") while the bar has nothing to show yet
+        if downloadMeter == nil,
+           let phase = newLines.reversed().lazy.compactMap({ line -> String? in
+               if case let .status(phase)? = XodusLine.parse(line) { return XodusMessages.phase(phase) }
+               return nil
+           }).first {
+            status = phase
+        }
+        guard let sample else { return }
         var meter = downloadMeter ?? DownloadMeter()
         meter.add(sample, at: Date())
         downloadMeter = meter

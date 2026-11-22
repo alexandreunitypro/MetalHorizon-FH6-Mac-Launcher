@@ -1,0 +1,239 @@
+gameinput: IGameInputDispatcher, so a game can run its callbacks itself (MetalHorizon 2.1.1, issue #15)
+
+CreateDispatcher answered E_NOTIMPL. A GDK game that makes a dispatcher, to run GameInput's callbacks on a thread of
+its own, could take GameInput for unusable on that failure and see no pad at all, wired or not. Now, as on Windows,
+once a dispatcher exists the worker queues the callbacks (device, reading, system button) instead of running them; the
+game's Dispatch(quota) runs them oldest first within its time quota (0: all), and OpenWaitHandle hands it an event set
+while some wait. A callback unregistered or stopped meanwhile is skipped. Blocking enumeration still runs inside
+RegisterDeviceCallback. Releasing the dispatcher gives the callbacks back to the worker.
+Tested without the game: engine/tests/gameinput-pads (with a dispatcher, nothing runs before Dispatch; the wait handle
+is set; Dispatch runs the waiting callback).
+
+--- a/dlls/gameinput/gameinput.c
++++ b/dlls/gameinput/gameinput.c
+@@ -1496,8 +1496,205 @@
+         }
+     }
+     LeaveCriticalSection( &dispatch_cs );
++}
++
++/* IGameInputDispatcher (MetalHorizon 2.1.1, issue #15). Once a game makes one, the callbacks wait for it to call
++ * Dispatch on the thread it chooses, instead of running on the worker thread, as on Windows. CreateDispatcher used to
++ * answer E_NOTIMPL, and a game that makes one to run its callbacks could take GameInput for unusable and see no pad.
++ * Blocking enumeration still runs in RegisterDeviceCallback, before it returns. */
++#define MAX_QUEUED 256
++
++struct dispatcher
++{
++    IGameInputDispatcher IGameInputDispatcher_iface;
++    LONG ref;
++};
++
++static CRITICAL_SECTION queue_cs;
++static CRITICAL_SECTION_DEBUG queue_cs_debug =
++{
++    0, 0, &queue_cs,
++    { &queue_cs_debug.ProcessLocksList, &queue_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": queue_cs") }
++};
++static CRITICAL_SECTION queue_cs = { &queue_cs_debug, -1, 0, 0, 0, 0 };
++
++/* all under queue_cs */
++static struct dispatcher *active_dispatcher;
++static struct event queued[MAX_QUEUED];
++static unsigned int queued_count;
++static HANDLE queued_event;   /* manual reset: set while events wait for Dispatch */
++
++static void drop_event( struct event *event )
++{
++    if (event->type == CALLBACK_READING && event->reading) reading_release( event->reading );
++    event->reading = NULL;
+ }
+ 
++/* The worker's events: run now, or queued for the game's dispatcher. */
++static void deliver_events( struct event *events, unsigned int count )
++{
++    unsigned int i;
++
++    EnterCriticalSection( &queue_cs );
++    if (!active_dispatcher)
++    {
++        LeaveCriticalSection( &queue_cs );
++        run_events( events, count );
++        return;
++    }
++    for (i = 0; i < count; i++)
++    {
++        if (queued_count == MAX_QUEUED)
++        {
++            /* a game that stopped dispatching: the oldest event goes */
++            drop_event( &queued[0] );
++            memmove( queued, queued + 1, (MAX_QUEUED - 1) * sizeof(*queued) );
++            queued_count--;
++        }
++        queued[queued_count++] = events[i];
++    }
++    SetEvent( queued_event );
++    LeaveCriticalSection( &queue_cs );
++}
++
++/* A callback still registered and not stopped (its queued events are dropped otherwise). */
++static BOOL callback_alive( GameInputCallbackToken token )
++{
++    struct callback *callback;
++    BOOL alive = FALSE;
++
++    EnterCriticalSection( &state_cs );
++    LIST_FOR_EACH_ENTRY( callback, &callbacks, struct callback, entry )
++        if (callback->token == token) { alive = !callback->stopped; break; }
++    LeaveCriticalSection( &state_cs );
++    return alive;
++}
++
++static inline struct dispatcher *impl_from_IGameInputDispatcher( IGameInputDispatcher *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher, IGameInputDispatcher_iface );
++}
++
++static HRESULT WINAPI dispatcher_QueryInterface( IGameInputDispatcher *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IGameInputDispatcher ))
++    {
++        IGameInputDispatcher_AddRef( (*out = iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    WARN( "unsupported interface %s\n", debugstr_guid( iid ) );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI dispatcher_AddRef( IGameInputDispatcher *iface )
++{
++    return InterlockedIncrement( &impl_from_IGameInputDispatcher( iface )->ref );
++}
++
++static ULONG WINAPI dispatcher_Release( IGameInputDispatcher *iface )
++{
++    struct dispatcher *dispatcher = impl_from_IGameInputDispatcher( iface );
++    ULONG ref = InterlockedDecrement( &dispatcher->ref );
++    unsigned int i;
++
++    if (ref) return ref;
++    /* the worker runs the callbacks again */
++    EnterCriticalSection( &queue_cs );
++    if (active_dispatcher == dispatcher) active_dispatcher = NULL;
++    for (i = 0; i < queued_count; i++) drop_event( &queued[i] );
++    queued_count = 0;
++    if (queued_event) ResetEvent( queued_event );
++    LeaveCriticalSection( &queue_cs );
++    free( dispatcher );
++    return 0;
++}
++
++/* Runs the queued callbacks, oldest first, until none is left or `quota` microseconds have passed (0: all of them);
++ * true while some are still waiting. */
++static bool WINAPI dispatcher_Dispatch( IGameInputDispatcher *iface, uint64_t quota )
++{
++    uint64_t start = current_timestamp();
++    struct event event;
++    bool more;
++
++    for (;;)
++    {
++        EnterCriticalSection( &queue_cs );
++        if (!queued_count)
++        {
++            ResetEvent( queued_event );
++            LeaveCriticalSection( &queue_cs );
++            return false;
++        }
++        event = queued[0];
++        memmove( queued, queued + 1, (queued_count - 1) * sizeof(*queued) );
++        queued_count--;
++        LeaveCriticalSection( &queue_cs );
++
++        if (callback_alive( event.token )) run_events( &event, 1 );
++        else drop_event( &event );
++
++        if (quota && current_timestamp() - start >= quota) break;
++    }
++    EnterCriticalSection( &queue_cs );
++    if (!(more = queued_count != 0)) ResetEvent( queued_event );
++    LeaveCriticalSection( &queue_cs );
++    return more;
++}
++
++/* An event the game can wait on: set while callbacks wait for Dispatch. The game closes its handle. */
++static HRESULT WINAPI dispatcher_OpenWaitHandle( IGameInputDispatcher *iface, HANDLE *handle )
++{
++    if (!handle) return E_POINTER;
++    if (!DuplicateHandle( GetCurrentProcess(), queued_event, GetCurrentProcess(), handle, 0, FALSE, DUPLICATE_SAME_ACCESS ))
++        return HRESULT_FROM_WIN32( GetLastError() );
++    return S_OK;
++}
++
++static const struct IGameInputDispatcherVtbl dispatcher_vtbl =
++{
++    .QueryInterface = dispatcher_QueryInterface,
++    .AddRef = dispatcher_AddRef,
++    .Release = dispatcher_Release,
++    .Dispatch = dispatcher_Dispatch,
++    .OpenWaitHandle = dispatcher_OpenWaitHandle,
++};
++
++/* One per process, as GameInput keeps one: a second CreateDispatcher gets the same one. */
++static HRESULT create_dispatcher( IGameInputDispatcher **out )
++{
++    struct dispatcher *dispatcher;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    EnterCriticalSection( &queue_cs );
++    if (active_dispatcher)
++    {
++        IGameInputDispatcher_AddRef( (*out = &active_dispatcher->IGameInputDispatcher_iface) );
++        LeaveCriticalSection( &queue_cs );
++        return S_OK;
++    }
++    if (!queued_event && !(queued_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
++    {
++        LeaveCriticalSection( &queue_cs );
++        return HRESULT_FROM_WIN32( GetLastError() );
++    }
++    if (!(dispatcher = calloc( 1, sizeof(*dispatcher) )))
++    {
++        LeaveCriticalSection( &queue_cs );
++        return E_OUTOFMEMORY;
++    }
++    dispatcher->IGameInputDispatcher_iface.lpVtbl = &dispatcher_vtbl;
++    dispatcher->ref = 1;
++    active_dispatcher = dispatcher;
++    *out = &dispatcher->IGameInputDispatcher_iface;
++    LeaveCriticalSection( &queue_cs );
++    TRACE( "dispatcher %p: the game runs the callbacks now\n", dispatcher );
++    return S_OK;
++}
++
+ static DWORD WINAPI worker_proc( void *arg )
+ {
+     struct event events[64];
+@@ -1571,7 +1768,7 @@
+         }
+         LeaveCriticalSection( &state_cs );
+ 
+-        if (count) run_events( events, count );
++        if (count) deliver_events( events, count );
+         Sleep( wants_readings ? 4 : 50 );
+     }
+     return 0;
+@@ -1754,9 +1951,7 @@
+ }                                                                                                                \
+ static HRESULT WINAPI v##ver##_gameinput_CreateDispatcher( v##ver##_IGameInput *iface, IGameInputDispatcher **out ) \
+ {                                                                                                                \
+-    FIXME( "dispatcher not supported\n" );                                                                       \
+-    *out = NULL;                                                                                                 \
+-    return E_NOTIMPL;                                                                                            \
++    return create_dispatcher( out );                                                                             \
+ }                                                                                                                \
+ static HRESULT WINAPI v##ver##_gameinput_FindDeviceFromId( v##ver##_IGameInput *iface, const APP_LOCAL_DEVICE_ID *id, \
+                                                            v##ver##_IGameInputDevice **out )                     \

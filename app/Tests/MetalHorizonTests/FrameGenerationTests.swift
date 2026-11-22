@@ -44,6 +44,43 @@ final class FrameGenerationTests: XCTestCase {
         XCTAssertNil(FrameGenerationQuality.p360.lower)
     }
 
+    func testTheSizesTriedKeepTheWindowsShapeLargestFirst() {
+        // a 16" MacBook Pro's screen, as the player of issue #15 had it
+        let sizes = frameGenerationCandidates(window: CGSize(width: 3456, height: 2234), maxSide: 1920, maxPixels: 2_073_600, quality: .automatic)
+        XCTAssertFalse(sizes.isEmpty)
+        XCTAssertEqual(sizes, sizes.sorted { $0.width * $0.height > $1.width * $1.height }, "largest first")
+        XCTAssertTrue(sizes.allSatisfy { $0.width * $0.height <= 2_073_600 && max($0.width, $0.height) <= 1920 }, "within the model's limits")
+        XCTAssertTrue(sizes.allSatisfy { abs($0.width / $0.height - 3456.0 / 2234.0) < 0.01 }, "the window's shape")
+        XCTAssertTrue(sizes.contains(CGSize(width: 1728, height: 1116)), "the size the model took on an M5 Pro")
+        XCTAssertFalse(sizes.contains(CGSize(width: 1790, height: 1158)), "not the window's own odd shape, which it never took")
+        let wide = frameGenerationCandidates(window: CGSize(width: 3840, height: 2160), maxSide: 1920, maxPixels: 2_073_600, quality: .automatic)
+        XCTAssertEqual(wide.first, CGSize(width: 1920, height: 1080), "16:9: the standard sizes")
+        XCTAssertTrue(wide.contains(CGSize(width: 1280, height: 720)))
+        XCTAssertTrue(frameGenerationCandidates(window: CGSize(width: 3840, height: 2160), maxSide: nil, maxPixels: nil, quality: .p720)
+            .allSatisfy { $0.width <= 1280 }, "the quality the player chose")
+        XCTAssertEqual(frameGenerationCandidates(window: CGSize(width: 500, height: 300), maxSide: 1920, maxPixels: 2_073_600, quality: .automatic),
+                       [CGSize(width: 500, height: 300)], "a small window: its own size")
+    }
+
+    /// Apple's model on this Mac: a size it takes answers at once, a size it does not take is turned down within the
+    /// timeout, before anything would be shown over the game (MetalHorizon 2.1.0 sat on "loading" instead).
+    func testASizeIsTriedOnTheModelBeforeAnythingIsShown() async throws {
+        guard #available(macOS 26.0, *), frameGenerationSupported() else { throw XCTSkip("no frame interpolation model on this Mac") }
+        let taken = try FrameInterpolator(width: 1280, height: 720, multiplier: 2)
+        try await taken.start()
+        let yes = await taken.warmUp(timeout: 3)
+        await taken.stop()
+        XCTAssertTrue(yes, "1280×720 is taken")
+        guard #available(macOS 27.0, *), frameGenerationLimits().maxSide == 1920 else { return }
+        let refused = try FrameInterpolator(width: 1790, height: 1158, multiplier: 2)
+        try await refused.start()
+        let start = Date()
+        let no = await refused.warmUp(timeout: 1.5)
+        await refused.stop()
+        XCTAssertFalse(no, "1790×1158 never loads on a Mac whose model stops at 1920")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3, "turned down within the timeout")
+    }
+
     func testThePhasesAreTheModelsOwnPoints() {
         XCTAssertEqual(frameGenerationPlan(multiplier: 2).frames, 1)
         XCTAssertEqual(frameGenerationPlan(multiplier: 2).phases, [0.5])

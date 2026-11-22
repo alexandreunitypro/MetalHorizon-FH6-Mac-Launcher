@@ -123,6 +123,37 @@ func frameGenerationSize(window: CGSize, maxSide: Int?, maxPixels: Int?, quality
     return CGSize(width: even(window.width), height: even(window.height))
 }
 
+/// The sizes to try, largest first, for a window of `window` pixels. Apple's model takes some sizes and not others,
+/// with no rule it states: on an M5 Pro, 1920×1080, 1728×1116 and 1600×1001 load, 1920×1072, 1790×1158 and 1776×1158
+/// never do (MetalHorizon 2.1.0 tried the window's own shape and sat on "loading", issue #15). So each candidate is
+/// tried on the model before anything is shown: widths of a common size, the window's shape kept, the standard 16:9
+/// sizes for a 16:9 window, all within the model's stated limits and the chosen quality.
+func frameGenerationCandidates(window: CGSize, maxSide: Int?, maxPixels: Int?, quality: FrameGenerationQuality) -> [CGSize] {
+    guard window.width >= 2, window.height >= 2 else { return [] }
+    let aspect = Double(window.width / window.height)
+    let longestAllowed = [maxSide, quality.maxSide].compactMap { $0 }.min() ?? Int.max
+    func fits(_ s: CGSize) -> Bool {
+        let longest = Int(max(s.width, s.height))
+        return s.width >= 2 && s.height >= 2 && longest <= longestAllowed && s.width <= window.width && s.height <= window.height
+            && (maxPixels.map { Int(s.width * s.height) <= $0 } ?? true)
+    }
+    var sizes: [CGSize] = []
+    if abs(aspect - 16.0 / 9.0) < 0.02 {
+        sizes += [CGSize(width: 1920, height: 1080), CGSize(width: 1600, height: 900), CGSize(width: 1280, height: 720),
+                  CGSize(width: 960, height: 540), CGSize(width: 640, height: 360)]
+    }
+    for width in [1920, 1792, 1728, 1664, 1600, 1536, 1440, 1344, 1280, 1152, 1024, 960, 896, 800, 768, 640] {
+        let height = max(2, Int((Double(width) / aspect).rounded()) & ~1)
+        sizes.append(CGSize(width: width, height: height))
+    }
+    // a window smaller than every common size: its own (even) size
+    sizes.append(CGSize(width: Int(window.width) & ~1, height: Int(window.height) & ~1))
+    var seen = Set<String>()
+    return sizes.filter(fits)
+        .filter { seen.insert("\(Int($0.width))x\(Int($0.height))").inserted }
+        .sorted { $0.width * $0.height > $1.width * $1.height }
+}
+
 /// The interpolation the model does for a multiplier: how many frames it is configured for and the phases asked of
 /// it. The model offers 2^n - 1 evenly spaced points for n frames (0.5 for one; 0.25, 0.5, 0.75 for two): 2× and 4×
 /// are exact, 3× takes the points nearest a third and two thirds (3/8 and 5/8 of eight).

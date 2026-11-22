@@ -23,7 +23,9 @@ The native Apple silicon engine MetalHorizon 1.0 uses for Forza Horizon 6 (Xbox 
     MetalHorizon's xodus-service (issue #18);
   - since 1.3, `0104-gameinput-controller-ui-navigation-and-macos-pads.patch`: a pad is also a generic controller and a
     UI navigation device, as Windows reports an Xbox pad, and when XInput has no pad the pads macOS itself knows are
-    read through Apple's GameController.framework, so a PlayStation pad on Bluetooth reaches the game (issue #15).
+    read through Apple's GameController.framework, so a PlayStation pad on Bluetooth reaches the game (issue #15);
+  - since 1.3.1, `0105-gameinput-dispatcher.patch`: IGameInputDispatcher, so a game can run GameInput's callbacks
+    itself, as on Windows (CreateDispatcher answered "not implemented").
 - **From Highball's engine release** `engine-arm64-wine-11.18-20261104T130327Z-arm64-games-0053-0054` (unchanged):
   FEX 2610 with Highball's FEX patches (MIT) as `xtajit64.dll` / `xtajit.dll` and its Darwin helper; GStreamer 1.28.7
   and winegstreamer (LGPL-2.1); the host libraries Wine opens by name (FreeType, GnuTLS, SDL and what they link);

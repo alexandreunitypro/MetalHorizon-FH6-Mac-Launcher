@@ -18,7 +18,9 @@ for lang, vals in langs.items():
         if ph(k) != ph(v): print(lang, i, "placeholders", repr(v)); bad += 1
         if not v.strip(): print(lang, i, "empty"); bad += 1
 if bad: sys.exit(1)
-langs.pop("en", None)
+# English too, each text its own translation: without an en.lproj, macOS does not find English among the app's
+# languages and shows a Mac set to English another one (2.0 and 2.1, issue #15)
+langs["en"] = list(keys)
 for lang, vals in langs.items():
     d = f"{out}/{lang}.lproj"; os.makedirs(d, exist_ok=True)
     with open(f"{d}/Localizable.strings", "w") as fh:

@@ -1,0 +1,3098 @@
+From: FORZA-LAUNCHER-FOR-MAC-BLACKWELL-PROJECT
+Subject: [PATCH] xodus-cli: robust downloads and Xbox sign-in (MetalHorizon's 30 xodus features)
+
+MetalHorizon, after 2.1.0. docs/XODUS-ROBUSTNESS.md lists the 50 features; these are its A, B and C, in xodus-cli and
+the xodus and msixvc crates it is built with. Each answers a failure seen in MetalHorizon's logs or in the code:
+panics on a cancelled Keychain (10 November) and on Xbox answering 400 (28 and 29 October), a download that asked a
+silent server again forever with no pause, a full disk written to again every 30 s forever, no resume.
+
+- A (network): a tuned HTTP client (20 s to connect, 60 s of silence in an answer, keep-alive); transient failures
+  (connection, timeout, 408/425/429/5xx) retried with a doubling, jittered pause and the server's Retry-After;
+  the catalog, package, XSTS and licence calls retried; opening the package retried (msixvc); every CDN mirror of the
+  package used; a file's requests paced (0.5 s to 30 s) and failed after 10 minutes without a byte.
+- B (download): no panic left (each step a typed error); a failed file tried 5 times on the next mirror; a journal
+  of the files done (.xodus-streaming-done, per package) so an interrupted download resumes; room checked for what
+  is left, and under 2 GB before the index; each file synced and its size checked before it counts; a full disk
+  stops after 3 tries with no-space; SIGINT/SIGTERM stop cleanly (exit 130, resumable); `status <phase>` and
+  `error <kind> <message>` lines for the app (XODUS_PROGRESS=lines).
+- C (sign-in): Keychain refusals and a missing sign-in are typed errors, not panics; the device token's expiry is
+  checked and it is renewed when Microsoft refuses an exchange (once, then the exchange again); device registration
+  retried; a refusal checks the Mac's clock against Microsoft's Date header; the sign-in status file is written
+  atomically, with network_error, keychain_denied, device_error and clock_wrong states; the exchange right after the
+  sign-in retried; "not owned" said as such.
+- The library keeps its old entry points (ensure_device_credentials, api::xbox::run, get_xsts_auth_header) for the
+  other users of the crate, as wrappers of the new checked ones.
+
+On top of 0007, in the tree MetalHorizon bundles xodus-cli from (work/xodus), with patch -p1.
+Tests: cargo test --release --offline -p xodus-cli (17, two against a local HTTP server), -p msixvc (20, with the package
+reopened after a dropped connection; the pause), -p xodus expiry.
+---
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus/src/api/live/mod.rs b/crates/xodus/src/api/live/mod.rs
+--- a/crates/xodus/src/api/live/mod.rs	2026-10-20 00:00:07
++++ b/crates/xodus/src/api/live/mod.rs	2026-11-21 20:57:53
+@@ -7,16 +7,28 @@
+ use crate::models::secrets::{LegacyToken, Token};
+ use crate::models::soap;
+ 
+-mod rst;
++pub mod rst;
+ mod utils;
+ 
+ pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+ 
++/// The device secret an exchange signs with: an error, not a panic, when the stored token has none or a wrong one.
++fn device_secret(token: &LegacyToken) -> Result<[u8; 4096], rst::RSTError> {
++    let encoded = token
++        .binary_secret
++        .as_ref()
++        .ok_or(rst::RSTError::MissingDeviceSecret)?;
++    BASE64_STANDARD
++        .decode(encoded)?
++        .try_into()
++        .map_err(|_| rst::RSTError::MissingDeviceSecret)
++}
++
+ pub async fn login_device_credential(
+     client: &reqwest::Client,
+     data: DeviceAddRequest,
+-) -> reqwest::Result<DeviceAddResponse> {
+-    let data = quick_xml::se::to_string(&data).unwrap();
++) -> Result<DeviceAddResponse, rst::RSTError> {
++    let data = quick_xml::se::to_string(&data)?;
+ 
+     let response = client
+         .post("https://login.live.com/ppsecure/deviceaddcredential.srf")
+@@ -25,9 +37,11 @@
+         .header("Host", "login.live.com")
+         .body(data)
+         .send()
+-        .await?;
++        .await?
++        .error_for_status()?;
+     let text = response.text().await?;
+-    let resp: DeviceAddResponse = quick_xml::de::from_str(&text).expect("Failed to de xml");
++    // an error page instead of the SOAP answer is an error, not a panic
++    let resp: DeviceAddResponse = quick_xml::de::from_str(&text)?;
+     Ok(resp)
+ }
+ 
+@@ -52,8 +66,7 @@
+     scope: String,
+     policy: Option<soap::PolicyReference>,
+ ) -> Result<soap::RequestSecurityTokenResponse, rst::RSTError> {
+-    let secret = BASE64_STANDARD.decode(token.binary_secret.as_ref().unwrap())?;
+-    let secret: [u8; 4096] = secret.try_into().unwrap();
++    let secret = device_secret(&token)?;
+     let secret: ClepHmacState = transmute!(secret);
+     let hmac_secret = secret.get_hmac_state();
+ 
+@@ -76,7 +89,8 @@
+             let token = collection.security_tokens.remove(0);
+             Ok(token)
+         }
+-        b => unimplemented!("Exchange token supports only singular token right now {b:?}"),
++        // a fault (or anything else) is Microsoft's refusal: an error the caller can act on, not a panic
++        _ => Err(rst::RSTError::Fault),
+     }
+ }
+ 
+@@ -93,8 +107,7 @@
+     hosting_app: String,
+     scope_policies: &[(String, Option<soap::PolicyReference>)],
+ ) -> Result<ExchangeUserTokenOutcome, rst::RSTError> {
+-    let secret = BASE64_STANDARD.decode(device_token.binary_secret.as_ref().unwrap())?;
+-    let secret: [u8; 4096] = secret.try_into().unwrap();
++    let secret = device_secret(&device_token)?;
+     let secret: ClepHmacState = transmute!(secret);
+     let hmac_secret = secret.get_hmac_state();
+ 
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus/src/api/live/rst/error.rs b/crates/xodus/src/api/live/rst/error.rs
+--- a/crates/xodus/src/api/live/rst/error.rs	2026-10-20 00:00:07
++++ b/crates/xodus/src/api/live/rst/error.rs	2026-11-21 20:58:04
+@@ -25,6 +25,23 @@
+     Utf8(#[from] std::str::Utf8Error),
+     #[error("The signature verification failed - {0}")]
+     InvalidResponseSignature(String),
++    /// MetalHorizon: these two used to be panics.
++    #[error("The stored device token has no usable secret: the device must authenticate again")]
++    MissingDeviceSecret,
++    #[error("Microsoft answered the token request with a fault")]
++    Fault,
++}
++
++impl RSTError {
++    /// A failure of the network or of Microsoft's servers, worth another try (MetalHorizon).
++    pub fn is_network(&self) -> bool {
++        match self {
++            RSTError::Request(err) => err
++                .status()
++                .is_none_or(|status| status.is_server_error() || status.as_u16() == 429),
++            _ => false,
++        }
++    }
+ }
+ 
+ #[derive(thiserror::Error, Debug)]
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus/src/api/xbox/auth.rs b/crates/xodus/src/api/xbox/auth.rs
+--- a/crates/xodus/src/api/xbox/auth.rs	2026-10-20 00:00:07
++++ b/crates/xodus/src/api/xbox/auth.rs	2026-11-21 20:58:37
+@@ -57,6 +57,11 @@
+ }
+ 
+ pub fn get_xsts_auth_header(xsts: XstsResponse) -> String {
+-    let uhs = xsts.user_hash().expect("XSTS response missing xui claim");
+-    format!("XBL3.0 x={uhs};{}", xsts.token)
++    try_xsts_auth_header(xsts).expect("XSTS response missing xui claim")
++}
++
++/// As `get_xsts_auth_header`, None instead of a panic when the token carries no user hash (MetalHorizon).
++pub fn try_xsts_auth_header(xsts: XstsResponse) -> Option<String> {
++    let uhs = xsts.user_hash()?;
++    Some(format!("XBL3.0 x={uhs};{}", xsts.token))
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus/src/api/xbox/mod.rs b/crates/xodus/src/api/xbox/mod.rs
+--- a/crates/xodus/src/api/xbox/mod.rs	2026-10-20 00:00:07
++++ b/crates/xodus/src/api/xbox/mod.rs	2026-11-21 20:58:27
+@@ -1,3 +1,6 @@
++use std::fmt;
++
++use crate::api::live::rst::RSTError;
+ use crate::models::live::ExchangeUserTokenOutcome;
+ use crate::models::secrets::{LegacyToken, Token};
+ use crate::models::soap;
+@@ -7,12 +10,72 @@
+ pub mod title;
+ pub use auth::{authenticate_xbox_user, get_xsts_auth_header, request_xsts_token};
+ 
+-pub async fn run(
++/// Why an XSTS token could not be had (MetalHorizon: these were panics, two of them `panic!("TODO")`).
++#[derive(Debug)]
++pub enum XboxAuthError {
++    /// The SOAP exchange of the user token failed: the network, or the device token.
++    Exchange(RSTError),
++    /// Microsoft refused the user token: the sign-in has expired, or the device token must be renewed first.
++    Refused,
++    /// Microsoft returned a token of a type xodus does not use.
++    UnsupportedToken,
++    /// user.auth.xboxlive.com or xsts.auth.xboxlive.com answered with an error.
++    Xbox(reqwest::Error),
++}
++
++impl fmt::Display for XboxAuthError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            XboxAuthError::Exchange(err) => write!(f, "the Microsoft token exchange failed: {err}"),
++            XboxAuthError::Refused => f.write_str("Microsoft refused the saved sign-in"),
++            XboxAuthError::UnsupportedToken => f.write_str("Microsoft returned a token xodus does not use"),
++            XboxAuthError::Xbox(err) => write!(f, "Xbox authentication failed: {err}"),
++        }
++    }
++}
++
++impl std::error::Error for XboxAuthError {}
++
++impl XboxAuthError {
++    /// The HTTP status Xbox or Microsoft answered with, when there was one.
++    pub fn status(&self) -> Option<u16> {
++        match self {
++            XboxAuthError::Xbox(err) | XboxAuthError::Exchange(RSTError::Request(err)) => {
++                err.status().map(|status| status.as_u16())
++            }
++            _ => None,
++        }
++    }
++
++    /// The network or a server error: worth another try as it is.
++    pub fn is_network(&self) -> bool {
++        match self {
++            XboxAuthError::Exchange(err) => err.is_network(),
++            XboxAuthError::Xbox(err) => err
++                .status()
++                .is_none_or(|status| status.is_server_error() || status.as_u16() == 429),
++            _ => false,
++        }
++    }
++
++    /// What a new device token may fix: a refused exchange, a device secret that does not work, or Xbox answering
++    /// 400 or 401 to the user token (the 400s of 28 and 29 October).
++    pub fn may_need_new_device_token(&self) -> bool {
++        match self {
++            XboxAuthError::Refused => true,
++            XboxAuthError::Exchange(RSTError::Fault | RSTError::MissingDeviceSecret) => true,
++            _ => matches!(self.status(), Some(400 | 401)),
++        }
++    }
++}
++
++/// An XSTS token for `relying_party`, with an error instead of a panic.
++pub async fn run_checked(
+     client: &reqwest::Client,
+     dev_token: LegacyToken,
+     legacy: LegacyToken,
+     relying_party: &str,
+-) -> XstsResponse {
++) -> Result<XstsResponse, XboxAuthError> {
+     let user_token = crate::api::live::exchange_user_token(
+         client,
+         legacy,
+@@ -27,33 +90,37 @@
+         )],
+     )
+     .await
+-    .expect("Failed to get ms user token");
++    .map_err(XboxAuthError::Exchange)?;
+ 
+     let user_token: Token = match user_token {
+-        ExchangeUserTokenOutcome::Fault(_) => {
+-            eprintln!("Failed to get exchange MS token");
+-            panic!("TODO");
+-        }
++        ExchangeUserTokenOutcome::Fault(_) => return Err(XboxAuthError::Refused),
+         ExchangeUserTokenOutcome::Issued(
+             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+-        ) => {
+-            let token = collection.security_tokens.remove(0);
+-            token.into()
+-        }
++        ) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0).into(),
+         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+             token,
+         )) => (*token).into(),
+-        _ => unreachable!("Only responses are handled"),
++        ExchangeUserTokenOutcome::Issued(_) => return Err(XboxAuthError::UnsupportedToken),
+     };
+     let Token::Compact(user_token) = user_token else {
+-        eprintln!("Unsupported token");
+-        panic!("TODO");
++        return Err(XboxAuthError::UnsupportedToken);
+     };
+     let resp = authenticate_xbox_user(client, user_token)
+         .await
+-        .expect("Failed to authenticate Xbox user");
++        .map_err(XboxAuthError::Xbox)?;
+ 
+     request_xsts_token(client, resp.token, relying_party)
++        .await
++        .map_err(XboxAuthError::Xbox)
++}
++
++pub async fn run(
++    client: &reqwest::Client,
++    dev_token: LegacyToken,
++    legacy: LegacyToken,
++    relying_party: &str,
++) -> XstsResponse {
++    run_checked(client, dev_token, legacy, relying_party)
+         .await
+         .expect("Failed to authenticate Xbox user")
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus/src/licensing/content.rs b/crates/xodus/src/licensing/content.rs
+--- a/crates/xodus/src/licensing/content.rs	2026-10-20 00:00:07
++++ b/crates/xodus/src/licensing/content.rs	2026-11-21 21:00:11
+@@ -20,8 +20,27 @@
+     /// not covered by the account's current subscription tier).
+     #[error("not entitled to this content: {description}")]
+     NotEntitled { description: String },
++
++    /// MetalHorizon: a licence without a key, or one that does not decode, used to be four panics.
++    #[error("the licence Microsoft returned could not be read: {0}")]
++    Malformed(String),
+ }
+ 
++impl LicenseContentError {
++    /// The network or Microsoft's servers: worth another try as it is (MetalHorizon).
++    pub fn is_network(&self) -> bool {
++        match self {
++            LicenseContentError::Request(err) => {
++                !err.is_decode()
++                    && err
++                        .status()
++                        .is_none_or(|status| status.is_server_error() || status.as_u16() == 429)
++            }
++            _ => false,
++        }
++    }
++}
++
+ // we might need a bump in xal-rs concerning reqwest,
+ // that might block us from using the correlationvector extension
+ pub async fn get_license_content(
+@@ -58,7 +77,9 @@
+             ),
+         })
+         .send()
+-        .await?;
++        .await?
++        // a server error is a status (tried again by the caller), not an answer that fails to decode
++        .error_for_status()?;
+ 
+     let content_res = response.json::<LicenseContentResponse>().await?;
+     let content = match content_res {
+@@ -71,9 +92,18 @@
+             });
+         }
+     };
+-    let license = &content.keys[0].value;
+-    let license = BASE64_STANDARD.decode(license).unwrap();
+-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
++    let license = &content
++        .keys
++        .first()
++        .ok_or_else(|| LicenseContentError::Malformed("it has no key".to_string()))?
++        .value;
++    let license = BASE64_STANDARD
++        .decode(license)
++        .map_err(|err| LicenseContentError::Malformed(format!("its key is not base64: {err}")))?;
++    let license = String::from_utf8(license)
++        .map_err(|err| LicenseContentError::Malformed(format!("its key is not text: {err}")))?;
++    let license = quick_xml::de::from_str::<License>(&license)
++        .map_err(|err| LicenseContentError::Malformed(format!("its key is not the expected XML: {err}")))?;
+     Ok((content, license))
+ }
+ 
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus/src/tokens/device.rs b/crates/xodus/src/tokens/device.rs
+--- a/crates/xodus/src/tokens/device.rs	2026-10-20 00:00:07
++++ b/crates/xodus/src/tokens/device.rs	2026-11-21 20:58:04
+@@ -1,39 +1,135 @@
++use std::fmt;
++use std::time::Duration;
++
+ use crate::hardware;
+ use crate::licensing::splicense::SPLicense;
+ use crate::licensing::utils::{generate_string, parse_bcrypt_rsa_private};
+ use crate::models::devicecredential::{Authentication, ClientInfo, DeviceAddRequest, DeviceInfo};
+-use crate::models::secrets::Device;
++use crate::models::secrets::{Device, Token};
+ use crate::models::soap::BodyContent;
+ use crate::tokens::manager::TokenManager;
++use crate::tokens::store::TokenStoreError;
+ 
++/// Why the Mac's device identity could not be made ready (MetalHorizon: these used to be panics).
++#[derive(Debug)]
++pub enum DeviceError {
++    /// The Keychain refused to give or keep the device's credentials.
++    Store(TokenStoreError),
++    /// Microsoft could not be reached, after a few tries.
++    Network(String),
++    /// Microsoft answered, but not with what a device needs.
++    Refused(String),
++}
++
++impl fmt::Display for DeviceError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            DeviceError::Store(err) => write!(f, "the device's credentials could not be read or saved: {err}"),
++            DeviceError::Network(err) => write!(f, "Microsoft could not be reached to authenticate this Mac: {err}"),
++            DeviceError::Refused(err) => write!(f, "Microsoft did not authenticate this Mac: {err}"),
++        }
++    }
++}
++
++impl std::error::Error for DeviceError {}
++
++impl From<TokenStoreError> for DeviceError {
++    fn from(err: TokenStoreError) -> Self {
++        DeviceError::Store(err)
++    }
++}
++
++/// A token whose lifetime ends within `margin` (or has ended) is expired. A lifetime that does not parse is taken as
++/// valid: Microsoft says so itself when it is not.
++pub fn token_expired(token: &Token, margin: Duration) -> bool {
++    let Token::Legacy(legacy) = token else {
++        return false;
++    };
++    let Ok(expires) = chrono::DateTime::parse_from_rfc3339(legacy.lifetime.expires.trim()) else {
++        return false;
++    };
++    let margin = chrono::Duration::from_std(margin).unwrap_or_else(|_| chrono::Duration::zero());
++    expires.with_timezone(&chrono::Utc) <= chrono::Utc::now() + margin
++}
++
+ /// Provisions a device (if none is stored yet) or re-authenticates an existing one
+ /// (if its STS token is missing/expired), persisting the result through `tokens`.
+ pub async fn ensure_device_credentials(client: &reqwest::Client, tokens: &TokenManager) {
++    ensure_device_credentials_checked(client, tokens)
++        .await
++        .expect("Failed to make the device credentials ready");
++}
++
++/// As `ensure_device_credentials`, with an error instead of a panic, the token's expiry checked (not only whether it
++/// is there), and Microsoft's network failures tried again.
++pub async fn ensure_device_credentials_checked(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++) -> Result<(), DeviceError> {
+     match tokens.get_device_license() {
+-        Err(_) => provision_device(client, tokens).await,
+-        Ok(license) if tokens.get_device_sts_token().is_err() => {
+-            reauthenticate_device(client, tokens, license).await
++        Err(TokenStoreError::NotFound) => provision_device(client, tokens).await,
++        Err(err) => Err(err.into()),
++        Ok(license) => match tokens.get_device_sts_token() {
++            Ok(token) if !token_expired(&token, Duration::from_secs(300)) => Ok(()),
++            Ok(_) | Err(TokenStoreError::NotFound) => reauthenticate_device(client, tokens, license).await,
++            Err(err) => Err(err.into()),
++        },
++    }
++}
++
++/// A new device STS token, whatever the stored one: what to do when Microsoft refuses an exchange made with it
++/// (xodus-service does the same since MetalHorizon's 0005).
++pub async fn renew_device_token(client: &reqwest::Client, tokens: &TokenManager) -> Result<(), DeviceError> {
++    match tokens.get_device_license() {
++        Ok(license) => reauthenticate_device(client, tokens, license).await,
++        Err(TokenStoreError::NotFound) => provision_device(client, tokens).await,
++        Err(err) => Err(err.into()),
++    }
++}
++
++/// Up to four tries, 1, 2 then 4 s apart, for a call to Microsoft that failed on the network.
++async fn with_retries<T, E: fmt::Display>(
++    what: &str,
++    is_network: impl Fn(&E) -> bool,
++    mut call: impl AsyncFnMut() -> Result<T, E>,
++) -> Result<T, DeviceError> {
++    let mut pause = Duration::from_secs(1);
++    for attempt in 1..=4 {
++        match call().await {
++            Ok(value) => return Ok(value),
++            Err(err) if is_network(&err) && attempt < 4 => {
++                eprintln!("{what}: {err}; trying again in {} s", pause.as_secs());
++                tokio::time::sleep(pause).await;
++                pause *= 2;
++            }
++            Err(err) if is_network(&err) => return Err(DeviceError::Network(err.to_string())),
++            Err(err) => return Err(DeviceError::Refused(err.to_string())),
+         }
+-        Ok(_) => {}
+     }
++    unreachable!("the last attempt returns")
+ }
+ 
+-async fn provision_device(client: &reqwest::Client, tokens: &TokenManager) {
++async fn provision_device(client: &reqwest::Client, tokens: &TokenManager) -> Result<(), DeviceError> {
+     let username = format!("02{}", generate_string(14));
+     let password = generate_string(20);
+-    let provision = DeviceAddRequest {
+-        client_info: ClientInfo::default(),
+-        authentication: Authentication::new(username.clone(), password.clone()),
+-        device_info: Some(DeviceInfo {
+-            id: "DeviceInfo".to_string(),
+-            components: hardware::probe_provision_components(),
+-            tpm_info: None,
+-        }),
+-    };
+ 
+-    let dev = crate::api::live::login_device_credential(client, provision)
+-        .await
+-        .expect("Failed to get device creds");
++    let dev = with_retries(
++        "registering this Mac with Microsoft",
++        crate::api::live::rst::RSTError::is_network,
++        async || {
++            let provision = DeviceAddRequest {
++                client_info: ClientInfo::default(),
++                authentication: Authentication::new(username.clone(), password.clone()),
++                device_info: Some(DeviceInfo {
++                    id: "DeviceInfo".to_string(),
++                    components: hardware::probe_provision_components(),
++                    tpm_info: None,
++                }),
++            };
++            crate::api::live::login_device_credential(client, provision).await
++        },
++    )
++    .await?;
+ 
+     let device = Device {
+         username: username.clone(),
+@@ -44,44 +140,82 @@
+         splicense: dev.license.splicense_block,
+     };
+ 
+-    tokens
+-        .save_device_license(&device)
+-        .expect("Failed to save device license");
++    tokens.save_device_license(&device)?;
+ 
+-    reauthenticate_device(client, tokens, device).await;
++    reauthenticate_device(client, tokens, device).await
+ }
+ 
+-async fn reauthenticate_device(client: &reqwest::Client, tokens: &TokenManager, license: Device) {
+-    let sp_license =
+-        SPLicense::parse_base64(&license.splicense).expect("Failed to parse SPLicense");
+-    let clep_sign_state = sp_license.clep_sign_state.expect("Missing clep sign state");
++async fn reauthenticate_device(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    license: Device,
++) -> Result<(), DeviceError> {
++    let sp_license = SPLicense::parse_base64(&license.splicense)
++        .map_err(|err| DeviceError::Refused(format!("the device licence does not parse: {err:?}")))?;
++    let clep_sign_state = sp_license
++        .clep_sign_state
++        .ok_or_else(|| DeviceError::Refused("the device licence has no CLEP signing state".to_string()))?;
+     let key = clep_sign_state.get_rsa_key();
+-    let private_key = parse_bcrypt_rsa_private(&key).unwrap();
+-    let resp = crate::api::live::authenticate_device(client, license.username, private_key)
+-        .await
+-        .expect("Failed to auth device");
++    let private_key = parse_bcrypt_rsa_private(&key)
++        .map_err(|err| DeviceError::Refused(format!("the device key does not parse: {err:?}")))?;
+ 
+-    if let BodyContent::RequestSecurityTokenResponse(resp) = resp.body.body {
+-        save_device_sts_token(tokens, resp);
++    let resp = with_retries(
++        "authenticating this Mac with Microsoft",
++        crate::api::live::rst::RSTError::is_network,
++        async || crate::api::live::authenticate_device(client, license.username.clone(), private_key.clone()).await,
++    )
++    .await?;
++
++    match resp.body.body {
++        BodyContent::RequestSecurityTokenResponse(resp) => save_device_sts_token(tokens, resp),
++        _ => Err(DeviceError::Refused(
++            "Microsoft answered the device authentication with a fault".to_string(),
++        )),
+     }
+ }
+ 
+ fn save_device_sts_token(
+     tokens: &TokenManager,
+     resp: Box<crate::models::soap::RequestSecurityTokenResponse>,
+-) {
++) -> Result<(), DeviceError> {
+     let key_name = resp
+         .requested_security_token
+         .encrypted_data
+         .as_ref()
+-        .unwrap()
+-        .key_info
+-        .key_name
+-        .as_ref()
+-        .unwrap()
+-        .clone();
++        .and_then(|data| data.key_info.key_name.clone())
++        .ok_or_else(|| DeviceError::Refused("the device token has no key name".to_string()))?;
+     let token = (*resp).into();
+-    tokens
+-        .save_device_token(key_name, token)
+-        .expect("Failed to save device token");
++    tokens.save_device_token(key_name, token)?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod expiry_tests {
++    use super::*;
++    use crate::models::secrets::LegacyToken;
++    use crate::models::soap::Timestamp;
++
++    fn token(expires: String) -> Token {
++        Token::Legacy(LegacyToken {
++            key_name: None,
++            token: String::new(),
++            binary_secret: None,
++            tpm_key: None,
++            lifetime: Timestamp { id: None, created: String::new(), expires },
++        })
++    }
++
++    #[test]
++    fn expired_tokens_are_renewed() {
++        let hour = chrono::Duration::hours(1);
++        let margin = Duration::from_secs(300);
++        assert!(token_expired(&token((chrono::Utc::now() - hour).to_rfc3339()), margin), "ended an hour ago");
++        assert!(
++            token_expired(&token((chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339()), margin),
++            "ends within the margin"
++        );
++        assert!(!token_expired(&token((chrono::Utc::now() + hour).to_rfc3339()), margin), "valid for an hour");
++        assert!(!token_expired(&token("not a date".to_string()), margin), "an unknown lifetime is left to Microsoft");
++        assert!(!token_expired(&Token::Compact("x".to_string()), margin));
++    }
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus-cli/src/commands/login.rs b/crates/xodus-cli/src/commands/login.rs
+--- a/crates/xodus-cli/src/commands/login.rs	2026-10-20 00:35:34
++++ b/crates/xodus-cli/src/commands/login.rs	2026-11-21 21:01:35
+@@ -1,10 +1,17 @@
+ use std::process::ExitCode;
+ 
+-fn publish_status(status: &str) {
++pub fn publish_status(status: &str) {
+     let Some(path) = std::env::var_os("BLACKWELL_LOGIN_STATUS_FILE") else {
+         return;
+     };
+     // Only fixed stage names are written here; never write account or token data.
++    // MetalHorizon: written beside, then renamed over, so the app never reads half a status.
++    let path = std::path::PathBuf::from(path);
++    let mut partial = path.clone().into_os_string();
++    partial.push(".partial");
++    if std::fs::write(&partial, status).is_ok() && std::fs::rename(&partial, &path).is_ok() {
++        return;
++    }
+     let _ = std::fs::write(path, status);
+ }
+ 
+@@ -25,28 +32,48 @@
+ 
+ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
+     publish_status("starting");
+-    let token = tokens.get_device_sts_token().unwrap();
+-    let secrets::Token::Legacy(token) = token else {
+-        eprintln!("Invalid STS token");
+-        return ExitCode::FAILURE;
++    // MetalHorizon: no device token, or a Keychain that refuses it, is a status and a message, not a panic
++    let token = match crate::package::device_token(tokens) {
++        Ok(token) => token,
++        Err(err) => {
++            publish_status(if err.kind == crate::resilience::ErrorKind::Keychain {
++                "keychain_denied"
++            } else {
++                "device_error"
++            });
++            err.report();
++            return ExitCode::FAILURE;
++        }
+     };
+     let handler = LoginHandler::new(client.clone(), token, tokens.clone());
+-    let output = webview::run_sessions(handler)
+-        .expect("failed to login")
+-        .flatten();
++    let output = match webview::run_sessions(handler) {
++        Ok(output) => output.flatten(),
++        Err(err) => {
++            publish_status("cancelled");
++            eprintln!("The sign-in window could not run: {err}");
++            return ExitCode::FAILURE;
++        }
++    };
+     let (issued_tokens, successful_exchange) = match output {
+         Some(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => {
+             (collection.security_tokens, true)
+         }
+         Some(soap::BodyContent::RequestSecurityTokenResponse(token)) => (vec![*token], true),
+         None => {
+-            if !matches!(current_status().as_deref(), Some("exchange_failed" | "exchange_rejected")) {
++            if !matches!(
++                current_status().as_deref(),
++                Some("exchange_failed" | "exchange_rejected" | "network_error" | "keychain_denied")
++            ) {
+                 publish_status("cancelled");
+             }
+             eprintln!("Didn't log in");
+             (vec![], false)
+         }
+-        _ => unreachable!(),
++        Some(_) => {
++            publish_status("exchange_rejected");
++            eprintln!("Microsoft answered the sign-in with something other than tokens");
++            (vec![], false)
++        }
+     };
+ 
+     for token in issued_tokens {
+@@ -57,7 +84,12 @@
+         } else {
+             address
+         };
+-        tokens.save_user_token(address, token).unwrap();
++        // MetalHorizon: a Keychain that refuses to keep the sign-in says so, instead of a panic
++        if let Err(err) = tokens.save_user_token(address, token) {
++            publish_status("keychain_denied");
++            crate::resilience::token_error(&err, "saving the Xbox sign-in").report();
++            return ExitCode::FAILURE;
++        }
+     }
+ 
+     if successful_exchange {
+@@ -122,18 +154,38 @@
+                     scopes.push(("http://Passport.NET/tb".to_string(), None));
+                 }
+ 
+-                xodus::api::live::exchange_user_token(
+-                    &client,
+-                    user_token,
+-                    username,
+-                    device_token,
+-                    Some(inline_ft),
+-                    None,
+-                    client_id,
+-                    &scopes,
++                // MetalHorizon: a network blip right after the player signed in is tried again (up to four times),
++                // so it does not waste the sign-in; if the network stays down, the status says so
++                crate::resilience::retry(
++                    "exchanging the Microsoft sign-in for Xbox",
++                    4,
++                    || {
++                        xodus::api::live::exchange_user_token(
++                            &client,
++                            user_token.clone(),
++                            username.clone(),
++                            device_token.clone(),
++                            Some(inline_ft.clone()),
++                            None,
++                            client_id.clone(),
++                            &scopes,
++                        )
++                    },
++                    |err: &xodus::api::live::rst::RSTError| {
++                        if err.is_network() {
++                            crate::resilience::Verdict::Retry(None)
++                        } else {
++                            crate::resilience::Verdict::GiveUp
++                        }
++                    },
+                 )
+                 .await
+-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
++                .map_err(|e| {
++                    if e.is_network() {
++                        publish_status("network_error");
++                    }
++                    Box::new(e) as Box<dyn std::error::Error>
++                })
+             })
+         })
+     }
+@@ -165,7 +217,10 @@
+         let exchanged = match self.exchange_user_token(data.clone()) {
+             Ok(exchanged) => exchanged,
+             Err(error) => {
+-                publish_status("exchange_failed");
++                // a network failure has already said network_error (the app tells the player to check the network)
++                if current_status().as_deref() != Some("network_error") {
++                    publish_status("exchange_failed");
++                }
+                 eprintln!("Xbox token exchange failed: {error}");
+                 runtime.close_session(session_id);
+                 return Ok(webview::HandlerControl::Complete(None));
+@@ -192,12 +247,14 @@
+             ExchangeUserTokenOutcome::Issued(da) => {
+                 publish_status("account_accepted");
+                 runtime.close_session(session_id);
+-                self.tokens
+-                    .save_user(&xodus::models::secrets::User {
+-                        puid: data.puid,
+-                        username: data.username,
+-                    })
+-                    .unwrap();
++                if let Err(err) = self.tokens.save_user(&xodus::models::secrets::User {
++                    puid: data.puid,
++                    username: data.username,
++                }) {
++                    publish_status("keychain_denied");
++                    crate::resilience::token_error(&err, "saving the Xbox account").report();
++                    return Ok(webview::HandlerControl::Complete(None));
++                }
+                 Ok(webview::HandlerControl::Complete(Some(da)))
+             }
+         }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus-cli/src/commands/streaming.rs b/crates/xodus-cli/src/commands/streaming.rs
+--- a/crates/xodus-cli/src/commands/streaming.rs	2026-11-21 20:43:43
++++ b/crates/xodus-cli/src/commands/streaming.rs	2026-11-21 21:06:39
+@@ -1,9 +1,10 @@
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::io::Write;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::process::ExitCode;
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::time::{Duration, Instant};
+-use std::vec;
+ 
+ use fs2::available_space;
+ use futures_util::{StreamExt, stream};
+@@ -11,19 +12,28 @@
+ use msixvc::streaming;
+ use msixvc::xvd::{SegmentFile, XvdFile};
+ use tokio::fs::{File, OpenOptions};
+-use tokio::io::AsyncRead;
++use tokio::io::{AsyncRead, AsyncWriteExt};
+ use tokio::sync::mpsc::{Receiver, Sender};
+ use uuid::Uuid;
+ use xodus::tokens::TokenManager;
+ 
+ use crate::license::get_license;
+ use crate::package::{get_content_id, get_packages};
++use crate::resilience::{self, ErrorKind, XodusError};
+ 
+-struct Job {
+-    name: String,
+-    content: SegmentFile,
+-}
++// MetalHorizon (patches/xodus-cli 0006 to 0008, docs/XODUS-ROBUSTNESS.md): the download says where it is and why
++// it stops, never panics, tries each file again on the package's other CDN mirrors, resumes where an interrupted
++// run stopped, checks the room before it starts and each file once written, and stops cleanly on SIGINT or SIGTERM.
+ 
++/// Under this, not even the package's index (about 1 GB) fits: stop before fetching it.
++const MIN_FREE_BYTES: u64 = 2_000_000_000;
++/// Tries for one file, each on the next mirror.
++const FILE_ATTEMPTS: u32 = 5;
++/// The files already downloaded, beside the game, for a download started again.
++const JOURNAL: &str = ".xodus-streaming-done";
++/// The exit code of a download stopped by SIGINT or SIGTERM: paused, resumable.
++const EXIT_PAUSED: u8 = 130;
++
+ enum ProgressEvent {
+     Started { id: usize, name: String, total: u64 },
+     Advanced { id: usize, delta: u64 },
+@@ -94,6 +104,14 @@
+     }
+ }
+ 
++/// How a download ended.
++enum Outcome {
++    Downloaded,
++    /// SIGINT or SIGTERM: what is done stays done, the next run resumes.
++    Stopped,
++    Failed(XodusError),
++}
++
+ pub async fn run(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+@@ -104,19 +122,19 @@
+     market: Option<String>,
+ ) -> ExitCode {
+     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+-    let downloaded = if source.starts_with("file://") {
++    let outcome = if source.starts_with("file://") {
+         let fsrc = source.strip_prefix("file://").unwrap_or_default();
+         let f = match File::open(fsrc).await {
+             Ok(f) => f,
+             Err(err) => {
+-                eprintln!("could not open {fsrc}: {err}");
++                XodusError::new(ErrorKind::Disk, format!("could not open {fsrc}: {err}")).report();
+                 return ExitCode::FAILURE;
+             }
+         };
+         let l = match f.metadata().await {
+             Ok(metadata) => metadata.len(),
+             Err(err) => {
+-                eprintln!("could not read metadata for {fsrc}: {err}");
++                XodusError::new(ErrorKind::Disk, format!("could not read metadata for {fsrc}: {err}")).report();
+                 return ExitCode::FAILURE;
+             }
+         };
+@@ -129,59 +147,28 @@
+             market,
+             f,
+             l,
+-            &source,
++            vec![source.clone()],
+             &tx,
+             rx,
+         )
+         .await
+     } else {
+-        let vurl = if source.starts_with("http://") || source.starts_with("https://") {
+-            source
+-        } else {
+-            let content_id = if Uuid::try_parse(&source).is_err() {
+-                let content_id_task = get_content_id(client, source, market.clone()).await;
+-                let Ok(content_id) = content_id_task else {
+-                    let Err(err) = content_id_task else {
+-                        eprintln!("Unknown Error");
+-                        return ExitCode::FAILURE;
+-                    };
+-                    eprintln!("{}", err);
+-                    return ExitCode::FAILURE;
+-                };
+-                content_id
+-            } else {
+-                source
+-            };
+-            let package_result = get_packages(client, tokens, content_id.clone()).await;
+-            let Ok(package) = package_result else {
+-                let Err(err) = package_result else {
+-                    eprintln!("Unknown Error");
+-                    return ExitCode::FAILURE;
+-                };
+-                eprintln!("{}", err);
++        resilience::status("package");
++        let mirrors = match package_mirrors(client, tokens, source, market.clone()).await {
++            Ok(mirrors) => mirrors,
++            Err(err) => {
++                err.report();
+                 return ExitCode::FAILURE;
+-            };
+-            let Some(file) = package
+-                .package_files
+-                .iter()
+-                .find(|p| p.file_name.ends_with(".msixvc"))
+-            else {
+-                eprintln!("No .msixvc file found");
+-                return ExitCode::FAILURE;
+-            };
+-            format!(
+-                "{}{}",
+-                file.cdn_root_paths.first().unwrap(),
+-                file.relative_url
+-            )
++            }
+         };
+-        let url = &vurl;
+-        let mut pos = 0;
+-        let http_file = streaming::HttpRead::open(
+-            client.clone(),
+-            url,
+-            Some(|c, _| {
+-                if tx
++        // the index is read from the first mirror that opens (each open is itself tried again, in msixvc)
++        let tx_ref = &tx;
++        let mut opened = None;
++        let mut last_error = String::new();
++        for (index, url) in mirrors.iter().enumerate() {
++            let mut pos = 0u64;
++            let progress = move |c: u64, _total: u64| {
++                if tx_ref
+                     .try_send(ProgressEvent::Advanced {
+                         id: usize::MAX,
+                         delta: c - pos,
+@@ -190,10 +177,32 @@
+                 {
+                     pos = c;
+                 }
+-            }),
+-        )
+-        .await
+-        .expect("ok");
++            };
++            match streaming::HttpRead::open(client.clone(), url, Some(progress)).await {
++                Ok(file) => {
++                    opened = Some((index, file));
++                    break;
++                }
++                Err(err) => {
++                    eprintln!("the package could not be opened at {url}: {err}");
++                    last_error = err.to_string();
++                }
++            }
++        }
++        let Some((index, http_file)) = opened else {
++            XodusError::new(
++                ErrorKind::Network,
++                format!(
++                    "The game's package could not be reached on any of its {} servers: {last_error}",
++                    mirrors.len()
++                ),
++            )
++            .report();
++            return ExitCode::FAILURE;
++        };
++        // the mirror that answered goes first; the others are where a failing file goes next
++        let mut ordered = mirrors.clone();
++        ordered.rotate_left(index);
+         let l = http_file.len();
+ 
+         run_cli_reader(
+@@ -205,22 +214,67 @@
+             market,
+             http_file,
+             l,
+-            url,
++            ordered,
+             &tx,
+             rx,
+         )
+         .await
+     };
+ 
+-    // A download that did not happen (no licence, no room on the disk) is a failure: it used to end with success,
+-    // and MetalHorizon said "Download finished." with no game.
+-    if downloaded {
+-        ExitCode::SUCCESS
++    match outcome {
++        Outcome::Downloaded => ExitCode::SUCCESS,
++        Outcome::Stopped => {
++            eprintln!("The download is paused: what is downloaded stays, and the same command resumes it.");
++            ExitCode::from(EXIT_PAUSED)
++        }
++        // A download that did not happen (no licence, no room on the disk) is a failure: it used to end with
++        // success, and MetalHorizon said "Download finished." with no game.
++        Outcome::Failed(err) => {
++            err.report();
++            ExitCode::FAILURE
++        }
++    }
++}
++
++/// Every CDN address of the game's package (`source` is a URL, a content ID or a Store product ID).
++async fn package_mirrors(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    source: String,
++    market: Option<String>,
++) -> Result<Vec<String>, XodusError> {
++    if source.starts_with("http://") || source.starts_with("https://") {
++        return Ok(vec![source]);
++    }
++    let content_id = if Uuid::try_parse(&source).is_err() {
++        get_content_id(client, source, market).await?
+     } else {
+-        ExitCode::FAILURE
++        source
++    };
++    let package = get_packages(client, tokens, content_id).await?;
++    let file = package
++        .package_files
++        .iter()
++        .find(|p| p.file_name.ends_with(".msixvc"))
++        .ok_or_else(|| XodusError::new(ErrorKind::Package, "No .msixvc file found"))?;
++    let mirrors = mirrors_of(&file.cdn_root_paths, &file.relative_url);
++    if mirrors.is_empty() {
++        return Err(XodusError::new(ErrorKind::Package, "The game's package has no download server"));
+     }
++    Ok(mirrors)
+ }
+ 
++/// The package's address on each of its CDN roots, in Microsoft's order, each once.
++fn mirrors_of(roots: &[String], relative_url: &str) -> Vec<String> {
++    let mut seen = HashSet::new();
++    roots
++        .iter()
++        .map(|root| format!("{root}{relative_url}"))
++        .filter(|url| seen.insert(url.clone()))
++        .collect()
++}
++
++#[allow(clippy::too_many_arguments)]
+ async fn run_cli_reader<Reader>(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+@@ -230,10 +284,10 @@
+     market: Option<String>,
+     reader: Reader,
+     l: u64,
+-    url: &str,
++    mirrors: Vec<String>,
+     tx: &Sender<ProgressEvent>,
+     mut rx: Receiver<ProgressEvent>,
+-) -> bool
++) -> Outcome
+ where
+     Reader: AsyncRead + Unpin,
+ {
+@@ -297,34 +351,138 @@
+ 
+         total_progess.abandon();
+     });
+-    let downloaded = run_reader(
+-        client,
+-        tokens,
+-        destination,
+-        try_skip_ntfs,
+-        parallel,
+-        market,
+-        reader,
+-        l,
+-        url,
+-        tx,
+-    )
+-    .await;
++
++    let cache_path = Path::new(&destination).join(".xodus-streaming-tmp.msixvc");
++    // SIGINT or SIGTERM (MetalHorizon's Stop) ends the download where it is: only files written in full and synced
++    // are in the journal, so the next run resumes from there
++    let outcome = tokio::select! {
++        outcome = run_reader(
++            client,
++            tokens,
++            destination,
++            try_skip_ntfs,
++            parallel,
++            market,
++            reader,
++            l,
++            &mirrors,
++            tx,
++        ) => outcome,
++        _ = stop_signal() => {
++            std::fs::remove_file(&cache_path).ok();
++            resilience::status("paused");
++            Outcome::Stopped
++        }
++    };
+     // the last line before the process exits (the channel is in order: every byte counted is in it)
+     let (ack, acked) = tokio::sync::oneshot::channel();
+     if tx.send(ProgressEvent::Done { ack }).await.is_ok() {
+         acked.await.ok();
+     }
+-    downloaded
++    outcome
+ }
+ 
+-/// The download is given up before its files (no licence, no room on the disk): the package's index cached for this
+-/// run is removed, as the next run would empty it anyway (about 1 GB, on a disk that may be short of room).
+-fn give_up(cache_path: &Path) -> bool {
++/// SIGINT or SIGTERM; never, if they cannot be listened to.
++async fn stop_signal() {
++    use tokio::signal::unix::{SignalKind, signal};
++    let (Ok(mut interrupt), Ok(mut terminate)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate()))
++    else {
++        std::future::pending::<()>().await;
++        return;
++    };
++    tokio::select! {
++        _ = interrupt.recv() => {}
++        _ = terminate.recv() => {}
++    }
++}
++
++/// The download is given up before its files are all there: the package's index cached for this run is removed, as
++/// the next run would empty it anyway (about 1 GB, on a disk that may be short of room). The journal stays: the
++/// files already downloaded are not fetched again.
++fn give_up(cache_path: &Path, err: XodusError) -> Outcome {
+     std::fs::remove_file(cache_path).ok();
+-    false
++    Outcome::Failed(err)
+ }
+ 
++/// xodus' own words (MetalHorizon reads them: DownloadProgress.notEnoughSpace), with the kind for the app.
++fn not_enough_space(out: &Path, need: u64, have: u64, files: u64) -> XodusError {
++    XodusError::new(
++        ErrorKind::NoSpace,
++        format!(
++            "not enough free disk space on {}: need {} bytes, have {} bytes (files: {})",
++            out.display(),
++            need,
++            have,
++            files
++        ),
++    )
++}
++
++/// The index could not be read: the network when it looks like it, else the package itself.
++fn index_error(what: &str, err: impl std::fmt::Display) -> XodusError {
++    let text = err.to_string();
++    let lower = text.to_lowercase();
++    let network = ["error sending request", "timed out", "connection", "dns", "tcp", "reset", "broken pipe", "http"]
++        .iter()
++        .any(|word| lower.contains(word));
++    XodusError::new(
++        if network { ErrorKind::Network } else { ErrorKind::Package },
++        format!("The package's index could not be {what}: {text}"),
++    )
++}
++
++fn is_no_space(message: &str) -> bool {
++    let lower = message.to_lowercase();
++    lower.contains("no space left") || lower.contains("os error 28") || lower.contains("disk full")
++}
++
++/// The sizes a finished file may have: its length, or whole 4 KiB pages (a file kept encrypted is written by pages).
++fn complete_size(size: u64, length: u64) -> bool {
++    size == length || size == length.div_ceil(4096) * 4096
++}
++
++// ---- the journal of the files done ------------------------------------------------------------------------------
++
++/// `package <content id> <package length>`, then `done <name>` for each file written in full and synced. Another
++/// package (an update came out) starts a new list.
++struct Journal {
++    file: std::fs::File,
++}
++
++impl Journal {
++    /// The files listed for `package`; nothing when the journal is missing or for another package.
++    fn read(path: &Path, package: &str) -> Vec<String> {
++        let Ok(text) = std::fs::read_to_string(path) else {
++            return Vec::new();
++        };
++        let mut lines = text.lines();
++        if lines.next() != Some(format!("package {package}").as_str()) {
++            return Vec::new();
++        }
++        lines
++            .filter_map(|line| line.strip_prefix("done "))
++            .map(str::to_owned)
++            .collect()
++    }
++
++    /// A new journal for `package` holding `kept`, then open for appending.
++    fn start(path: &Path, package: &str, kept: &[String]) -> std::io::Result<Journal> {
++        let mut text = format!("package {package}\n");
++        for name in kept {
++            text.push_str(&format!("done {name}\n"));
++        }
++        std::fs::write(path, text)?;
++        let file = std::fs::OpenOptions::new().append(true).open(path)?;
++        Ok(Journal { file })
++    }
++
++    fn record(&mut self, name: &str) -> std::io::Result<()> {
++        writeln!(self.file, "done {name}")?;
++        self.file.sync_data()
++    }
++}
++
++#[allow(clippy::too_many_arguments)]
+ async fn run_reader<Reader>(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+@@ -334,37 +492,59 @@
+     market: Option<String>,
+     reader: Reader,
+     l: u64,
+-    url: &str,
++    mirrors: &[String],
+     tx: &Sender<ProgressEvent>,
+-) -> bool
++) -> Outcome
+ where
+     Reader: AsyncRead + Unpin,
+ {
+     let out: &Path = Path::new(&destination);
+ 
+-    std::fs::create_dir_all(out).expect("ok");
++    if let Err(err) = std::fs::create_dir_all(out) {
++        return Outcome::Failed(XodusError::new(
++            ErrorKind::Disk,
++            format!("The folder {} could not be made: {err}", out.display()),
++        ));
++    }
+ 
++    // too little room for even the package's index: said now, not after fetching about 1 GB of it
++    if let Ok(free) = available_space(out)
++        && free < MIN_FREE_BYTES
++    {
++        return Outcome::Failed(not_enough_space(out, MIN_FREE_BYTES, free, MIN_FREE_BYTES));
++    }
++
+     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
+     let final_path = out.join(".xodus-streaming.msixvc");
++    let journal_path = out.join(JOURNAL);
+ 
+-    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+-        .await
+-        .expect("no err");
+-    let remote_xvd = XvdFile::parse(&mut remote_file).await.expect("no err");
++    resilience::status("index");
++    let mut remote_file = match streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await {
++        Ok(file) => file,
++        Err(err) => {
++            return give_up(
++                &cache_path,
++                XodusError::new(ErrorKind::Disk, format!("The package's index could not be cached: {err}")),
++            );
++        }
++    };
++    let remote_xvd = match XvdFile::parse(&mut remote_file).await {
++        Ok(xvd) => xvd,
++        Err(err) => return give_up(&cache_path, index_error("read", err)),
++    };
+     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
+ 
+-    let files = remote_xvd
+-        .parse_user_package_files(&mut remote_file)
+-        .await
+-        .expect("ok");
++    let files = match remote_xvd.parse_user_package_files(&mut remote_file).await {
++        Ok(files) => files,
++        Err(err) => return give_up(&cache_path, index_error("listed", err)),
++    };
+     for (k, v) in &files {
+         if k == "SegmentMetadata.bin" {
+-            let sfiles = remote_xvd
+-                .parse_segment_metadata(&mut remote_file, v)
+-                .await
+-                .expect("ok");
+-            rfiles = sfiles;
++            match remote_xvd.parse_segment_metadata(&mut remote_file, v).await {
++                Ok(sfiles) => rfiles = sfiles,
++                Err(err) => return give_up(&cache_path, index_error("read (segments)", err)),
++            }
+         }
+     }
+ 
+@@ -374,97 +554,136 @@
+         })
+         .await
+         .ok();
+-        let sfiles = remote_xvd
++        match remote_xvd
+             .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
+             .await
+-            .expect("ok");
+-        rfiles.extend(sfiles);
++        {
++            Ok(sfiles) => rfiles.extend(sfiles),
++            Err(err) => return give_up(&cache_path, index_error("read (NTFS)", err)),
++        }
+     }
+ 
+-    let file = OpenOptions::new()
+-        .read(true)
+-        .open(final_path.to_owned())
+-        .await
+-        .ok();
+-
+-    if let Some(mut file) = file {
+-        let xvd = XvdFile::parse(&mut file).await.expect("no err");
+-
+-        let files = xvd.parse_user_package_files(&mut file).await.expect("ok");
+-        for (k, v) in &files {
+-            if k == "SegmentMetadata.bin" {
+-                let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");
+-                lfiles = sfiles;
++    // the last complete download's index, to fetch only what changed; one that does not read means fetch everything
++    if let Ok(mut file) = OpenOptions::new().read(true).open(&final_path).await {
++        match XvdFile::parse(&mut file).await {
++            Ok(xvd) => {
++                if let Ok(files) = xvd.parse_user_package_files(&mut file).await {
++                    for (k, v) in &files {
++                        if k == "SegmentMetadata.bin"
++                            && let Ok(sfiles) = xvd.parse_segment_metadata(&mut file, v).await
++                        {
++                            lfiles = sfiles;
++                        }
++                    }
++                }
++                if let Ok(sfiles) = xvd
++                    .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
++                    .await
++                {
++                    lfiles.extend(sfiles);
++                }
+             }
++            Err(err) => eprintln!("the last download's index does not read ({err}): every file is checked"),
+         }
+-
+-        if let Ok(sfiles) = xvd
+-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
+-            .await
+-        {
+-            lfiles.extend(sfiles);
+-        }
+     }
+ 
+-    let license = get_license(
++    resilience::status("licence");
++    let (key, game_splicense) = match get_license(
+         client,
+         tokens,
+         remote_xvd.content_id().to_string(),
+         market.unwrap_or("neutral".to_string()),
+     )
+-    .await;
+-    if let Err(err) = license {
+-        eprintln!("{}", err);
+-        return give_up(&cache_path);
+-    }
+-    let (key, game_splicense) = license.unwrap();
++    .await
++    {
++        Ok(license) => license,
++        Err(err) => return give_up(&cache_path, err),
++    };
+     if game_splicense.content_keys.len() != 1 {
+-        eprintln!(
+-            "unexpected number of content keys {}",
+-            game_splicense.content_keys.len()
++        return give_up(
++            &cache_path,
++            XodusError::new(
++                ErrorKind::Package,
++                format!("unexpected number of content keys {}", game_splicense.content_keys.len()),
++            ),
+         );
+-        return give_up(&cache_path);
+     }
+     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
+-        return give_up(&cache_path);
++        return give_up(&cache_path, XodusError::new(ErrorKind::Package, "the licence has no content key"));
+     };
+ 
+-    let full_key = content_key.unpack(&key).expect("failed to unpack");
++    let full_key = match content_key.unpack(&key) {
++        Ok(full_key) => full_key,
++        Err(err) => {
++            return give_up(
++                &cache_path,
++                XodusError::new(ErrorKind::Package, format!("the game's key could not be unpacked: {err:?}")),
++            );
++        }
++    };
+ 
+-    let total_size = rfiles
++    // the files an interrupted run already wrote in full: kept when they are still on disk at their size
++    let package = format!("{} {}", remote_xvd.content_id(), l);
++    let done: Vec<String> = Journal::read(&journal_path, &package)
++        .into_iter()
++        .filter(|name| {
++            rfiles.get(name).is_some_and(|file| {
++                std::fs::metadata(out.join(name.replace("\\", "/")))
++                    .is_ok_and(|meta| complete_size(meta.len(), file.length))
++            })
++        })
++        .collect();
++    let journal = match Journal::start(&journal_path, &package, &done) {
++        Ok(journal) => Some(journal),
++        Err(err) => {
++            eprintln!("the list of the files done could not be written ({err}): an interrupted run starts over");
++            None
++        }
++    };
++    let done: HashSet<String> = done.into_iter().collect();
++    if !done.is_empty() {
++        eprintln!("Resuming: {} files are already downloaded", done.len());
++        resilience::status(&format!("resume {}", done.len()));
++    }
++
++    let to_do: Vec<(String, SegmentFile)> = rfiles
+         .iter()
+         .filter(|(k, v1)| {
+-            if let Some(v2) = lfiles.get(*k) {
+-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
+-            } else {
+-                true
+-            }
++            !done.contains(*k)
++                && match lfiles.get(*k) {
++                    Some(v2) => v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty(),
++                    None => true,
++                }
+         })
+-        .map(|(_, v)| v.length)
+-        .sum();
++        .map(|(n, v)| {
++            (
++                n.clone(),
++                SegmentFile {
++                    offset: v.offset,
++                    length: v.length,
++                    data_hashs: vec![],
++                    keep_encrypted: v.keep_encrypted,
++                },
++            )
++        })
++        .collect();
++    let total_size: u64 = to_do.iter().map(|(_, v)| v.length).sum();
+ 
+-    let required_free_space = total_size;
++    // the room for what is left to fetch (the files already done are on disk already)
+     let available_free_space = match available_space(out) {
+         Ok(space) => space,
+         Err(err) => {
+-            eprintln!(
+-                "failed to determine available space for {}: {}",
+-                out.display(),
+-                err
++            return give_up(
++                &cache_path,
++                XodusError::new(
++                    ErrorKind::Disk,
++                    format!("failed to determine available space for {}: {}", out.display(), err),
++                ),
+             );
+-            return give_up(&cache_path);
+         }
+     };
+-
+-    if available_free_space < required_free_space {
+-        eprintln!(
+-            "not enough free disk space on {}: need {} bytes, have {} bytes (files: {})",
+-            out.display(),
+-            required_free_space,
+-            available_free_space,
+-            total_size
+-        );
+-        return give_up(&cache_path);
++    if available_free_space < total_size {
++        return give_up(&cache_path, not_enough_space(out, total_size, available_free_space, total_size));
+     }
+ 
+     tx.send(ProgressEvent::UpdateRemaining {
+@@ -473,92 +692,191 @@
+     })
+     .await
+     .ok();
++    resilience::status("files");
+ 
++    let journal = Mutex::new(journal);
++    let failed = AtomicUsize::new(0);
++    let first_failure: Mutex<Option<XodusError>> = Mutex::new(None);
++    let no_room = AtomicBool::new(false);
+     let remote_xvd_ref = &remote_xvd;
+-    stream::iter(
+-        rfiles
+-            .iter()
+-            .filter(|(k, v1)| {
+-                if let Some(v2) = lfiles.get(*k) {
+-                    v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
++    stream::iter(to_do.into_iter().enumerate())
++        .for_each_concurrent(parallel.unwrap_or(4), |(id, (name, content))| {
++            let tx = tx.clone();
++            let journal = &journal;
++            let failed = &failed;
++            let first_failure = &first_failure;
++            let no_room = &no_room;
++            async move {
++                // a full disk stops the files not started: each would fail the same way
++                if no_room.load(Ordering::Relaxed) {
++                    return;
++                }
++                let shown = if name.len() > 30 {
++                    format!("...{}", &name[name.len() - 27..])
+                 } else {
+-                    true
++                    name.clone()
++                };
++                tx.send(ProgressEvent::Started {
++                    id,
++                    name: shown,
++                    total: content.length,
++                })
++                .await
++                .ok();
++
++                let target = out.join(name.replace("\\", "/"));
++                match fetch_file(client, remote_xvd_ref, mirrors, &target, &name, &content, *full_key, id, &tx).await {
++                    Ok(()) => {
++                        if let Some(journal) = journal.lock().unwrap().as_mut()
++                            && let Err(err) = journal.record(&name)
++                        {
++                            eprintln!("{name} is downloaded but could not be listed as done: {err}");
++                        }
++                    }
++                    Err(err) => {
++                        eprintln!("{err}");
++                        if err.kind == ErrorKind::NoSpace {
++                            no_room.store(true, Ordering::Relaxed);
++                        }
++                        failed.fetch_add(1, Ordering::Relaxed);
++                        first_failure.lock().unwrap().get_or_insert(err);
++                    }
+                 }
+-            })
+-            .map(|(n, v)| Job {
+-                name: n.clone(),
+-                content: SegmentFile {
+-                    offset: v.offset,
+-                    length: v.length,
+-                    data_hashs: vec![],
+-                    keep_encrypted: v.keep_encrypted,
+-                },
+-            })
+-            .enumerate(),
+-    )
+-    .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
+-        let tx = tx.clone();
+-        let client = client.clone();
+-        async move {
+-            let target_file = out.join(job.name.replace("\\", "/"));
+-            if let Some(folder) = target_file.parent() {
+-                std::fs::create_dir_all(folder).expect("ok");
++                tx.send(ProgressEvent::Finished { id }).await.ok();
+             }
+-            let mut fout = OpenOptions::new()
+-                .create(true)
+-                .write(true)
+-                .truncate(true)
+-                .open(target_file)
+-                .await
+-                .expect("ok");
+-            let mut lp = 0;
++        })
++        .await;
+ 
+-            let progress = |pos, _| {
+-                if tx
++    let failed = failed.into_inner();
++    if failed > 0 {
++        let first = first_failure
++            .into_inner()
++            .unwrap()
++            .unwrap_or_else(|| XodusError::new(ErrorKind::Network, "a file could not be downloaded"));
++        let err = if failed == 1 {
++            first
++        } else {
++            XodusError::new(
++                first.kind,
++                format!("{failed} files could not be downloaded. The first: {}", first.message),
++            )
++        };
++        return give_up(&cache_path, err);
++    }
++
++    resilience::status("finishing");
++    std::fs::remove_file(&final_path).ok();
++    if let Err(err) = std::fs::rename(&cache_path, &final_path) {
++        return Outcome::Failed(XodusError::new(
++            ErrorKind::Disk,
++            format!("The package's index could not be kept for updates: {err}"),
++        ));
++    }
++    // complete: the next update compares against the index just kept, not a list
++    std::fs::remove_file(&journal_path).ok();
++    Outcome::Downloaded
++}
++
++/// One file, tried up to FILE_ATTEMPTS times, each on the next mirror, with a pause in between. A file counts as done
++/// once written in full, synced to the disk and of its size.
++#[allow(clippy::too_many_arguments)]
++async fn fetch_file(
++    client: &reqwest::Client,
++    xvd: &XvdFile,
++    mirrors: &[String],
++    target: &PathBuf,
++    name: &str,
++    content: &SegmentFile,
++    full_key: [u8; 32],
++    id: usize,
++    tx: &Sender<ProgressEvent>,
++) -> Result<(), XodusError> {
++    let disk = |what: &str, err: std::io::Error| {
++        let message = format!("{name}: {what}: {err}");
++        XodusError::new(if is_no_space(&message) { ErrorKind::NoSpace } else { ErrorKind::Disk }, message)
++    };
++    if let Some(folder) = target.parent() {
++        std::fs::create_dir_all(folder).map_err(|err| disk("its folder could not be made", err))?;
++    }
++
++    // bytes already counted for this file: a retry does not count them again until it passes them
++    let mut reported = 0u64;
++    let mut last_error = String::new();
++    for attempt in 0..FILE_ATTEMPTS {
++        let url = &mirrors[attempt as usize % mirrors.len()];
++        let mut fout = OpenOptions::new()
++            .create(true)
++            .write(true)
++            .truncate(true)
++            .open(target)
++            .await
++            .map_err(|err| disk("it could not be opened for writing", err))?;
++        let progress = |pos: u64, _total: u64| {
++            if pos > reported
++                && tx
+                     .try_send(ProgressEvent::Advanced {
+                         id,
+-                        delta: pos - lp,
++                        delta: pos - reported,
+                     })
+                     .is_ok()
+-                {
+-                    lp = pos;
+-                }
+-            };
+-            let path = job.name.to_owned();
+-            let shown = if path.len() > 30 {
+-                format!("...{}", &path[path.len() - 27..])
+-            } else {
+-                path.clone()
+-            };
+-            tx.send(ProgressEvent::Started {
+-                id,
+-                name: shown,
+-                total: job.content.length,
+-            })
+-            .await
+-            .ok();
+-
+-            if let Some(fpath) = url.strip_prefix("file://") {
+-                let mut i = File::open(&fpath).await.unwrap();
+-                remote_xvd_ref
+-                    .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
++            {
++                reported = pos;
++            }
++        };
++        let result = if let Some(path) = url.strip_prefix("file://") {
++            match File::open(path).await {
++                Ok(mut source) => xvd
++                    .extract_file(&mut source, &mut fout, content, full_key, progress)
+                     .await
+-                    .expect("msg");
+-                tx.send(ProgressEvent::Finished { id }).await.ok();
+-            } else {
+-                remote_xvd_ref
+-                    .download_file_http(&client, url, &mut fout, &job.content, *full_key, progress)
++                    .map_err(|err| err.to_string()),
++                Err(err) => Err(err.to_string()),
++            }
++        } else {
++            xvd.download_file_http(client, url, &mut fout, content, full_key, progress)
++                .await
++                .map_err(|err| err.to_string())
++        };
++        match result {
++            Ok(()) => {
++                fout.flush().await.map_err(|err| disk("it could not be written", err))?;
++                fout.sync_all().await.map_err(|err| disk("it could not be synced to the disk", err))?;
++                let size = fout
++                    .metadata()
+                     .await
+-                    .expect("msg");
+-                tx.send(ProgressEvent::Finished { id }).await.ok();
++                    .map_err(|err| disk("its size could not be read", err))?
++                    .len();
++                if complete_size(size, content.length) {
++                    return Ok(());
++                }
++                last_error = format!("it has {size} bytes, not {}", content.length);
+             }
++            Err(message) if is_no_space(&message) => {
++                return Err(XodusError::new(
++                    ErrorKind::NoSpace,
++                    format!("No space left on the disk while writing {name}: free some space, then resume ({message})."),
++                ));
++            }
++            Err(message) => last_error = message,
+         }
+-    })
+-    .await;
++        if attempt + 1 < FILE_ATTEMPTS {
++            let pause = resilience::backoff(attempt, Duration::from_secs(2), Duration::from_secs(60));
++            eprintln!(
++                "{name}: {last_error}; trying again in {:.0} s, from {}",
++                pause.as_secs_f32(),
++                mirror_host(&mirrors[(attempt as usize + 1) % mirrors.len()])
++            );
++            tokio::time::sleep(pause).await;
++        }
++    }
++    Err(XodusError::new(
++        ErrorKind::Network,
++        format!("{name} could not be downloaded after {FILE_ATTEMPTS} tries: {last_error}"),
++    ))
++}
+ 
+-    std::fs::remove_file(&final_path).ok();
+-    std::fs::rename(&cache_path, &final_path).expect("ok");
+-    true
++/// The server's name, for the log.
++fn mirror_host(url: &str) -> &str {
++    url.split("://").nth(1).and_then(|rest| rest.split('/').next()).unwrap_or(url)
+ }
+ 
+ #[cfg(test)]
+@@ -586,21 +904,82 @@
+     }
+ 
+     #[test]
+-    fn giving_up_fails_and_removes_the_cached_index() {
+-        let dir = std::env::temp_dir().join(format!("xodus-give-up-{}", std::process::id()));
++    fn progress_lines_nothing_to_fetch() {
++        let mut lines = ProgressLines::default();
++        assert_eq!(lines.start(42, 0, Instant::now()), "progress 0 0");
++        assert_eq!(lines.finish(42), Some("progress 0 0".to_owned()));
++    }
++
++    fn temp_dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("xodus-{name}-{}", std::process::id()));
+         std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    #[test]
++    fn giving_up_fails_and_removes_the_cached_index() {
++        let dir = temp_dir("give-up");
+         let cache = dir.join(".xodus-streaming-tmp.msixvc");
+         std::fs::write(&cache, b"index").unwrap();
+-        assert!(!give_up(&cache), "a download given up is a failure");
++        assert!(matches!(
++            give_up(&cache, XodusError::new(ErrorKind::NoSpace, "no room")),
++            Outcome::Failed(err) if err.kind == ErrorKind::NoSpace
++        ));
+         assert!(!cache.exists(), "the run's cached index is removed");
+-        assert!(!give_up(&cache), "and nothing to remove is fine");
++        assert!(matches!(give_up(&cache, XodusError::new(ErrorKind::Other, "x")), Outcome::Failed(_)));
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ 
+     #[test]
+-    fn progress_lines_nothing_to_fetch() {
+-        let mut lines = ProgressLines::default();
+-        assert_eq!(lines.start(42, 0, Instant::now()), "progress 0 0");
+-        assert_eq!(lines.finish(42), Some("progress 0 0".to_owned()));
++    fn the_journal_resumes_the_same_package_only() {
++        let dir = temp_dir("journal");
++        let path = dir.join(JOURNAL);
++        assert!(Journal::read(&path, "abc 10").is_empty(), "no journal: nothing done");
++
++        let mut journal = Journal::start(&path, "abc 10", &["a.bin".to_string()]).unwrap();
++        journal.record("Content\\with space.pak").unwrap();
++        drop(journal);
++        assert_eq!(Journal::read(&path, "abc 10"), vec!["a.bin".to_string(), "Content\\with space.pak".to_string()]);
++        assert!(Journal::read(&path, "abc 11").is_empty(), "another package (an update) starts over");
++
++        // starting again keeps only what is still valid
++        Journal::start(&path, "abc 10", &["a.bin".to_string()]).unwrap();
++        assert_eq!(Journal::read(&path, "abc 10"), vec!["a.bin".to_string()]);
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    #[test]
++    fn mirrors_in_order_each_once() {
++        let roots = vec![
++            "http://assets1.xboxlive.com/".to_string(),
++            "http://assets2.xboxlive.com/".to_string(),
++            "http://assets1.xboxlive.com/".to_string(),
++        ];
++        assert_eq!(
++            mirrors_of(&roots, "Z/game.msixvc"),
++            vec!["http://assets1.xboxlive.com/Z/game.msixvc", "http://assets2.xboxlive.com/Z/game.msixvc"]
++        );
++        assert!(mirrors_of(&[], "x").is_empty());
++        assert_eq!(mirror_host("http://assets2.xboxlive.com/Z/game.msixvc"), "assets2.xboxlive.com");
++    }
++
++    #[test]
++    fn sizes_of_a_finished_file() {
++        assert!(complete_size(10, 10));
++        assert!(complete_size(4096, 10), "kept encrypted: whole pages");
++        assert!(complete_size(0, 0));
++        assert!(!complete_size(5, 10));
++        assert!(!complete_size(8192, 10));
++    }
++
++    #[test]
++    fn failures_have_the_right_kind() {
++        assert!(is_no_space("No space left on device (os error 28)"));
++        assert!(!is_no_space("connection reset"));
++        assert_eq!(index_error("read", "error sending request for url").kind, ErrorKind::Network);
++        assert_eq!(index_error("read", "bad XVD magic").kind, ErrorKind::Package);
++        let err = not_enough_space(Path::new("/x"), 5, 3, 5);
++        assert_eq!(err.kind, ErrorKind::NoSpace);
++        assert_eq!(err.message, "not enough free disk space on /x: need 5 bytes, have 3 bytes (files: 5)");
+     }
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus-cli/src/license.rs b/crates/xodus-cli/src/license.rs
+--- a/crates/xodus-cli/src/license.rs	2026-10-20 00:00:07
++++ b/crates/xodus-cli/src/license.rs	2026-11-21 21:08:44
+@@ -1,95 +1,183 @@
++use xodus::api::live::rst::RSTError;
++use xodus::licensing::content::LicenseContentError;
+ use xodus::licensing::splicense::{DeviceKey, SPLicense};
+ use xodus::models::live::ExchangeUserTokenOutcome;
+ use xodus::models::secrets::Token;
+ use xodus::models::soap;
+ use xodus::tokens::TokenManager;
+ 
++use crate::package::{device_error, device_token, refused, user_token};
++use crate::resilience::{self, ErrorKind, Verdict, XodusError};
++
++const HOSTING_APP: &str = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
++
++/// One attempt at the licence: an error, or a refusal a new device token may fix.
++enum Attempt {
++    Renew(String),
++    Final(XodusError),
++}
++
++fn rst_verdict(err: &RSTError) -> Verdict {
++    if err.is_network() { Verdict::Retry(None) } else { Verdict::GiveUp }
++}
++
++fn rst_failure(what: &str, err: RSTError) -> Attempt {
++    if err.is_network() {
++        Attempt::Final(XodusError::new(ErrorKind::Network, format!("{what}: Microsoft could not be reached: {err}")))
++    } else {
++        Attempt::Renew(format!("{what}: {err}"))
++    }
++}
++
++/// The game's licence and this Mac's device key. MetalHorizon: Microsoft's transient failures are tried again, a
++/// refusal renews the device token once and asks again, a licence that is not owned says so, and nothing in here
++/// panics any more (`xodus-cli run` asks for the licence at every Play).
+ pub async fn get_license(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+     content_id: String,
+     market: String,
+-) -> std::result::Result<(DeviceKey, SPLicense), String> {
+-    let dev_token = tokens.get_device_sts_token().unwrap();
+-    let Token::Legacy(dev_token) = dev_token else {
+-        return Err("Invalid STS token".to_string());
+-    };
+-    let user = tokens.get_user().unwrap();
+-    let user_token = tokens.get_user_sts_token().unwrap();
+-    let Token::Legacy(legacy) = user_token else {
+-        return Err("Unspported user token".to_string());
+-    };
++) -> std::result::Result<(DeviceKey, SPLicense), XodusError> {
++    let mut renewed = false;
++    loop {
++        match attempt(client, tokens, &content_id, &market).await {
++            Ok(license) => return Ok(license),
++            Err(Attempt::Final(err)) => return Err(err),
++            Err(Attempt::Renew(why)) if !renewed => {
++                eprintln!("Microsoft refused ({why}): renewing this Mac's device token and trying again");
++                renewed = true;
++                xodus::tokens::device::renew_device_token(client, tokens)
++                    .await
++                    .map_err(device_error)?;
++            }
++            Err(Attempt::Renew(why)) => return Err(refused(client, why).await),
++        }
++    }
++}
+ 
+-    let ms_device_token = xodus::api::live::exchange_device_token(
+-        client,
+-        dev_token.clone(),
+-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+-        "www.microsoft.com".to_owned(),
+-        Some(soap::PolicyReference::mbi_ssl()),
++async fn attempt(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    content_id: &str,
++    market: &str,
++) -> Result<(DeviceKey, SPLicense), Attempt> {
++    let dev_token = device_token(tokens).map_err(Attempt::Final)?;
++    let user = tokens
++        .get_user()
++        .map_err(|err| Attempt::Final(resilience::token_error(&err, "the saved Xbox account")))?;
++    let legacy = user_token(tokens).map_err(Attempt::Final)?;
++
++    let ms_device_token = resilience::retry(
++        "exchanging this Mac's token with Microsoft",
++        4,
++        || {
++            xodus::api::live::exchange_device_token(
++                client,
++                dev_token.clone(),
++                HOSTING_APP.to_string(),
++                "www.microsoft.com".to_owned(),
++                Some(soap::PolicyReference::mbi_ssl()),
++            )
++        },
++        rst_verdict,
+     )
+     .await
+-    .unwrap();
++    .map_err(|err| rst_failure("exchanging this Mac's token", err))?;
+ 
+-    let user_token = xodus::api::live::exchange_user_token(
+-        client,
+-        legacy,
+-        user.username,
+-        dev_token,
+-        None,
+-        Some("Silent".to_string()),
+-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+-        &[(
+-            "www.microsoft.com".to_owned(),
+-            Some(soap::PolicyReference::mbi_ssl()),
+-        )],
++    let scopes = [(
++        "www.microsoft.com".to_owned(),
++        Some(soap::PolicyReference::mbi_ssl()),
++    )];
++    let user_token = resilience::retry(
++        "exchanging the Xbox sign-in with Microsoft",
++        4,
++        || {
++            xodus::api::live::exchange_user_token(
++                client,
++                legacy.clone(),
++                user.username.clone(),
++                dev_token.clone(),
++                None,
++                Some("Silent".to_string()),
++                HOSTING_APP.to_string(),
++                &scopes,
++            )
++        },
++        rst_verdict,
+     )
+     .await
+-    .expect("Failed to get ms user token");
++    .map_err(|err| rst_failure("exchanging the Xbox sign-in", err))?;
+ 
+     let ms_device_token: Token = ms_device_token.into();
+     let Token::Compact(ms_device_token) = ms_device_token else {
+-        return Err("Unsupported token".to_string());
++        return Err(Attempt::Final(XodusError::new(ErrorKind::Other, "Unsupported token")));
+     };
+ 
+     let user_token: Token = match user_token {
+         ExchangeUserTokenOutcome::Fault(_) => {
+-            return Err("Failed to get exchange MS token".to_string());
++            return Err(Attempt::Renew("Microsoft refused the saved sign-in".to_string()));
+         }
+         ExchangeUserTokenOutcome::Issued(
+             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+-        ) => {
+-            let token = collection.security_tokens.remove(0);
+-            token.into()
+-        }
++        ) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0).into(),
+         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
+             token,
+         )) => (*token).into(),
+-        _ => unreachable!("Only responses are handled"),
++        ExchangeUserTokenOutcome::Issued(_) => {
++            return Err(Attempt::Final(XodusError::new(ErrorKind::Other, "Unsupported token")));
++        }
+     };
+     let Token::Compact(user_token) = user_token else {
+-        return Err("Unsupported token".to_string());
++        return Err(Attempt::Final(XodusError::new(ErrorKind::Other, "Unsupported token")));
+     };
+ 
+-    let (_content, game_license) = xodus::licensing::content::get_license_content(
+-        client,
+-        ms_device_token,
+-        user_token,
+-        user.puid,
+-        content_id,
+-        market,
++    let (_content, game_license) = resilience::retry(
++        "asking Microsoft for the game's licence",
++        5,
++        || {
++            xodus::licensing::content::get_license_content(
++                client,
++                ms_device_token.clone(),
++                user_token.clone(),
++                user.puid.clone(),
++                content_id.to_string(),
++                market.to_string(),
++            )
++        },
++        |err: &LicenseContentError| if err.is_network() { Verdict::Retry(None) } else { Verdict::GiveUp },
+     )
+     .await
+-    .map_err(|err| err.to_string())?;
++    .map_err(|err| match err {
++        LicenseContentError::NotEntitled { description } => Attempt::Final(XodusError::new(
++            ErrorKind::NotOwned,
++            format!(
++                "Microsoft gives no licence for the game to this account ({description}): it must own Forza Horizon \
++                 6, or have a Game Pass plan that includes it."
++            ),
++        )),
++        LicenseContentError::Request(ref request) if request.status().is_some_and(|s| s.as_u16() == 401) => {
++            Attempt::Renew(format!("the licence request: {err}"))
++        }
++        err if err.is_network() => Attempt::Final(XodusError::new(
++            ErrorKind::Network,
++            format!("Microsoft's licence service could not be reached: {err}"),
++        )),
++        err => Attempt::Final(XodusError::new(ErrorKind::Package, format!("The game's licence: {err}"))),
++    })?;
+ 
+-    let game_splicense = SPLicense::parse_base64(&game_license.splicense_block)
+-        .expect("could not parse base64 game SPLicense");
++    let game_splicense = SPLicense::parse_base64(&game_license.splicense_block).map_err(|err| {
++        Attempt::Final(XodusError::new(ErrorKind::Package, format!("The game's licence could not be read: {err:?}")))
++    })?;
+ 
+-    let dev_license = tokens.get_device_license().unwrap();
+-    let device_license = SPLicense::parse_base64(&dev_license.splicense)
+-        .expect("could not parse base64 device SPLicense");
++    let dev_license = tokens
++        .get_device_license()
++        .map_err(|err| Attempt::Final(resilience::token_error(&err, "this Mac's device licence")))?;
++    let device_license = SPLicense::parse_base64(&dev_license.splicense).map_err(|err| {
++        Attempt::Final(XodusError::new(ErrorKind::Other, format!("This Mac's device licence could not be read: {err:?}")))
++    })?;
+     let key = device_license
+         .encrypted_device_key
+-        .unwrap()
++        .ok_or_else(|| Attempt::Final(XodusError::new(ErrorKind::Other, "This Mac's device licence has no key")))?
+         .derive_device_key();
+     Ok((key, game_splicense))
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+--- a/crates/xodus-cli/src/main.rs	2026-10-20 14:33:41
++++ b/crates/xodus-cli/src/main.rs	2026-11-21 21:11:32
+@@ -9,6 +9,7 @@
+ mod commands;
+ mod license;
+ mod package;
++mod resilience;
+ mod webview;
+ 
+ #[derive(Subcommand)]
+@@ -145,11 +146,19 @@
+     {
+         registry.init();
+     }
++    // MetalHorizon: a connection that cannot be made in 20 s fails (and is tried again by the caller), TCP
++    // connections are kept alive through long downloads, idle ones are closed. No limit on a whole response, which
++    // would cut the game's big files.
+     let client = reqwest::ClientBuilder::new()
+         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
+         .connection_verbose(true)
++        .connect_timeout(std::time::Duration::from_secs(20))
++        // a server silent for a minute in the middle of an answer is a cut, reopened where it was
++        .read_timeout(std::time::Duration::from_secs(60))
++        .tcp_keepalive(std::time::Duration::from_secs(30))
++        .pool_idle_timeout(std::time::Duration::from_secs(90))
+         .build()
+-        .unwrap();
++        .expect("the HTTP client could not be made");
+     let login_app_mode = std::env::current_exe()
+         .ok()
+         .and_then(|path| path.file_name().map(|name| name == "xodus-login"))
+@@ -178,7 +187,36 @@
+             | SubCommand::Logout { .. }
+     );
+     if needs_device_credentials {
+-        xodus::tokens::device::ensure_device_credentials(&client, &tokens).await;
++        // MetalHorizon: the device token's expiry is checked (not only whether it is there), Microsoft's network
++        // failures are tried again, and a refused Keychain or no network is a clear error instead of a panic
++        if let Err(err) = xodus::tokens::device::ensure_device_credentials_checked(&client, &tokens).await {
++            let error = match &err {
++                xodus::tokens::device::DeviceError::Store(store) => {
++                    resilience::token_error(store, "this Mac's device identity")
++                }
++                xodus::tokens::device::DeviceError::Network(_) => {
++                    resilience::XodusError::new(resilience::ErrorKind::Network, err.to_string())
++                }
++                xodus::tokens::device::DeviceError::Refused(_) => {
++                    let note = resilience::clock_note(&client).await;
++                    match note {
++                        Some(note) => resilience::XodusError::new(resilience::ErrorKind::Clock, note),
++                        None => resilience::XodusError::new(resilience::ErrorKind::Other, err.to_string()),
++                    }
++                }
++            };
++            if matches!(args.command, SubCommand::Login) {
++                commands::login::publish_status(match error.kind {
++                    resilience::ErrorKind::Keychain => "keychain_denied",
++                    resilience::ErrorKind::Network => "network_error",
++                    resilience::ErrorKind::Clock => "clock_wrong",
++                    _ => "device_error",
++                });
++            }
++            error.report();
++            xodus::secrets::destroy_secrets();
++            return ExitCode::FAILURE;
++        }
+     }
+ 
+     let code = match args.command {
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus-cli/src/package.rs b/crates/xodus-cli/src/package.rs
+--- a/crates/xodus-cli/src/package.rs	2026-10-20 00:00:07
++++ b/crates/xodus-cli/src/package.rs	2026-11-21 21:00:59
+@@ -1,22 +1,43 @@
+ use inquire::Select;
+ use xodus::XBOX_LIVE_PACKAGES_PC;
+ use xodus::api::displaycatalog::find_products_by_id;
++use xodus::api::xbox::XboxAuthError;
+ use xodus::models::packagespc::{PackageDetails, PackageResponse};
+-use xodus::models::secrets::Token;
++use xodus::models::secrets::{LegacyToken, Token};
++use xodus::models::xbox::XstsResponse;
+ use xodus::tokens::TokenManager;
++use xodus::tokens::device::DeviceError;
+ 
++use crate::resilience::{self, ErrorKind, Verdict, XodusError};
++
+ pub async fn get_content_id(
+     client: &reqwest::Client,
+     product: String,
+     market: Option<String>,
+-) -> Result<String, Box<dyn std::error::Error>> {
+-    let displaycatalog = find_products_by_id(
+-        client,
+-        product,
+-        market.clone().unwrap_or("neutral".to_owned()),
+-        vec!["en".to_string(), "neutral".to_string()],
++) -> Result<String, XodusError> {
++    let market_name = market.clone().unwrap_or("neutral".to_owned());
++    // MetalHorizon: the catalog lookup is tried again on the network's and the servers' failures
++    let displaycatalog = resilience::retry(
++        "looking the game up in the Microsoft Store catalog",
++        5,
++        || {
++            find_products_by_id(
++                client,
++                product.clone(),
++                market_name.clone(),
++                vec!["en".to_string(), "neutral".to_string()],
++            )
++        },
++        resilience::verdict_for_reqwest,
+     )
+-    .await?;
++    .await
++    .map_err(|err| {
++        let kind = match resilience::verdict_for_reqwest(&err) {
++            Verdict::Retry(_) => ErrorKind::Network,
++            Verdict::GiveUp => ErrorKind::Package,
++        };
++        XodusError::new(kind, format!("The Microsoft Store catalog did not answer for {product}: {err}"))
++    })?;
+ 
+     let product_details = displaycatalog.product;
+ 
+@@ -55,61 +76,141 @@
+                 .with_page_size(30)
+                 .prompt()
+             else {
+-                return Err(Box::new(std::io::Error::other("Selection failed")));
++                return Err(XodusError::new(ErrorKind::Package, "Selection failed"));
+             };
+             return Box::pin(get_content_id(client, item, market)).await;
+         }
+ 
+-        return Err(Box::new(std::io::Error::other(
++        return Err(XodusError::new(
++            ErrorKind::Package,
+             "Windows.Desktop package not found, if you believe this is an error, please report it",
+-        )));
++        ));
+     };
+ 
+     let Some(content_id) = &package.content_id else {
+         tracing::error!("ContentId not found, if you believe this is an error, please report it");
+-        return Err(Box::new(std::io::Error::other(
++        return Err(XodusError::new(
++            ErrorKind::Package,
+             "ContentId not found, if you believe this is an error, please report it",
+-        )));
++        ));
+     };
+     Ok(content_id.to_owned())
+ }
+ 
++/// The device's STS token, as an error the app understands when the Keychain refuses or has none.
++pub fn device_token(tokens: &TokenManager) -> Result<LegacyToken, XodusError> {
++    match tokens.get_device_sts_token() {
++        Ok(Token::Legacy(token)) => Ok(token),
++        Ok(_) => Err(XodusError::new(ErrorKind::Other, "Invalid STS token")),
++        Err(err) => Err(resilience::token_error(&err, "this Mac's device token")),
++    }
++}
++
++/// The saved user's STS token.
++pub fn user_token(tokens: &TokenManager) -> Result<LegacyToken, XodusError> {
++    match tokens.get_user_sts_token() {
++        Ok(Token::Legacy(token)) => Ok(token),
++        Ok(_) => Err(XodusError::new(ErrorKind::SignedOut, "Unsupported user token: sign in with Microsoft again.")),
++        Err(err) => Err(resilience::token_error(&err, "the saved Xbox sign-in")),
++    }
++}
++
++/// A device that could not be made ready again, for the app.
++pub fn device_error(err: DeviceError) -> XodusError {
++    match &err {
++        DeviceError::Store(store) => resilience::token_error(store, "this Mac's device identity"),
++        DeviceError::Network(_) => XodusError::new(ErrorKind::Network, err.to_string()),
++        DeviceError::Refused(_) => XodusError::new(ErrorKind::Other, err.to_string()),
++    }
++}
++
++/// When Xbox or Microsoft refuse the saved sign-in for good: a wrong clock says so, else it is "sign in again".
++pub async fn refused(client: &reqwest::Client, why: impl std::fmt::Display) -> XodusError {
++    match resilience::clock_note(client).await {
++        Some(note) => XodusError::new(ErrorKind::Clock, note),
++        None => XodusError::new(
++            ErrorKind::SignedOut,
++            format!("Xbox no longer accepts the saved sign-in ({why}): sign in with Microsoft again."),
++        ),
++    }
++}
++
++/// An XSTS token for `relying_party`. The network's failures are tried again, and when Xbox refuses, the device
++/// token is renewed once and the whole exchange made again (MetalHorizon: before, the first refusal was a panic).
++pub async fn xsts_for(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    relying_party: &str,
++) -> Result<XstsResponse, XodusError> {
++    let mut renewed = false;
++    loop {
++        let device = device_token(tokens)?;
++        let user = user_token(tokens)?;
++        let attempt = resilience::retry(
++            "authenticating with Xbox",
++            4,
++            || xodus::api::xbox::run_checked(client, device.clone(), user.clone(), relying_party),
++            |err: &XboxAuthError| if err.is_network() { Verdict::Retry(None) } else { Verdict::GiveUp },
++        )
++        .await;
++        match attempt {
++            Ok(xsts) => return Ok(xsts),
++            Err(err) if err.may_need_new_device_token() && !renewed => {
++                eprintln!("Xbox refused ({err}): renewing this Mac's device token and trying again");
++                renewed = true;
++                xodus::tokens::device::renew_device_token(client, tokens)
++                    .await
++                    .map_err(device_error)?;
++            }
++            Err(err) if err.is_network() => {
++                return Err(XodusError::new(ErrorKind::Network, format!("Xbox could not be reached: {err}")));
++            }
++            Err(err) => return Err(refused(client, err).await),
++        }
++    }
++}
++
+ pub async fn get_packages(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+     content_id: String,
+-) -> Result<PackageDetails, Box<dyn std::error::Error>> {
+-    let dev_token = tokens.get_device_sts_token().unwrap();
+-    let Token::Legacy(dev_token) = dev_token else {
+-        return Err(Box::new(std::io::Error::other("Invalid STS token")));
+-    };
+-    let user_token = tokens.get_user_sts_token().unwrap();
+-    let Token::Legacy(legacy) = user_token else {
+-        return Err(Box::new(std::io::Error::other("Unsupported user token")));
+-    };
++) -> Result<PackageDetails, XodusError> {
++    let xsts = xsts_for(client, tokens, "http://update.xboxlive.com").await?;
++    let authorization = xodus::api::xbox::auth::try_xsts_auth_header(xsts).ok_or_else(|| {
++        XodusError::new(ErrorKind::SignedOut, "Xbox's token names no user: sign in with Microsoft again.")
++    })?;
+ 
+-    let xsts_token =
+-        xodus::api::xbox::run(client, dev_token, legacy, "http://update.xboxlive.com").await;
+-
+-    let response = client
+-        .get(format!(
+-            "{XBOX_LIVE_PACKAGES_PC}/GetBasePackage/{content_id}"
+-        ))
+-        .header("x-xbl-contract-version", "3")
+-        .header(
+-            "Authorization",
+-            xodus::api::xbox::get_xsts_auth_header(xsts_token),
+-        )
+-        .send()
++    // MetalHorizon: tried again on the network's and the servers' failures, its status checked, and an answer that
++    // is not the expected JSON is an error instead of a panic
++    let response = resilience::send("asking Xbox for the game's package", 5, || {
++        client
++            .get(format!("{XBOX_LIVE_PACKAGES_PC}/GetBasePackage/{content_id}"))
++            .header("x-xbl-contract-version", "3")
++            .header("Authorization", authorization.clone())
++    })
++    .await
++    .map_err(|failure| match failure.status {
++        Some(404) => XodusError::new(
++            ErrorKind::NotOwned,
++            "Xbox has no package of the game for this account: the Microsoft account signed in must own Forza \
++             Horizon 6, or have a Game Pass plan that includes it.",
++        ),
++        _ => XodusError::new(failure.kind(), format!("Xbox did not give the game's package: {failure}")),
++    })?;
++    let text = response
++        .text()
+         .await
+-        .unwrap();
++        .map_err(|err| XodusError::new(ErrorKind::Network, format!("Xbox's answer about the package was cut: {err}")))?;
++    let res: PackageResponse = serde_json::from_str(&text).map_err(|err| {
++        XodusError::new(ErrorKind::Package, format!("Xbox's answer about the package could not be read: {err}"))
++    })?;
+ 
+-    let res: PackageResponse = response.json().await.expect("Failed to get data");
+-
+     let PackageResponse::Found(package) = res else {
+-        return Err(Box::new(std::io::Error::other(
+-            "Package was not found, is it owned by the user?",
+-        )));
++        return Err(XodusError::new(
++            ErrorKind::NotOwned,
++            "Package was not found, is it owned by the user? The Microsoft account signed in must own Forza Horizon \
++             6, or have a Game Pass plan that includes it.",
++        ));
+     };
+     Ok(package)
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/xodus-cli/src/resilience.rs b/crates/xodus-cli/src/resilience.rs
+--- a/crates/xodus-cli/src/resilience.rs	1970-01-01 01:00:00
++++ b/crates/xodus-cli/src/resilience.rs	2026-11-21 21:09:52
+@@ -0,0 +1,507 @@
++//! MetalHorizon: what xodus-cli does when the network, Microsoft, the Keychain or the disk misbehave
++//! (docs/XODUS-ROBUSTNESS.md in MetalHorizon). Before, each of these ended in a panic or in a loop with no end.
++
++use std::fmt;
++use std::future::Future;
++use std::io::Write;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use xodus::tokens::store::TokenStoreError;
++
++/// Why xodus-cli failed, as one word MetalHorizon reads on an `error <kind> <message>` line.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ErrorKind {
++    /// The disk has not enough room.
++    NoSpace,
++    /// The account does not own the game.
++    NotOwned,
++    /// No sign-in is saved, or Xbox no longer accepts it.
++    SignedOut,
++    /// macOS's Keychain did not let xodus read or save the sign-in.
++    Keychain,
++    /// Microsoft or the CDN could not be reached, or kept failing.
++    Network,
++    /// A folder or a file could not be made or written.
++    Disk,
++    /// The package or its licence was not what xodus expected.
++    Package,
++    /// The Mac's clock is off: Microsoft refuses its tickets.
++    Clock,
++    Other,
++}
++
++impl ErrorKind {
++    pub fn word(self) -> &'static str {
++        match self {
++            ErrorKind::NoSpace => "no-space",
++            ErrorKind::NotOwned => "not-owned",
++            ErrorKind::SignedOut => "signed-out",
++            ErrorKind::Keychain => "keychain",
++            ErrorKind::Network => "network",
++            ErrorKind::Disk => "disk",
++            ErrorKind::Package => "package",
++            ErrorKind::Clock => "clock",
++            ErrorKind::Other => "other",
++        }
++    }
++}
++
++/// An error with its kind: printed for people on stderr, and as an `error` line for MetalHorizon.
++#[derive(Debug, Clone)]
++pub struct XodusError {
++    pub kind: ErrorKind,
++    pub message: String,
++}
++
++impl XodusError {
++    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
++        Self {
++            kind,
++            message: message.into(),
++        }
++    }
++
++    /// What MetalHorizon reads: `error <kind> <message on one line>`.
++    pub fn line(&self) -> String {
++        format!("error {} {}", self.kind.word(), one_line(&self.message))
++    }
++
++    /// Printed once, where the run gives up.
++    pub fn report(&self) {
++        eprintln!("{}", self.message);
++        machine_line(&self.line());
++    }
++}
++
++impl fmt::Display for XodusError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.message)
++    }
++}
++
++impl std::error::Error for XodusError {}
++
++fn one_line(text: &str) -> String {
++    text.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++// ---- lines for MetalHorizon ---------------------------------------------------------------------------------------
++
++/// MetalHorizon asks for its lines with XODUS_PROGRESS=lines; a terminal gets none of them.
++pub fn machine_lines_enabled() -> bool {
++    std::env::var("XODUS_PROGRESS").is_ok_and(|v| v == "lines")
++}
++
++/// One line on stdout, flushed at once (the app reads the log while xodus runs).
++pub fn machine_line(line: &str) {
++    if !machine_lines_enabled() {
++        return;
++    }
++    let mut out = std::io::stdout().lock();
++    writeln!(out, "{line}").ok();
++    out.flush().ok();
++}
++
++/// `status <phase>`: the step the download is at (index, licence, files, finishing, paused).
++pub fn status(phase: &str) {
++    machine_line(&format!("status {phase}"));
++}
++
++// ---- transient or final -----------------------------------------------------------------------------------------
++
++/// Whether a failure is worth another try, and after how long when the server said so.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Verdict {
++    Retry(Option<Duration>),
++    GiveUp,
++}
++
++/// 408, 425, 429 and the 5xx may pass; 400, 401, 403 and 404 will answer the same again.
++pub fn verdict_for_status(status: u16, retry_after: Option<Duration>) -> Verdict {
++    match status {
++        408 | 425 | 429 | 500..=599 => Verdict::Retry(retry_after),
++        _ => Verdict::GiveUp,
++    }
++}
++
++/// A connection that failed or timed out, or a body cut short, may pass; an answer that does not decode will not.
++pub fn verdict_for_reqwest(err: &reqwest::Error) -> Verdict {
++    if let Some(status) = err.status() {
++        return verdict_for_status(status.as_u16(), None);
++    }
++    if err.is_decode() || err.is_builder() || err.is_redirect() {
++        return Verdict::GiveUp;
++    }
++    Verdict::Retry(None)
++}
++
++/// The pause before the next try: `base` doubled at each failure, at most `cap`, less up to a quarter at random so
++/// that retries do not all land together. `jitter` is in 0..1.
++pub fn backoff_with(failures: u32, base: Duration, cap: Duration, jitter: f64) -> Duration {
++    let factor = 2u32.saturating_pow(failures.min(20));
++    let pause = base.saturating_mul(factor).min(cap);
++    pause.mul_f64(1.0 - 0.25 * jitter.clamp(0.0, 1.0))
++}
++
++pub fn backoff(failures: u32, base: Duration, cap: Duration) -> Duration {
++    backoff_with(failures, base, cap, pseudo_random())
++}
++
++fn pseudo_random() -> f64 {
++    let nanos = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.subsec_nanos())
++        .unwrap_or(0);
++    // a few rounds of xorshift on the clock's nanoseconds: enough to spread retries, nothing secret depends on it
++    let mut x = (nanos as u64) ^ 0x9E37_79B9_7F4A_7C15;
++    x ^= x << 13;
++    x ^= x >> 7;
++    x ^= x << 17;
++    (x % 10_000) as f64 / 10_000.0
++}
++
++/// `Retry-After`: seconds, or an HTTP date. At most 5 minutes: a server asking for more is answered by the app's
++/// own resume later.
++pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
++    let value = value.trim();
++    let cap = Duration::from_secs(300);
++    if let Ok(seconds) = value.parse::<u64>() {
++        return Some(Duration::from_secs(seconds).min(cap));
++    }
++    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
++    let then = UNIX_EPOCH + Duration::from_secs(date.timestamp().max(0) as u64);
++    Some(then.duration_since(now).unwrap_or(Duration::ZERO).min(cap))
++}
++
++fn retry_after_header(response: &reqwest::Response) -> Option<Duration> {
++    response
++        .headers()
++        .get(reqwest::header::RETRY_AFTER)
++        .and_then(|value| value.to_str().ok())
++        .and_then(|value| parse_retry_after(value, SystemTime::now()))
++}
++
++/// Runs `op` until it succeeds, `judge` says the failure is final, or `attempts` tries are spent. Each failure that
++/// is tried again is written on stderr with the pause, so the log shows what happened.
++pub async fn retry<T, E, F, Fut>(
++    what: &str,
++    attempts: u32,
++    mut op: F,
++    judge: impl Fn(&E) -> Verdict,
++) -> Result<T, E>
++where
++    F: FnMut() -> Fut,
++    Fut: Future<Output = Result<T, E>>,
++    E: fmt::Display,
++{
++    let mut failures = 0u32;
++    loop {
++        match op().await {
++            Ok(value) => return Ok(value),
++            Err(err) => {
++                failures += 1;
++                match judge(&err) {
++                    Verdict::Retry(after) if failures < attempts => {
++                        let pause = after.unwrap_or_else(|| {
++                            backoff(failures - 1, Duration::from_secs(1), Duration::from_secs(60))
++                        });
++                        eprintln!(
++                            "{what}: {err}; trying again in {:.1} s ({failures}/{attempts})",
++                            pause.as_secs_f32()
++                        );
++                        tokio::time::sleep(pause).await;
++                    }
++                    _ => return Err(err),
++                }
++            }
++        }
++    }
++}
++
++/// A request that did not give a success: its status when there was an answer, and the pause the server asked for.
++#[derive(Debug)]
++pub struct HttpFailure {
++    pub status: Option<u16>,
++    pub retry_after: Option<Duration>,
++    pub message: String,
++}
++
++impl fmt::Display for HttpFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.message)
++    }
++}
++
++impl HttpFailure {
++    pub fn verdict(&self) -> Verdict {
++        match self.status {
++            Some(status) => verdict_for_status(status, self.retry_after),
++            None => Verdict::Retry(None),
++        }
++    }
++
++    /// The kind for a request to Microsoft that failed for good.
++    pub fn kind(&self) -> ErrorKind {
++        match self.status {
++            None => ErrorKind::Network,
++            Some(401) | Some(403) => ErrorKind::SignedOut,
++            Some(status) if verdict_for_status(status, None) != Verdict::GiveUp => ErrorKind::Network,
++            Some(_) => ErrorKind::Package,
++        }
++    }
++}
++
++/// Sends the request `build` makes until it answers with a success (retrying the transient failures, with the
++/// server's Retry-After when it gives one).
++pub async fn send(
++    what: &str,
++    attempts: u32,
++    build: impl Fn() -> reqwest::RequestBuilder,
++) -> Result<reqwest::Response, HttpFailure> {
++    retry(
++        what,
++        attempts,
++        || async {
++            let response = build().send().await.map_err(|err| HttpFailure {
++                status: err.status().map(|s| s.as_u16()),
++                retry_after: None,
++                message: format!("{what}: {err}"),
++            })?;
++            let status = response.status();
++            if status.is_success() {
++                Ok(response)
++            } else {
++                Err(HttpFailure {
++                    status: Some(status.as_u16()),
++                    retry_after: retry_after_header(&response),
++                    message: format!("{what}: HTTP {status}"),
++                })
++            }
++        },
++        |failure: &HttpFailure| failure.verdict(),
++    )
++    .await
++}
++
++// ---- the Keychain and the saved sign-in ---------------------------------------------------------------------
++
++/// A failure to read the saved sign-in: no entry is "signed out", a refused Keychain is "keychain".
++pub fn token_error(err: &TokenStoreError, what: &str) -> XodusError {
++    match err {
++        TokenStoreError::NotFound => XodusError::new(
++            ErrorKind::SignedOut,
++            format!("No Xbox sign-in is saved ({what}): sign in with Microsoft first."),
++        ),
++        TokenStoreError::Keychain(err) => XodusError::new(
++            ErrorKind::Keychain,
++            format!(
++                "macOS's Keychain did not let xodus use the Xbox sign-in ({what}: {err}). When macOS asks about the \
++                 \"Xodus Service\" item, choose Always Allow, then try again."
++            ),
++        ),
++        TokenStoreError::Serde(err) => XodusError::new(
++            ErrorKind::SignedOut,
++            format!("The saved Xbox sign-in could not be read ({what}: {err}): sign in with Microsoft again."),
++        ),
++        TokenStoreError::Io(err) => XodusError::new(
++            ErrorKind::Keychain,
++            format!("The saved Xbox sign-in could not be read ({what}: {err})."),
++        ),
++    }
++}
++
++// ---- the clock ----------------------------------------------------------------------------------------------------
++
++/// How far the Mac's clock is from a server's `Date` header, in seconds (positive: the Mac is ahead).
++pub fn clock_skew(date_header: &str, now: SystemTime) -> Option<i64> {
++    let server = chrono::DateTime::parse_from_rfc2822(date_header.trim()).ok()?;
++    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
++    Some(now - server.timestamp())
++}
++
++/// When Microsoft refuses a ticket, a clock more than 5 minutes off is the usual cause: this says so, or None.
++pub async fn clock_note(client: &reqwest::Client) -> Option<String> {
++    let response = client
++        .head("https://licensing.mp.microsoft.com/")
++        .timeout(Duration::from_secs(10))
++        .send()
++        .await
++        .ok()?;
++    let date = response.headers().get(reqwest::header::DATE)?.to_str().ok()?;
++    let skew = clock_skew(date, SystemTime::now())?;
++    (skew.abs() > 300).then(|| {
++        format!(
++            "This Mac's clock is {} minutes {} Microsoft's: turn on Set time and date automatically in System \
++             Settings › General › Date & Time, then try again.",
++            skew.abs() / 60,
++            if skew > 0 { "ahead of" } else { "behind" }
++        )
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn statuses_worth_another_try() {
++        for status in [408, 425, 429, 500, 502, 503, 504] {
++            assert_eq!(verdict_for_status(status, None), Verdict::Retry(None), "{status}");
++        }
++        for status in [400, 401, 403, 404, 410] {
++            assert_eq!(verdict_for_status(status, None), Verdict::GiveUp, "{status}");
++        }
++        let after = Some(Duration::from_secs(7));
++        assert_eq!(verdict_for_status(429, after), Verdict::Retry(after));
++    }
++
++    #[test]
++    fn backoff_doubles_up_to_its_cap() {
++        let base = Duration::from_secs(1);
++        let cap = Duration::from_secs(60);
++        assert_eq!(backoff_with(0, base, cap, 0.0), Duration::from_secs(1));
++        assert_eq!(backoff_with(1, base, cap, 0.0), Duration::from_secs(2));
++        assert_eq!(backoff_with(5, base, cap, 0.0), Duration::from_secs(32));
++        assert_eq!(backoff_with(6, base, cap, 0.0), cap);
++        assert_eq!(backoff_with(40, base, cap, 0.0), cap, "no overflow");
++        // the random part takes at most a quarter off
++        assert_eq!(backoff_with(2, base, cap, 1.0), Duration::from_secs(3));
++        let any = backoff(3, base, cap);
++        assert!(any >= Duration::from_secs(6) && any <= Duration::from_secs(8));
++    }
++
++    #[test]
++    fn retry_after_in_seconds_or_as_a_date() {
++        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
++        assert_eq!(parse_retry_after("12", now), Some(Duration::from_secs(12)));
++        assert_eq!(parse_retry_after(" 4000 ", now), Some(Duration::from_secs(300)), "capped");
++        let in_a_minute = chrono::DateTime::from_timestamp(1_700_000_060, 0).unwrap().to_rfc2822();
++        assert_eq!(parse_retry_after(&in_a_minute, now), Some(Duration::from_secs(60)));
++        assert_eq!(parse_retry_after("soon", now), None);
++    }
++
++    #[test]
++    fn clock_skew_from_a_date_header() {
++        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_600);
++        let server = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap().to_rfc2822();
++        assert_eq!(clock_skew(&server, now), Some(600));
++        assert_eq!(clock_skew("Sun, 06 Nov 1994 08:49:37 GMT", UNIX_EPOCH + Duration::from_secs(784_111_777)), Some(0));
++        assert_eq!(clock_skew("yesterday", now), None);
++    }
++
++    #[test]
++    fn error_lines_for_the_app() {
++        let err = XodusError::new(ErrorKind::NoSpace, "not enough free disk space on /x:\n need 5 bytes");
++        assert_eq!(err.line(), "error no-space not enough free disk space on /x: need 5 bytes");
++        assert_eq!(err.to_string(), "not enough free disk space on /x:\n need 5 bytes");
++        assert_eq!(ErrorKind::SignedOut.word(), "signed-out");
++    }
++
++    #[test]
++    fn keychain_and_missing_sign_in() {
++        assert_eq!(token_error(&TokenStoreError::NotFound, "user token").kind, ErrorKind::SignedOut);
++        let io = std::io::Error::other("denied");
++        assert_eq!(token_error(&TokenStoreError::Io(io), "user token").kind, ErrorKind::Keychain);
++    }
++
++    #[test]
++    fn http_failures_have_a_kind() {
++        let failure = |status| HttpFailure { status, retry_after: None, message: String::new() };
++        assert_eq!(failure(None).kind(), ErrorKind::Network);
++        assert_eq!(failure(Some(503)).kind(), ErrorKind::Network);
++        assert_eq!(failure(Some(401)).kind(), ErrorKind::SignedOut);
++        assert_eq!(failure(Some(404)).kind(), ErrorKind::Package);
++        assert_eq!(failure(None).verdict(), Verdict::Retry(None));
++    }
++
++    /// A server on 127.0.0.1 answering each connection with the next of `answers` (raw HTTP), then closing.
++    fn local_server(answers: Vec<&'static str>) -> (String, std::thread::JoinHandle<usize>) {
++        use std::io::{Read, Write};
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let url = format!("http://{}/", listener.local_addr().unwrap());
++        let handle = std::thread::spawn(move || {
++            let mut served = 0;
++            for answer in answers {
++                let (mut stream, _) = listener.accept().unwrap();
++                let mut request = [0u8; 4096];
++                let _ = stream.read(&mut request);
++                stream.write_all(answer.as_bytes()).unwrap();
++                served += 1;
++            }
++            served
++        });
++        (url, handle)
++    }
++
++    #[tokio::test]
++    async fn send_waits_as_the_server_asks_then_succeeds() {
++        let (url, server) = local_server(vec![
++            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
++            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
++            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
++        ]);
++        let client = reqwest::Client::new();
++        let started = std::time::Instant::now();
++        let response = send("test", 5, || client.get(&url)).await.expect("the third answer is a success");
++        assert_eq!(response.text().await.unwrap(), "ok");
++        assert!(started.elapsed() >= Duration::from_millis(900), "Retry-After: 1 was respected");
++        assert_eq!(server.join().unwrap(), 3);
++    }
++
++    #[tokio::test]
++    async fn send_gives_up_at_once_on_a_final_status() {
++        let (url, server) = local_server(vec![
++            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
++        ]);
++        let client = reqwest::Client::new();
++        let failure = send("test", 5, || client.get(&url)).await.expect_err("404 is final");
++        assert_eq!(failure.status, Some(404));
++        assert_eq!(failure.kind(), ErrorKind::Package);
++        assert_eq!(server.join().unwrap(), 1, "not asked again");
++    }
++
++    #[tokio::test]
++    async fn retry_stops_on_success_or_on_a_final_failure() {
++        let mut calls = 0;
++        let result: Result<u32, String> = retry(
++            "test",
++            5,
++            || {
++                calls += 1;
++                let n = calls;
++                async move { if n < 3 { Err(format!("try {n}")) } else { Ok(n) } }
++            },
++            |_| Verdict::Retry(Some(Duration::from_millis(1))),
++        )
++        .await;
++        assert_eq!(result, Ok(3));
++
++        let mut calls = 0;
++        let result: Result<u32, String> = retry(
++            "test",
++            5,
++            || {
++                calls += 1;
++                async { Err("refused".to_string()) }
++            },
++            |_| Verdict::GiveUp,
++        )
++        .await;
++        assert_eq!(result, Err("refused".to_string()));
++        assert_eq!(calls, 1, "a final failure is not tried again");
++
++        let mut calls = 0;
++        let result: Result<u32, String> = retry(
++            "test",
++            3,
++            || {
++                calls += 1;
++                async { Err("down".to_string()) }
++            },
++            |_| Verdict::Retry(Some(Duration::from_millis(1))),
++        )
++        .await;
++        assert!(result.is_err());
++        assert_eq!(calls, 3, "at most the attempts asked for");
++    }
++}
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/msixvc/src/streaming.rs b/crates/msixvc/src/streaming.rs
+--- a/crates/msixvc/src/streaming.rs	2026-10-20 00:00:07
++++ b/crates/msixvc/src/streaming.rs	2026-11-21 21:10:06
+@@ -48,7 +48,7 @@
+         Progress: FnMut(u64, u64) + Send + 't,
+     {
+         let url = url.into();
+-        let initial = open_http_stream(client.clone(), url.clone(), None).await?;
++        let initial = open_http_stream_retrying(client.clone(), url.clone(), None).await?;
+ 
+         Ok(Self {
+             client,
+@@ -80,7 +80,7 @@
+         let url = self.url.clone();
+         let range_start = if start == 0 { None } else { Some(start) };
+         self.pending_open = Some(Box::pin(async move {
+-            open_http_stream(client, url, range_start).await
++            open_http_stream_retrying(client, url, range_start).await
+         }));
+     }
+ 
+@@ -563,6 +563,36 @@
+     }
+ }
+ 
++/// Tries to open (or reopen after a cut) the package over HTTP.
++const OPEN_ATTEMPTS: u32 = 6;
++
++/// MetalHorizon: opening the package, or reopening it where a cut left it, is tried again with a pause that doubles
++/// from 1 s to 30 s (six tries, about a minute), instead of the first failure ending the whole download.
++async fn open_http_stream_retrying(
++    client: reqwest::Client,
++    url: String,
++    start: Option<u64>,
++) -> std::io::Result<OpenedHttpStream> {
++    let mut pause = std::time::Duration::from_secs(1);
++    let mut attempt = 1;
++    loop {
++        match open_http_stream(client.clone(), url.clone(), start).await {
++            Ok(opened) => return Ok(opened),
++            Err(err) if attempt < OPEN_ATTEMPTS => {
++                eprintln!(
++                    "opening the package at byte {}: {err}; trying again in {} s ({attempt}/{OPEN_ATTEMPTS})",
++                    start.unwrap_or(0),
++                    pause.as_secs()
++                );
++                tokio::time::sleep(pause).await;
++                pause = (pause * 2).min(std::time::Duration::from_secs(30));
++                attempt += 1;
++            }
++            Err(err) => return Err(err),
++        }
++    }
++}
++
+ async fn open_http_stream(
+     client: reqwest::Client,
+     url: String,
+@@ -902,5 +932,35 @@
+         let err = file.read_exact(&mut buf).await.unwrap_err();
+         assert!(err.to_string().contains("range resume mismatch"));
+         let _ = std::fs::remove_file(cache);
++    }
++}
++
++#[cfg(test)]
++mod reopen_tests {
++    use super::*;
++
++    /// MetalHorizon: a connection dropped while opening the package is tried again instead of ending the download.
++    #[tokio::test]
++    async fn opening_the_package_is_tried_again() {
++        use std::io::{Read, Write};
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let url = format!("http://{}/package.msixvc", listener.local_addr().unwrap());
++        let server = std::thread::spawn(move || {
++            // first: the connection is dropped without an answer
++            let (stream, _) = listener.accept().unwrap();
++            drop(stream);
++            // then: the package (4 bytes)
++            let (mut stream, _) = listener.accept().unwrap();
++            let mut request = [0u8; 4096];
++            let _ = stream.read(&mut request);
++            stream
++                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nXVD!")
++                .unwrap();
++        });
++        let file = HttpRead::open(reqwest::Client::new(), url, None::<fn(u64, u64)>)
++            .await
++            .expect("opened on the second try");
++        assert_eq!(file.len(), 4);
++        server.join().unwrap();
+     }
+ }
+diff -ruN -x target -x *.bak -x .DS_Store a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+--- a/crates/msixvc/src/xvd.rs	2026-10-20 00:00:07
++++ b/crates/msixvc/src/xvd.rs	2026-11-21 21:07:35
+@@ -29,6 +29,30 @@
+ };
+ use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+ 
++/// MetalHorizon: a file whose server sends nothing for this long fails (it is tried again on another mirror).
++const NO_DATA_LIMIT: tokio::time::Duration = tokio::time::Duration::from_secs(600);
++/// Tries to write a page before the error (a full disk) goes up.
++const WRITE_ATTEMPTS: u32 = 3;
++
++/// The pause before asking the server again after `failures` failures in a row: 0.5 s, doubling, at most 30 s.
++fn retry_pause(failures: u32) -> tokio::time::Duration {
++    let millis = 500u64.saturating_mul(1u64 << failures.min(10));
++    tokio::time::Duration::from_millis(millis.min(30_000))
++}
++
++#[cfg(test)]
++mod retry_pause_tests {
++    #[test]
++    fn the_pause_grows_to_thirty_seconds() {
++        let ms = |n| super::retry_pause(n).as_millis();
++        assert_eq!(ms(0), 500);
++        assert_eq!(ms(1), 1_000);
++        assert_eq!(ms(5), 16_000);
++        assert_eq!(ms(6), 30_000);
++        assert_eq!(ms(500), 30_000, "no overflow");
++    }
++}
++
+ pub struct SyncSubstream<R> {
+     inner: R,
+     start: u64,
+@@ -784,6 +808,11 @@
+         let mut stream = None;
+         let mut pending = bytes::BytesMut::new();
+         let mut v: u64 = 0;
++        // MetalHorizon: failures in a row since the last data, and when data last came. Offline, the requests used
++        // to be made again at once, forever (a busy loop); now the pause grows to 30 s, and after NO_DATA_LIMIT
++        // without a byte the file fails, for the caller to try it again on another mirror.
++        let mut failures: u32 = 0;
++        let mut last_data = tokio::time::Instant::now();
+ 
+         let stall_timeout = tokio::time::Duration::from_secs(5);
+         if let Ok(Ok(Ok(response))) = timeout(
+@@ -818,8 +847,25 @@
+             let data;
+             if let Ok(Some(Ok(b))) = next {
+                 data = b;
++                failures = 0;
++                last_data = tokio::time::Instant::now();
+             } else {
+                 // error
++                failures += 1;
++                if last_data.elapsed() > NO_DATA_LIMIT {
++                    return Err(Box::new(io::Error::new(
++                        io::ErrorKind::TimedOut,
++                        format!(
++                            "no data for {} minutes ({} of {} bytes received)",
++                            NO_DATA_LIMIT.as_secs() / 60,
++                            v.min(sfile.length),
++                            sfile.length
++                        ),
++                    )));
++                }
++                if failures > 1 {
++                    sleep(retry_pause(failures - 1)).await;
++                }
+                 if let Ok(Ok(Ok(response))) = timeout(
+                     stall_timeout,
+                     client
+@@ -886,9 +932,15 @@
+                 } else {
+                     to_write_remaining
+                 };
++                // MetalHorizon: a full disk used to be written to again every 30 s, forever; three tries leave time
++                // to free some room, then the error goes up (the caller sees "No space left on device")
++                let mut write_failures = 0;
+                 while let Err(err) = out.write_all(&page[..to_write]).await {
++                    write_failures += 1;
++                    if write_failures >= WRITE_ATTEMPTS {
++                        return Err(Box::new(err));
++                    }
+                     eprintln!("Error write file {} waiting 30s", err);
+-                    println!("Error write file {} waiting 30s", err);
+                     sleep(tokio::time::Duration::from_secs(30)).await;
+                 }
+                 remaining -= to_write_remaining as u64;

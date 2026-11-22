@@ -70,6 +70,38 @@ actor FrameInterpolator {
         transfer = nil
     }
 
+    /// Whether the model takes this size: frames of its own pools are interpolated until one comes back (about
+    /// 0.1 s where it does) or `timeout` passes (it never does at a size it does not take). Nothing is shown meanwhile.
+    func warmUp(timeout: TimeInterval) async -> Bool {
+        guard started else { return false }
+        let start = Date()
+        var tick: Int64 = 0
+        while Date().timeIntervalSince(start) < timeout {
+            tick += 4
+            guard let a = try? Self.buffer(sourcePool), let b = try? Self.buffer(sourcePool),
+                  let earlier = VTFrameProcessorFrame(buffer: a, presentationTimeStamp: CMTime(value: tick, timescale: 600)),
+                  let source = VTFrameProcessorFrame(buffer: b, presentationTimeStamp: CMTime(value: tick + 4, timescale: 600))
+            else { return false }
+            var destinations: [VTFrameProcessorFrame] = []
+            for (i, _) in phases.enumerated() {
+                guard let out = try? Self.buffer(destinationPool),
+                      let frame = VTFrameProcessorFrame(buffer: out, presentationTimeStamp: CMTime(value: tick + 1 + Int64(i), timescale: 600))
+                else { return false }
+                destinations.append(frame)
+            }
+            guard let parameters = VTLowLatencyFrameInterpolationParameters(
+                sourceFrame: source, previousFrame: earlier, interpolationPhase: phases, destinationFrames: destinations)
+            else { return false }
+            do {
+                for try await _ in processor.process(parameters: parameters) { ready = true }
+                if ready { return true }
+            } catch {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        return false
+    }
+
     /// The frames to show between the previous frame and this one, in order (empty for the first frame, while the
     /// model loads, and once it has failed to load). The caller shows them, then the frame itself.
     func interpolate(_ frame: CVPixelBuffer, at time: CMTime) async throws -> [CVPixelBuffer] {

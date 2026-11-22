@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import QuartzCore
 import CoreMedia
 import CoreVideo
 
@@ -81,6 +82,14 @@ final class FrameOverlay {
         let level = NSWindow.Level(rawValue: max(info.level + 1, NSWindow.Level.floating.rawValue))
         if panel.level != level { panel.level = level }
         if panel.frame != info.frame { panel.setFrame(info.frame, display: false) }
+        // the video layer follows the window's size itself: a sublayer is not resized with its view (MetalHorizon
+        // 2.1.0 drew the game in a 640×360 corner of the overlay, issue #15)
+        if let layer, let bounds = panel.contentView?.bounds, layer.frame != bounds {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.frame = bounds
+            CATransaction.commit()
+        }
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 

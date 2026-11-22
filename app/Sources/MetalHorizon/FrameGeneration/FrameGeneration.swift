@@ -55,7 +55,11 @@ final class FrameGeneration: ObservableObject {
         guard #available(macOS 26.0, *) else { return }
         active = true
         status = "Waiting for the game's window…"
-        let pipeline = FrameGenerationPipeline(settings: settings) { [weak self] text in self?.status = text }
+        FrameGenerationLog.write("started: \(settings.mode.rawValue), quality \(settings.quality.rawValue)")
+        let pipeline = FrameGenerationPipeline(settings: settings) { [weak self] text in
+            if self?.status != text, !text.contains(" fps") { FrameGenerationLog.write(text) }
+            self?.status = text
+        }
         task = Task { [weak self] in
             await pipeline.run()
             await MainActor.run { self?.active = false }
@@ -104,7 +108,6 @@ final class FrameGenerationPipeline: NSObject, SCStreamOutput, SCStreamDelegate,
     }
 
     func run() async {
-        var quality = settings.quality
         while !Task.isCancelled {
             let window: SCWindow
             do {
@@ -119,61 +122,80 @@ final class FrameGenerationPipeline: NSObject, SCStreamOutput, SCStreamDelegate,
                 return
             }
             let pixels = await Self.pixelSize(of: window)
-            let limits = frameGenerationLimits()
-            let size = frameGenerationSize(window: pixels, maxSide: limits.maxSide, maxPixels: limits.maxPixels, quality: quality)
-            guard size.width >= 2 else { try? await Task.sleep(nanoseconds: 1_000_000_000); continue }
-
-            let interpolator: FrameInterpolator
-            do {
-                interpolator = try FrameInterpolator(width: Int(size.width), height: Int(size.height),
-                                                     multiplier: settings.mode.multiplier)
-                try await interpolator.start()
-            } catch {
-                if let lower = quality.lower {
-                    quality = lower
-                    continue
-                }
-                await report("Apple's frame interpolation could not start on this Mac.")
+            guard let (interpolator, size) = await interpolator(for: pixels) else {
+                // nothing is shown over the game: it plays as it would without frame generation
+                await report("Apple's model does not take this window's size on this Mac: the game plays without frame generation.")
                 return
             }
             let pid = window.owningApplication?.processID ?? 0
             let overlay = await MainActor.run {
                 FrameOverlay(windowID: window.windowID, ownerPID: pid, showStats: settings.showStats)
             }
-            let modelFailed = await play(window: window, size: size, interpolator: interpolator, overlay: overlay)
+            let outcome = await play(window: window, size: size, interpolator: interpolator, overlay: overlay)
             await stopCapture()
             await interpolator.stop()
             await MainActor.run { overlay.close() }
-            if modelFailed {
-                // the model did not load at this size (macOS 26 does not say its limits): one size down
-                guard let lower = quality.lower else {
-                    await report("Apple's frame interpolation does not work at any size on this Mac.")
-                    return
-                }
-                quality = lower
+            switch outcome {
+            case .windowGone:
+                continue   // the game made a new window, or closed: look again
+            case .failed(let why):
+                Self.forgetSize(for: pixels)
+                await report("Frame generation stopped (\(why)): the game plays without it.")
+                return
             }
         }
     }
 
-    /// Frames until the window goes away or the run is cancelled; true when the model never loaded at this size.
-    private func play(window: SCWindow, size: CGSize, interpolator: FrameInterpolator, overlay: FrameOverlay) async -> Bool {
+    /// The first size Apple's model takes for this window, tried on the model itself before anything is shown, and
+    /// remembered for the next game; nil when it takes none of them.
+    private func interpolator(for pixels: CGSize) async -> (FrameInterpolator, CGSize)? {
+        let limits = frameGenerationLimits()
+        var sizes = frameGenerationCandidates(window: pixels, maxSide: limits.maxSide, maxPixels: limits.maxPixels,
+                                              quality: settings.quality)
+        if let known = Self.knownSize(for: pixels), let index = sizes.firstIndex(of: known) {
+            sizes.insert(sizes.remove(at: index), at: 0)
+        }
+        for size in sizes.prefix(10) {
+            if Task.isCancelled { return nil }
+            await report("Trying Apple's model at \(Int(size.width))×\(Int(size.height))…")
+            guard let candidate = try? FrameInterpolator(width: Int(size.width), height: Int(size.height),
+                                                         multiplier: settings.mode.multiplier) else { continue }
+            do { try await candidate.start() } catch { continue }
+            if await candidate.warmUp(timeout: 2) {
+                Self.rememberSize(size, for: pixels)
+                FrameGenerationLog.write("model ready at \(Int(size.width))x\(Int(size.height)) for a \(Int(pixels.width))x\(Int(pixels.height)) window")
+                return (candidate, size)
+            }
+            FrameGenerationLog.write("model does not take \(Int(size.width))x\(Int(size.height))")
+            await candidate.stop()
+        }
+        return nil
+    }
+
+    private enum Outcome { case windowGone, failed(String) }
+
+    /// Frames until the window goes away, the run is cancelled, or interpolation stops working.
+    private func play(window: SCWindow, size: CGSize, interpolator: FrameInterpolator, overlay: FrameOverlay) async -> Outcome {
         let incoming: AsyncStream<Frame>
         do {
             incoming = try await startCapture(window: window, size: size, pixelFormat: interpolator.sourcePixelFormat)
         } catch {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            return false
+            return .failed("the game's window could not be captured: \(error.localizedDescription)")
         }
         let multiplier = settings.mode.multiplier
         let label = "\(multiplier)× at \(Int(size.width))×\(Int(size.height))"
         await report("\(label): starting…")
         var previous: CMTime?
-        var fromGame = 0, onScreen = 0
+        var fromGame = 0, onScreen = 0, misses = 0
         var since = Date()
         for await frame in incoming {
             if Task.isCancelled { break }
-            let made = (try? await interpolator.interpolate(frame.buffer, at: frame.time)) ?? []
-            if await interpolator.failed { return true }
+            var made: [CVPixelBuffer] = []
+            do { made = try await interpolator.interpolate(frame.buffer, at: frame.time) } catch { misses += 1 }
+            if await interpolator.failed { return .failed("Apple's model stopped answering") }
+            // the model answers every frame once it is ready: a long run without its frames means it is not working
+            if previous != nil { misses = made.isEmpty ? misses + 1 : 0 }
+            if misses > 120 { return .failed("Apple's model gave no frame for two seconds") }
             let span = previous.map { CMTimeGetSeconds(frame.time) - CMTimeGetSeconds($0) } ?? 0
             previous = frame.time
             fromGame += 1
@@ -192,16 +214,34 @@ final class FrameGenerationPipeline: NSObject, SCStreamOutput, SCStreamDelegate,
             let elapsed = Date().timeIntervalSince(since)
             if elapsed >= 1 {
                 let game = Double(fromGame) / elapsed, shown = Double(onScreen) / elapsed
-                let ready = await interpolator.ready
-                let text = ready ? String(format: "%@: %.0f → %.0f fps", label, game, shown) : "\(label): loading Apple's model…"
-                await report(text)
-                await MainActor.run { overlay.setStats(ready ? String(format: " MetalDuck %d×  %.0f → %.0f fps ", multiplier, game, shown) : " MetalDuck: loading ") }
+                await report(String(format: "%@: %.0f → %.0f fps", label, game, shown))
+                await MainActor.run { overlay.setStats(String(format: " MetalDuck %d×  %.0f → %.0f fps ", multiplier, game, shown)) }
                 fromGame = 0
                 onScreen = 0
                 since = Date()
             }
         }
-        return false
+        return .windowGone
+    }
+
+    // MARK: The size that worked, per window size
+
+    private static func sizeKey(_ pixels: CGSize) -> String {
+        "metalhorizon.frameGeneration.size.\(Int(pixels.width))x\(Int(pixels.height))"
+    }
+
+    private static func knownSize(for pixels: CGSize) -> CGSize? {
+        guard let text = settingsStore().string(forKey: sizeKey(pixels)) else { return nil }
+        let parts = text.split(separator: "x").compactMap { Double($0) }
+        return parts.count == 2 ? CGSize(width: parts[0], height: parts[1]) : nil
+    }
+
+    private static func rememberSize(_ size: CGSize, for pixels: CGSize) {
+        settingsStore().set("\(Int(size.width))x\(Int(size.height))", forKey: sizeKey(pixels))
+    }
+
+    private static func forgetSize(for pixels: CGSize) {
+        settingsStore().removeObject(forKey: sizeKey(pixels))
     }
 
     // MARK: The game's window
@@ -271,5 +311,27 @@ final class FrameGenerationPipeline: NSObject, SCStreamOutput, SCStreamDelegate,
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         // the window closed, or the game made a new one: the run looks for it again
         frames?.finish()
+    }
+}
+
+/// What frame generation did, for Activity › Export Diagnostics (frame-generation.log beside the app's other logs):
+/// the sizes tried, the one used, and why it stopped. The frame rates themselves are not written.
+enum FrameGenerationLog {
+    static var file: URL { logDirectory.appendingPathComponent("frame-generation.log") }
+
+    static func write(_ line: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let text = "\(stamp) \(line)\n"
+        let fm = FileManager.default
+        if let size = (try? fm.attributesOfItem(atPath: file.path))?[.size] as? Int, size > 1_000_000 {
+            try? fm.removeItem(at: file)
+        }
+        if let handle = try? FileHandle(forWritingTo: file) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(text.utf8))
+        } else {
+            try? Data(text.utf8).write(to: file)
+        }
     }
 }

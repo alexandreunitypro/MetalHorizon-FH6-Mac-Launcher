@@ -61,6 +61,7 @@ private struct GeneralSettings: View {
                     ForEach(Edition.allCases) { Text(tr($0.title)).tag($0) }
                 }
                 .disabled(model.isBusy)
+                LanguagePicker()
             }
             Section("Game") {
                 if model.edition == .xbox {

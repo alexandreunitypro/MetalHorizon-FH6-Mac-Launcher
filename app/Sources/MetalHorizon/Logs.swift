@@ -174,7 +174,7 @@ final class LogTail {
 }
 
 enum LogFilter {
-    private static let noise: [NSRegularExpression] = [
+    private static let noise: [NSRegularExpression] = ([
         #"^\s*VK_[A-Za-z0-9_]+ v\d+$"#,                       // MoltenVK's extension lists
         #"^\[mvk-info\]"#, #"^\s*(model|type|vendorID|deviceID|pipelineCacheUUID|GPU memory|Metal Shading Language|GPU Family|Read-Write Texture|supports the following)"#,
         #"The following \d+ Vulkan extensions are supported"#, #"Created VkInstance for Vulkan version"#,
@@ -182,7 +182,8 @@ enum LogFilter {
         #"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+ --:--:--"#,   // curl's progress meter
         #"^\s*% Total\s+% Received"#, #"^\s*Dload\s+Upload"#,
         DownloadProgress.linePattern                            // xodus-cli's progress lines: the bar shows them
-    ].compactMap { try? NSRegularExpression(pattern: $0) }
+    ] + XodusLine.patterns                                      // its status and error lines: the window says them
+    ).compactMap { try? NSRegularExpression(pattern: $0) }
 
     private static let problem = try? NSRegularExpression(
         pattern: #"(?i)(^STOP:|^WARN|err:|error|unhandled|page fault|exception|terminating|failed|fatal|crash|c0000135|not supported|refus)"#)

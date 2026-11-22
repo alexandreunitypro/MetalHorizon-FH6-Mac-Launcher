@@ -21,7 +21,7 @@ typedef void (WINAPI *set_fn)( BOOL, WORD, BYTE, BYTE, SHORT, SHORT, SHORT, SHOR
 typedef void (WINAPI *motors_fn)( WORD *, WORD * );
 
 static int failures;
-static volatile LONG connects, disconnects;
+static volatile LONG connects, disconnects, dispatched;
 static v2_IGameInputDevice *seen;
 
 static void check( BOOL ok, const char *what )
@@ -35,6 +35,12 @@ static void __stdcall on_device( GameInputCallbackToken token, void *context, v2
 {
     if ((current & GameInputDeviceConnected) && !(previous & GameInputDeviceConnected)) { seen = device; InterlockedIncrement( &connects ); }
     if (!(current & GameInputDeviceConnected) && (previous & GameInputDeviceConnected)) InterlockedIncrement( &disconnects );
+}
+
+static void __stdcall on_dispatched( GameInputCallbackToken token, void *context, v2_IGameInputDevice *device,
+                                     uint64_t timestamp, GameInputDeviceStatus current, GameInputDeviceStatus previous )
+{
+    InterlockedIncrement( &dispatched );
 }
 
 static v2_IGameInputReading *reading_of( v2_IGameInput *gi, GameInputKind kind )
@@ -125,6 +131,31 @@ int main( void )
         v2_IGameInputDevice_SetRumbleState( seen, &rumble );
         motors( &low, &high );
         check( low == 32767 && high == 65535, "its rumble reaches XInput" );
+    }
+
+    /* a game that runs the callbacks itself: nothing until it calls Dispatch, then the device */
+    {
+        IGameInputDispatcher *dispatcher = NULL;
+        GameInputCallbackToken later = 0;
+        HANDLE wait = NULL;
+        BOOL waited;
+        bool more;
+        check( SUCCEEDED(v2_IGameInput_CreateDispatcher( gi, &dispatcher )) && dispatcher, "a dispatcher is made" );
+        if (dispatcher)
+        {
+            v2_IGameInput_RegisterDeviceCallback( gi, NULL, GameInputKindGamepad, GameInputDeviceConnected,
+                                                  GameInputAsyncEnumeration, NULL, on_dispatched, &later );
+            Sleep( 300 );
+            check( dispatched == 0, "with a dispatcher, no callback runs before Dispatch" );
+            check( SUCCEEDED(IGameInputDispatcher_OpenWaitHandle( dispatcher, &wait )) && wait, "its wait handle" );
+            waited = wait && WaitForSingleObject( wait, 2000 ) == WAIT_OBJECT_0;
+            check( waited, "the wait handle is set while a callback waits" );
+            more = IGameInputDispatcher_Dispatch( dispatcher, 0 );
+            check( dispatched == 1 && !more, "Dispatch runs the waiting callback, and nothing is left" );
+            if (wait) CloseHandle( wait );
+            v2_IGameInput_UnregisterCallback( gi, later );
+            IGameInputDispatcher_Release( dispatcher );
+        }
     }
 
     set( FALSE, 0, 0, 0, 0, 0, 0, 0 );

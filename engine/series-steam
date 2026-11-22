@@ -33,5 +33,8 @@
 # through GameController.framework (a PlayStation pad on Bluetooth). WINE_GAMEINPUT_APPLE=0 turns that source off.
 # Tested without the game: tests/gameinput-pads.
 0018-gameinput-controller-ui-navigation-and-macos-pads.patch
+# The GameInput dispatcher (since engine 1.3.1, MetalHorizon 2.1.1, issue #15): a game can run GameInput's callbacks
+# itself, as on Windows; CreateDispatcher answered E_NOTIMPL. Tested without the game: tests/gameinput-pads.
+0019-gameinput-dispatcher.patch
 # The 32-bit half: 0005's FH6 diagnostics read x86_64 registers, kept to the 64-bit build.
 0013-i386-build-guards.patch

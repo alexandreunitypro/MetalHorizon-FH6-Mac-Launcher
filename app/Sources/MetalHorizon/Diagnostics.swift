@@ -449,7 +449,7 @@ enum Diagnostics {
             }
         }
         for name in ["xodus-service.log", "steam-window.log", "steam-install.log", "steam-prefix.log", "updater.log",
-                     "repairs.log", "repairs.json"] {
+                     "repairs.log", "repairs.json", "frame-generation.log"] {
             copyRedacted(logDirectory.appendingPathComponent(name), as: name)
         }
         let crashes = MCPServer.recentCrashSummaries(limit: 3)
