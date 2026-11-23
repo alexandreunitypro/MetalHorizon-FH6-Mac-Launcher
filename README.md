@@ -6,7 +6,7 @@ Pass or Steam, on Apple silicon. One app, one button, 60 frames a second on an M
 **[⬇ Download the latest version](../../releases/latest)** · **[☕ Support it on Buy Me a Coffee](https://buymeacoffee.com/zaidalexandre)** · **[Report a problem](../../issues)**
 
 I am committed to patching as many bugs as possible and resolving as many issues as I can: report them in
-[Issues](../../issues), and I will release a fix within 24 hours.
+[Issues](../../issues), and I will release a fix within 24 hours between Friday and the whole week ends only otherwise except a fix by Friday.
 
 Forza Horizon 5, 4, 3, 2 and 1 support is coming very soon, and Forza Motorsport (2023) as a world first.
 
