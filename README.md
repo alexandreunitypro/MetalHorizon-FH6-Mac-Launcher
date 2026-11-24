@@ -154,7 +154,6 @@ details in [SPONSORS.md](SPONSORS.md).
 
 ## Credits
 
-- [Highball](https://github.com/gauthierpiarrette/highball) and
   [highball-engine](https://github.com/gauthierpiarrette/highball-engine), by Gauthier Piarrette (GPL-3.0): the
   DirectX 12 shim, Wine patches, the native route and the Forza recipe.
 - [Ferestre](https://github.com/icex/ferestre), by icex: Wine patches for the Xbox edition.
