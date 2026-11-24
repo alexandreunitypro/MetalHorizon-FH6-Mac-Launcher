@@ -1,5 +1,6 @@
 # MetalHorizon X
-<img width="4260" height="2840" alt="MacBook Pro with PROLED XDR Display 16-inch Space Black" src="https://github.com/user-attachments/assets/3a770d2c-3601-4eaf-a319-4cc32c3b3553" />
+<img width="1351" height="898" alt="Capture d’écran 2026-11-24 à 21 32 01" src="https://github.com/user-attachments/assets/187382e9-b001-401e-8cb9-d68d7468cd88" />
+
 **The most complete way to play Forza Horizon 6 on a Mac: your own copy from the Xbox / Microsoft Store, PC Game
 Pass or Steam, on Apple silicon. One app, one button, 60 frames a second on an M5 Pro.**
 
