@@ -1,5 +1,6 @@
 # MetalHorizon X
 <img width="1351" height="898" alt="Capture d’écran 2026-11-24 à 21 32 01" src="https://github.com/user-attachments/assets/187382e9-b001-401e-8cb9-d68d7468cd88" />
+*GamePlay on the M5 Max 64Gb MacBook Pro at Max settings
 
 **The most complete way to play Forza Horizon 6 on a Mac: your own copy from the Xbox / Microsoft Store, PC Game
 Pass or Steam, on Apple silicon. One app, one button, 60 frames a second on an M5 Pro.**
