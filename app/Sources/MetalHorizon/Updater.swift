@@ -3,14 +3,15 @@ import Foundation
 import SwiftUI
 
 // MetalHorizon updates itself. Each time the app opens (never the MCP server, a snapshot, or a development build that
-// is not MetalHorizon.app), it reads the GitHub releases of the project, prereleases only when opted in. A newer version is
-// mandatory: once nothing runs (game, download, install, Steam), a sheet without Cancel downloads
-// MetalHorizon-<version>.zip, checks it against the release's SHA256SUMS, unzips it and checks the app inside (bundle
-// identifier, version, executable, signature). A small helper script, started in a session of its own, then waits for
-// the app to quit, puts the new MetalHorizon.app at the same path, relaunches it, and puts the previous one back if the
-// new one does not start. Only the app is replaced: the settings (UserDefaults), the logs and the engines in
-// Application Support stay as they are, and the new version installs the engines it needs by itself (components.json).
-// Everything is written to ~/Library/Logs/MetalHorizon/updater.log; a failed check is silent.
+// is not MetalHorizon.app), it reads the GitHub releases of the project, prereleases only when opted in. A newer
+// version installs by itself unless Update automatically is off (then Install Now or Later): once nothing runs (game,
+// download, install, Steam), a sheet without Cancel downloads MetalHorizon-<version>.zip, checks it against the
+// release's SHA256SUMS, unzips it and checks the app inside (bundle identifier, version, executable, signature). A
+// small helper script, started in a session of its own, then waits for the app to quit, puts the new MetalHorizon.app
+// at the same path, relaunches it, and puts the previous one back if the new one does not start. Only the app is
+// replaced: the settings (UserDefaults), the logs and the engines in Application Support stay as they are, and the new
+// version installs the engines it needs by itself (components.json). Everything is written to
+// ~/Library/Logs/MetalHorizon/updater.log; a failed check is silent.
 // MH_UPDATE_FEED=<URL or file> reads another feed in the same format as GitHub's (tests).
 
 /// A release version, "v0.4.1" or "0.4.1": compared number by number (0.10.0 is newer than 0.9.0), and a pre-release
@@ -553,6 +554,7 @@ enum UpdateKey {
     static let lastRunVersion = "metalhorizon.lastRunVersion"
     static let failedVersion = "metalhorizon.updateFailedVersion"     // a version the helper had to put back
     static let preReleases = "metalhorizon.updatePreReleases"
+    static let automatic = "metalhorizon.updateAutomatically"
 }
 
 /// What the update sheet shows.
@@ -562,6 +564,7 @@ enum UpdateState: Equatable {
     case updating(version: String, step: String, fraction: Double?)
     /// Something to read, with the release page when there is one and Try Again when it can be retried.
     case notice(title: String, text: String, page: URL?, retry: Bool)
+    case available(AvailableUpdate)
 }
 
 @MainActor
@@ -582,6 +585,7 @@ final class Updater: ObservableObject {
     }
 
     static var preReleases: Bool { settingsStore().bool(forKey: UpdateKey.preReleases) }
+    static var automatic: Bool { settingsStore().object(forKey: UpdateKey.automatic) as? Bool ?? true }
 
     var isForced: Bool { if case .updating = state { return true } else { return false } }
 
@@ -616,6 +620,11 @@ final class Updater: ObservableObject {
         settingsStore().removeObject(forKey: UpdateKey.failedVersion)
         state = .none
         Task { await check(userInitiated: true) }
+    }
+
+    func installNow(_ update: AvailableUpdate) {
+        state = .none
+        Task { await install(update, userInitiated: true) }
     }
 
     func dismiss() {
@@ -671,6 +680,10 @@ final class Updater: ObservableObject {
             return
         }
         Self.log("MetalHorizon \(update.version) is available (this is \(current))")
+        if !userInitiated && !Self.automatic {
+            await show(.available(update))
+            return
+        }
         await install(update, userInitiated: userInitiated)
     }
 
@@ -857,6 +870,18 @@ struct UpdateSheet: View {
                         Button("Try Again") { updater.retry() }
                     }
                     Button(page == nil && !retry ? tr("OK") : tr("Continue")) { updater.dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
+            case let .available(update):
+                Text("MetalHorizon \(update.version) is available")
+                    .font(.headline)
+                Text("You are using \(Updater.currentVersion).")
+                HStack {
+                    Button("Open the Release Page") { NSWorkspace.shared.open(update.page) }
+                    Spacer()
+                    Button("Later") { updater.dismiss() }
+                    Button("Install Now") { updater.installNow(update) }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
                 }

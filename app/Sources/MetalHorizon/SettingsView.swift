@@ -202,6 +202,7 @@ private struct ControllerSettings: View {
 
 private struct AdvancedSettings: View {
     @ObservedObject var model: LauncherModel
+    @AppStorage(UpdateKey.automatic, store: settingsStore()) private var automaticUpdates = true
     @AppStorage(UpdateKey.preReleases, store: settingsStore()) private var preReleases = false
 
     var body: some View {
@@ -213,6 +214,7 @@ private struct AdvancedSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Engine channel") }
             Section {
+                Toggle("Update automatically", isOn: $automaticUpdates)
                 Toggle("Pre-release versions", isOn: $preReleases)
             } header: { Text("Updates") }
             Section {
