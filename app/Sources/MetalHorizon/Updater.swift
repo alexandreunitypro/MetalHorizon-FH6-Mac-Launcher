@@ -3,7 +3,7 @@ import Foundation
 import SwiftUI
 
 // MetalHorizon updates itself. Each time the app opens (never the MCP server, a snapshot, or a development build that
-// is not MetalHorizon.app), it reads the GitHub releases of the project, prereleases included. A newer version is
+// is not MetalHorizon.app), it reads the GitHub releases of the project, prereleases only when opted in. A newer version is
 // mandatory: once nothing runs (game, download, install, Steam), a sheet without Cancel downloads
 // MetalHorizon-<version>.zip, checks it against the release's SHA256SUMS, unzips it and checks the app inside (bundle
 // identifier, version, executable, signature). A small helper script, started in a session of its own, then waits for
@@ -71,15 +71,17 @@ struct FeedRelease: Decodable {
     }
     var tag: String
     var draft: Bool
+    var prerelease: Bool
     var page: String?
     var assets: [Asset]
 
-    enum CodingKeys: String, CodingKey { case tag = "tag_name", draft, page = "html_url", assets }
+    enum CodingKeys: String, CodingKey { case tag = "tag_name", draft, prerelease, page = "html_url", assets }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         tag = try c.decode(String.self, forKey: .tag)
         draft = try c.decodeIfPresent(Bool.self, forKey: .draft) ?? false
+        prerelease = try c.decodeIfPresent(Bool.self, forKey: .prerelease) ?? false
         page = try c.decodeIfPresent(String.self, forKey: .page)
         assets = try c.decodeIfPresent([Asset].self, forKey: .assets) ?? []
     }
@@ -147,11 +149,12 @@ enum UpdateFeed {
 
     /// The highest version above `current` whose release is published (not a draft) and carries both
     /// MetalHorizon-<version>.zip and SHA256SUMS. Tags that are not versions are skipped.
-    static func newest(in releases: [FeedRelease], above current: String) -> AvailableUpdate? {
+    static func newest(in releases: [FeedRelease], above current: String, includePrereleases: Bool = false) -> AvailableUpdate? {
         guard let running = AppVersion(current) else { return nil }
         var best: (version: AppVersion, update: AvailableUpdate)?
         for release in releases where !release.draft {
             guard let version = AppVersion(release.tag), version > running else { continue }
+            if !includePrereleases && (release.prerelease || !version.suffix.isEmpty) { continue }
             if let best, best.version >= version { continue }
             guard let zip = release.assets.first(where: { $0.name == "MetalHorizon-\(version).zip" }),
                   let sums = release.assets.first(where: { $0.name == "SHA256SUMS" }) else { continue }
@@ -546,9 +549,10 @@ enum UpdateHelper {
 
 // MARK: - The app's side
 
-private enum UpdateKey {
+enum UpdateKey {
     static let lastRunVersion = "metalhorizon.lastRunVersion"
     static let failedVersion = "metalhorizon.updateFailedVersion"     // a version the helper had to put back
+    static let preReleases = "metalhorizon.updatePreReleases"
 }
 
 /// What the update sheet shows.
@@ -576,6 +580,8 @@ final class Updater: ObservableObject {
         !CommandLine.arguments.contains("--mcp") && ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil
             && Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
     }
+
+    static var preReleases: Bool { settingsStore().bool(forKey: UpdateKey.preReleases) }
 
     var isForced: Bool { if case .updating = state { return true } else { return false } }
 
@@ -648,7 +654,7 @@ final class Updater: ObservableObject {
         let update: AvailableUpdate?
         do {
             let releases = try await UpdateFeed.releases(from: UpdateFeed.url)
-            update = UpdateFeed.newest(in: releases, above: current)
+            update = UpdateFeed.newest(in: releases, above: current, includePrereleases: Self.preReleases)
         } catch {
             // offline, rate limit, GitHub down: the app works as before, the next launch checks again
             Self.log("could not check for updates: \(error)")

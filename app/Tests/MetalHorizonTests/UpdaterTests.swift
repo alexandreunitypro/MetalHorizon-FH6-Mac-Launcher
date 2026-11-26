@@ -110,18 +110,20 @@ final class UpdaterTests: XCTestCase {
         XCTAssertEqual(releases.count, 7)
 
         // the draft, the release without its zip and the one without SHA256SUMS are skipped
-        let update = try XCTUnwrap(UpdateFeed.newest(in: releases, above: "0.4.0"))
+        let update = try XCTUnwrap(UpdateFeed.newest(in: releases, above: "0.4.0", includePrereleases: true))
         XCTAssertEqual(update.version, "0.4.2")
         XCTAssertEqual(update.archiveName, "MetalHorizon-0.4.2.zip")
         XCTAssertEqual(update.archive.absoluteString, "https://github.com/o/r/releases/download/x/MetalHorizon-0.4.2.zip")
         XCTAssertEqual(update.checksums.lastPathComponent, "SHA256SUMS")
         XCTAssertEqual(update.page.absoluteString, "https://github.com/o/r/releases/tag/v0.4.2")
         XCTAssertEqual(update.archiveSize, 1000)
-        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.4.1")?.version, "0.4.2")
-        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.4.2"))
-        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.10.0"))
-        XCTAssertNil(UpdateFeed.newest(in: releases, above: ""), "a copy without a version never updates")
-        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.3.1")?.version, "0.4.2")
+        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.4.1", includePrereleases: true)?.version, "0.4.2")
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.4.2", includePrereleases: true))
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.10.0", includePrereleases: true))
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "", includePrereleases: true), "a copy without a version never updates")
+        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.3.1", includePrereleases: true)?.version, "0.4.2")
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.3.1"))
+        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.3.0")?.version, "0.3.1")
 
         // MH_UPDATE_FEED takes a path or a URL
         XCTAssertTrue(UpdateFeed.location(file.path).isFileURL)
