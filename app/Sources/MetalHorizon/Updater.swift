@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -95,16 +96,18 @@ struct AvailableUpdate: Equatable {
     var archiveSize: Int64?
     var checksums: URL
     var page: URL
+    var signature: URL?
     var archiveName: String { "MetalHorizon-\(version).zip" }
 }
 
 enum UpdateError: Error, CustomStringConvertible {
-    case server(String), noChecksum(String), badChecksum(String), badApp(String), tool(String)
+    case server(String), noChecksum(String), badChecksum(String), badSignature, badApp(String), tool(String)
     var description: String {
         switch self {
         case .server(let m): return m
         case .noChecksum(let n): return "The release's SHA256SUMS has no line for \(n)."
         case .badChecksum(let n): return "\(n) does not match its SHA-256 in the release's SHA256SUMS: it was not installed."
+        case .badSignature: return "SHA256SUMS is not signed with MetalHorizon's update key: nothing was installed."
         case .badApp(let m): return "The downloaded app was refused: \(m)."
         case .tool(let m): return m
         }
@@ -160,8 +163,9 @@ enum UpdateFeed {
             guard let zip = release.assets.first(where: { $0.name == "MetalHorizon-\(version).zip" }),
                   let sums = release.assets.first(where: { $0.name == "SHA256SUMS" }) else { continue }
             let page = release.page.flatMap(URL.init(string:)) ?? releasesPage.appendingPathComponent("tag/\(release.tag)")
+            let signature = release.assets.first { $0.name == "SHA256SUMS.sig" }.map { location($0.url) }
             best = (version, AvailableUpdate(version: version.description, archive: location(zip.url), archiveSize: zip.size,
-                                             checksums: location(sums.url), page: page))
+                                             checksums: location(sums.url), page: page, signature: signature))
         }
         return best?.update
     }
@@ -222,6 +226,8 @@ private final class UpdateDownload: NSObject, URLSessionDownloadDelegate {
 }
 
 enum UpdatePackage {
+    static let publicKeyInfoKey = "MHUpdatePublicKey"
+
     static func session(timeout: TimeInterval) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
@@ -244,6 +250,13 @@ enum UpdatePackage {
         return sums
     }
 
+    static func verifySignature(of sums: Data, signature: Data?, publicKey: String) throws {
+        guard let key = Data(base64Encoded: publicKey).flatMap({ try? Curve25519.Signing.PublicKey(rawRepresentation: $0) }),
+              let signature,
+              let raw = Data(base64Encoded: String(decoding: signature, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)),
+              key.isValidSignature(raw, for: sums) else { throw UpdateError.badSignature }
+    }
+
     static func verifyChecksum(of file: URL, named name: String, in sums: [String: String]) throws {
         guard let expected = sums[name] else { throw UpdateError.noChecksum(name) }
         guard try Installer.sha256(of: file) == expected else { throw UpdateError.badChecksum(name) }
@@ -251,7 +264,7 @@ enum UpdatePackage {
 
     /// The unzipped archive must hold exactly one MetalHorizon.app, with this app's bundle identifier, the release's
     /// version, its executable, and a signature that verifies (ad-hoc signatures do).
-    static func verifyApp(in folder: URL, bundleID: String, version: String) throws -> URL {
+    static func verifyApp(in folder: URL, bundleID: String, version: String, publicKey: String? = nil) throws -> URL {
         let items = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
             .filter { !$0.hasPrefix(".") && $0 != "__MACOSX" }
         guard items == ["MetalHorizon.app"] else {
@@ -266,6 +279,9 @@ enum UpdatePackage {
         guard id == bundleID else { throw UpdateError.badApp("its bundle identifier is \(id.isEmpty ? "missing" : id), not \(bundleID)") }
         let found = info["CFBundleShortVersionString"] as? String ?? ""
         guard found == version else { throw UpdateError.badApp("it is version \(found.isEmpty ? "?" : found), not \(version)") }
+        if let publicKey, info[publicKeyInfoKey] as? String != publicKey {
+            throw UpdateError.badApp("it does not carry this app's update key")
+        }
         guard let executable = info["CFBundleExecutable"] as? String, !executable.isEmpty, !executable.contains("/"),
               FileManager.default.isExecutableFile(atPath: app.path + "/Contents/MacOS/" + executable) else {
             throw UpdateError.badApp("its executable is missing")
@@ -280,18 +296,14 @@ enum UpdatePackage {
 
     /// Downloads the update into `work` (a folder on the app's volume), checks it and returns the new MetalHorizon.app
     /// inside `work`. Nothing outside `work` is touched.
-    static func prepare(_ update: AvailableUpdate, in work: URL, bundleID: String,
+    static func prepare(_ update: AvailableUpdate, in work: URL, bundleID: String, publicKey: String? = nil,
                         progress: @escaping @Sendable (Double?, String) -> Void) async throws -> URL {
         progress(nil, "Reading the release's checksums…")
-        let sumsData: Data
-        if update.checksums.isFileURL {
-            sumsData = try Data(contentsOf: update.checksums)
-        } else {
-            let (body, response) = try await session(timeout: 20).data(from: update.checksums)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                throw UpdateError.server("GitHub answered \((response as? HTTPURLResponse)?.statusCode ?? 0) for SHA256SUMS.")
-            }
-            sumsData = body
+        let sumsData = try await fetch(update.checksums)
+        if let publicKey {
+            var signature: Data?
+            if let url = update.signature { signature = try await fetch(url) }
+            try verifySignature(of: sumsData, signature: signature, publicKey: publicKey)
         }
         let sums = parseChecksums(String(decoding: sumsData, as: UTF8.self))
         let name = update.archiveName
@@ -313,7 +325,16 @@ enum UpdatePackage {
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
         try run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
         progress(nil, "Checking the new app's signature…")
-        return try verifyApp(in: unpacked, bundleID: bundleID, version: update.version)
+        return try verifyApp(in: unpacked, bundleID: bundleID, version: update.version, publicKey: publicKey)
+    }
+
+    private static func fetch(_ url: URL) async throws -> Data {
+        if url.isFileURL { return try Data(contentsOf: url) }
+        let (body, response) = try await session(timeout: 20).data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw UpdateError.server("GitHub answered \((response as? HTTPURLResponse)?.statusCode ?? 0) for \(url.lastPathComponent).")
+        }
+        return body
     }
 
     static func run(_ path: String, _ args: [String]) throws {
@@ -715,7 +736,9 @@ final class Updater: ObservableObject {
             work = folder
             fm.createFile(atPath: folder.appendingPathComponent(UpdateHelper.workMarker).path, contents: nil)
             Self.log("downloading \(update.archive.absoluteString) into \(folder.path)")
-            let newApp = try await UpdatePackage.prepare(update, in: folder, bundleID: Bundle.main.bundleIdentifier ?? appBundleID) { [weak self] fraction, step in
+            let publicKey = Bundle.main.object(forInfoDictionaryKey: UpdatePackage.publicKeyInfoKey) as? String
+            let newApp = try await UpdatePackage.prepare(update, in: folder, bundleID: Bundle.main.bundleIdentifier ?? appBundleID,
+                                                         publicKey: publicKey) { [weak self] fraction, step in
                 Task { @MainActor in self?.progress(update.version, step, fraction) }
             }
             Self.log("MetalHorizon \(update.version) downloaded and verified (SHA-256, bundle, signature)")
