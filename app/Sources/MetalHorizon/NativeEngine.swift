@@ -29,6 +29,7 @@ enum EngineRoute: String, CaseIterable, Identifiable {
 enum ResolvedRoute: String {
     case native, d3dmetal
     var title: String { self == .native ? tr("Native Apple silicon") : "D3DMetal" }
+    var noFrameCapTitle: String { self == .native ? "\(tr("Automatic")) · \(tr("%lld fps", 30))" : tr("None") }
     var shortExplanation: String {
         self == .native
             ? tr("Steady 30 frames a second, no hitch every second.")

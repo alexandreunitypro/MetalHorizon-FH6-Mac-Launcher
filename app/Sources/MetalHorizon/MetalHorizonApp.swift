@@ -87,7 +87,7 @@ struct MetalHorizonApp: App {
                 Toggle("Metal Performance HUD", isOn: $model.metalHUD)
                 Toggle("MetalFX Upscaling (DLSS in the Game)", isOn: $model.metalFX)
                 Picker("Frame Cap", selection: $model.maxFPS) {
-                    Text("None").tag(0)
+                    Text(model.routeDecision.route.noFrameCapTitle).tag(0)
                     ForEach([30, 40, 45, 60], id: \.self) { Text("\($0) fps").tag($0) }
                 }
                 Picker("Controllers", selection: $model.controllerMode) {
