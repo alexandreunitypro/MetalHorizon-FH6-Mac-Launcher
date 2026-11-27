@@ -69,12 +69,23 @@ export WINEPREFIX="$PREFIX"
 # Xbox sign-in at all ("Sign In Required", issue #21). Native only: the game's own copy loads and the builtin never
 # does, as in Highball's engine, which has no xgameruntime.
 export WINEDLLOVERRIDES="xgameruntime=n${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
-# The game keeps the package identity the engine gives it from the MicrosoftGame.config beside it (engine patch 0002):
-# Microsoft's runtime finds the game's configuration through it. Measured with Microsoft's own xgameruntime.dll (GDK
-# 2610) on Blackwell Engine 1.4: XGameRuntimeInitialize() with the identity reaches the sign-in code at
-# microsoft.com/link; without it (2.2.0 pointed WINE_PACKAGE_MANIFEST at a manifest without <Identity>) it fails with
-# E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT, and the game still showed "Sign In Required" (issue #21).
-unset WINE_PACKAGE_MANIFEST
+# As on a Windows PC and in Highball's engine, a Steam game has no package identity: Microsoft's Gaming Runtime then
+# reads the MicrosoftGame.config beside it as an unpackaged game. 2.2.1 and 2.2.2 kept the identity the engine gives a
+# program with that file beside it (engine patch 0002), the Microsoft Store copy's: the sign-in worked, then the game
+# stopped with E:0-0-L-8 ("Initialization Failed", issue #21). Without it the runtime only starts on Blackwell Engine
+# 1.4.1 and later (patch 0020; 1.4 gave E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT). A manifest without <Identity> gives none
+# to every program of this prefix; the file has to exist, or the engine looks beside the program again.
+NO_IDENTITY="$PREFIX/drive_c/metalhorizon/no-package-identity.xml"
+export WINE_PACKAGE_MANIFEST='C:\metalhorizon\no-package-identity.xml'
+no_package_identity() {
+    [ -d "$PREFIX/drive_c" ] || return 0
+    grep -q '<MetalHorizon/>' "$NO_IDENTITY" 2>/dev/null && return 0
+    mkdir -p "$(dirname "$NO_IDENTITY")" 2>/dev/null
+    printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' \
+        '<!-- MetalHorizon: no package identity for the programs of the Steam prefix, as on a Windows PC. -->' \
+        '<MetalHorizon/>' > "$NO_IDENTITY" 2>/dev/null || echo "WARN: could not write $NO_IDENTITY"
+}
+no_package_identity
 # wineboot copies every builtin DLL of the engine into the prefix's system folders, xgameruntime among them, where
 # Windows without the Xbox app, Proton and Highball's engine have none: a game looking for a system Gaming Runtime would
 # find one there that cannot load (native only, above). Set aside, and again during Play, since wineboot brings it back
@@ -90,8 +101,8 @@ runtime_copies_aside
 # What the programs of this prefix get, as one number: raised when it changes, so that a Steam client started by an
 # older MetalHorizon, whose environment the game would inherit, is restarted before it starts the game.
 # 2: xgameruntime native only and no package identity (2.2.0). 3: native only, with the package identity (2.2.1).
-# 4: the Xbox sign-in's requests in the game log (2.2.2).
-STEAM_ENV=4
+# 4: the Xbox sign-in's requests in the game log (2.2.2). 5: no package identity again, on engine 1.4.1 (2.2.3).
+STEAM_ENV=5
 # The Xbox sign-in (issue #21): the game's own Gaming Runtime talks to login.live.com and the Xbox services through
 # WinHTTP. Each request's host and path and each answer's status (and Microsoft's X-WLID-Error) go to the game log, for
 # Export Diagnostics; the rest of WinHTTP's trace, headers and bodies, is dropped here. No token is in what is kept.
@@ -195,6 +206,7 @@ cmd_prefix() {
     ( export WINEMSYNC=0 WINEESYNC=0; "$ENGINE/bin/wine" wineboot -i >> "$LOGS/steam-prefix.log" 2>&1; "$ENGINE/bin/wineserver" -w )
     [ -f "$PREFIX/system.reg" ] || mh_fail "wineboot did not create the prefix (see $LOGS/steam-prefix.log)"
     [ -f "$PREFIX/drive_c/windows/syswow64/ntdll.dll" ] || echo "WARN: the prefix has no 32-bit system folder"
+    no_package_identity
     echo "prefix ready"
 }
 

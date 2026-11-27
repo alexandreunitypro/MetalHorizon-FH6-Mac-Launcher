@@ -38,6 +38,9 @@
 0019-gameinput-dispatcher.patch
 # The 32-bit half: 0005's FH6 diagnostics read x86_64 registers, kept to the 64-bit build.
 0013-i386-build-guards.patch
+# An unpackaged process gets APPMODEL_ERROR_NO_PACKAGE with *length untouched, as Windows and CrossOver answer (since
+# engine 1.4.1, MetalHorizon 2.2.3, issue #21): Microsoft's Gaming Runtime in a Steam game then reads its config.
+0020-kernelbase-unpackaged-length-untouched.patch
 # The Rosetta line (since engine 1.4, MetalHorizon 2.1.2; Beta 1.4a1 and 1.4a2 before it): against the freezes and
 # the hitches under Rosetta, in forzahorizon6.exe only. Highball's Rosetta-line patches, copied verbatim from
 # https://github.com/gauthierpiarrette/highball-engine/tree/main/patches (LGPL-2.1-or-later; see patches/ORIGIN-beta.md),

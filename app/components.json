@@ -3,20 +3,20 @@
     {
       "id": "engine",
       "name": "Blackwell Engine",
-      "version": "1.4",
-      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.4/blackwell-engine-1.4.tar.xz",
-      "sha256": "50b9cbd273676f75f2bed1bb2230a5e92158e3aaf6f1acdb0b071d216289b0cf",
-      "size": 103939980,
+      "version": "1.4.1",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.4.1/blackwell-engine-1.4.1.tar.xz",
+      "sha256": "7770e10ae0d8a14bf8173cda521aaba0abda92e31f0a652f9a357456c8575356",
+      "size": 103367868,
       "folder": "Blackwell Engine",
       "root": "Blackwell Engine"
     },
     {
       "id": "engine-steam",
       "name": "Blackwell Engine Steam",
-      "version": "steam-1.4",
-      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.4/blackwell-engine-steam-1.4.tar.xz",
-      "sha256": "b5b94698d7f5bd17eaa34ef1ae52bdec34a60a80e2448d7f1b0f12503a72031b",
-      "size": 91576772,
+      "version": "steam-1.4.1",
+      "url": "https://github.com/alexandreunitypro/blackwell-engine/releases/download/blackwell-engine-1.4.1/blackwell-engine-steam-1.4.1.tar.xz",
+      "sha256": "563803283b932836987940b93732b0e9e76002c56447ad1569d476a8ed70a275",
+      "size": 91557968,
       "folder": "Blackwell Engine Steam",
       "root": "Blackwell Engine"
     },

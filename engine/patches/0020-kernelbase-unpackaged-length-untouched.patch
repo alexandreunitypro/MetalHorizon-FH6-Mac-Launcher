@@ -1,0 +1,26 @@
+From: MetalHorizon
+Subject: kernelbase: an unpackaged process leaves *length as it was (Microsoft Gaming Runtime, Steam, issue #21)
+
+Windows and CrossOver return APPMODEL_ERROR_NO_PACKAGE without touching *length. Microsoft's Gaming
+Runtime (the xgameruntime.dll a Steam build ships) then reads MicrosoftGame.config beside the executable; with
+*length set to 0 it took the process for a packaged one and failed with E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT.
+---
+--- a/dlls/kernelbase/package.c	2026-11-27 14:19:11
++++ b/dlls/kernelbase/package.c	2026-11-27 14:19:03
+@@ -588,11 +588,11 @@
+ 
+     if (!length) return ERROR_INVALID_PARAMETER;
+     ensure_identity();
+-    if (!value)
+-    {
+-        *length = 0;
+-        return none_error;
+-    }
++    /* an unpackaged process: the error alone, *length left as the caller set it, as Windows' and CrossOver's
++     * answers leave it. Microsoft's Gaming Runtime then looks for MicrosoftGame.config beside the executable; with
++     * *length set to 0 it took the process for a packaged one and stopped with E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT
++     * (a Steam game, issue #21). */
++    if (!value) return none_error;
+     needed = lstrlenW( value ) + 1;
+     if (*length < needed || !buffer)
+     {
