@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import MetalHorizon
 
@@ -27,12 +28,14 @@ final class UpdaterTests: XCTestCase {
 
     /// A fake MetalHorizon.app: its Info.plist and an executable (/usr/bin/true when it is to be signed).
     @discardableResult
-    private func fakeApp(_ url: URL, version: String, bundleID: String = appBundleID, signed: Bool = false) throws -> URL {
+    private func fakeApp(_ url: URL, version: String, bundleID: String = appBundleID, signed: Bool = false,
+                         updateKey: String? = nil) throws -> URL {
         let fm = FileManager.default
         try fm.createDirectory(at: url.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
         try fm.createDirectory(at: url.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
-        let info: [String: Any] = ["CFBundleIdentifier": bundleID, "CFBundleShortVersionString": version, "CFBundleVersion": version,
+        var info: [String: Any] = ["CFBundleIdentifier": bundleID, "CFBundleShortVersionString": version, "CFBundleVersion": version,
                                    "CFBundleExecutable": "MetalHorizon", "CFBundlePackageType": "APPL", "CFBundleName": "MetalHorizon"]
+        info[UpdatePackage.publicKeyInfoKey] = updateKey
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: url.appendingPathComponent("Contents/Info.plist"))
         try "settings stay".write(to: url.appendingPathComponent("Contents/Resources/components.json"), atomically: true, encoding: .utf8)
@@ -110,18 +113,20 @@ final class UpdaterTests: XCTestCase {
         XCTAssertEqual(releases.count, 7)
 
         // the draft, the release without its zip and the one without SHA256SUMS are skipped
-        let update = try XCTUnwrap(UpdateFeed.newest(in: releases, above: "0.4.0"))
+        let update = try XCTUnwrap(UpdateFeed.newest(in: releases, above: "0.4.0", includePrereleases: true))
         XCTAssertEqual(update.version, "0.4.2")
         XCTAssertEqual(update.archiveName, "MetalHorizon-0.4.2.zip")
         XCTAssertEqual(update.archive.absoluteString, "https://github.com/o/r/releases/download/x/MetalHorizon-0.4.2.zip")
         XCTAssertEqual(update.checksums.lastPathComponent, "SHA256SUMS")
         XCTAssertEqual(update.page.absoluteString, "https://github.com/o/r/releases/tag/v0.4.2")
         XCTAssertEqual(update.archiveSize, 1000)
-        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.4.1")?.version, "0.4.2")
-        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.4.2"))
-        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.10.0"))
-        XCTAssertNil(UpdateFeed.newest(in: releases, above: ""), "a copy without a version never updates")
-        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.3.1")?.version, "0.4.2")
+        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.4.1", includePrereleases: true)?.version, "0.4.2")
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.4.2", includePrereleases: true))
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.10.0", includePrereleases: true))
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "", includePrereleases: true), "a copy without a version never updates")
+        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.3.1", includePrereleases: true)?.version, "0.4.2")
+        XCTAssertNil(UpdateFeed.newest(in: releases, above: "0.3.1"))
+        XCTAssertEqual(UpdateFeed.newest(in: releases, above: "0.3.0")?.version, "0.3.1")
 
         // MH_UPDATE_FEED takes a path or a URL
         XCTAssertTrue(UpdateFeed.location(file.path).isFileURL)
@@ -163,10 +168,11 @@ final class UpdaterTests: XCTestCase {
 
     /// A release folder as build-app.sh makes it (the app zipped with ditto --keepParent, SHA256SUMS), as an update.
     private func release(label: String, appVersion: String? = nil, tamper: Bool = false, wrongSum: Bool = false,
-                         bundleID: String = appBundleID) throws -> AvailableUpdate {
+                         bundleID: String = appBundleID, signedBy key: Curve25519.Signing.PrivateKey? = nil,
+                         appKey: String? = nil) throws -> AvailableUpdate {
         let dir = root.appendingPathComponent("release-\(UUID().uuidString)")
         let app = try fakeApp(dir.appendingPathComponent("build/MetalHorizon.app"), version: appVersion ?? label,
-                              bundleID: bundleID, signed: true)
+                              bundleID: bundleID, signed: true, updateKey: appKey)
         if tamper {    // changed after signing: the signature no longer verifies
             try "changed".write(to: app.appendingPathComponent("Contents/Resources/components.json"), atomically: true, encoding: .utf8)
         }
@@ -176,14 +182,34 @@ final class UpdaterTests: XCTestCase {
         let sums = dir.appendingPathComponent("SHA256SUMS")
         try "\(sum)  \(zip.lastPathComponent)\n\(String(repeating: "1", count: 64))  xodus-source-\(label).tar.gz\n"
             .write(to: sums, atomically: true, encoding: .utf8)
+        var signature: URL?
+        if let key {
+            let file = dir.appendingPathComponent("SHA256SUMS.sig")
+            try key.signature(for: Data(contentsOf: sums)).base64EncodedString().write(to: file, atomically: true, encoding: .utf8)
+            signature = file
+        }
         return AvailableUpdate(version: label, archive: zip, archiveSize: nil, checksums: sums,
-                               page: URL(string: "https://example.invalid/release")!)
+                               page: URL(string: "https://example.invalid/release")!, signature: signature)
     }
 
-    private func prepare(_ update: AvailableUpdate) throws -> URL {
+    private func prepare(_ update: AvailableUpdate, publicKey: String? = nil) throws -> URL {
         let work = root.appendingPathComponent("work-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-        return try awaitResult { try await UpdatePackage.prepare(update, in: work, bundleID: appBundleID) { _, _ in } }
+        return try awaitResult { try await UpdatePackage.prepare(update, in: work, bundleID: appBundleID, publicKey: publicKey) { _, _ in } }
+    }
+
+    func testSignedChecksumsAreRequiredWithAKey() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+        XCTAssertNoThrow(try prepare(try release(label: "0.4.1", signedBy: key, appKey: publicKey), publicKey: publicKey))
+        XCTAssertNoThrow(try prepare(try release(label: "0.4.1")))
+
+        func refused(_ update: AvailableUpdate, _ expected: String) {
+            XCTAssertThrowsError(try prepare(update, publicKey: publicKey)) { XCTAssertTrue("\($0)".contains(expected), "\($0)") }
+        }
+        refused(try release(label: "0.4.1", appKey: publicKey), "not signed")
+        refused(try release(label: "0.4.1", signedBy: Curve25519.Signing.PrivateKey(), appKey: publicKey), "not signed")
+        refused(try release(label: "0.4.1", signedBy: key), "update key")
     }
 
     func testDownloadedAppIsChecked() throws {

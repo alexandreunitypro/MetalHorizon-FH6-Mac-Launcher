@@ -1,9 +1,11 @@
 #!/bin/bash
 # Build MetalHorizon.app and the files of a GitHub release.
 #   bash app/build-app.sh [version, default 0.1.0]
-# Output in app/dist/: MetalHorizon.app, MetalHorizon-<version>.zip, xodus-source-<version>.tar.gz, SHA256SUMS.
+# Output in app/dist/: MetalHorizon.app, MetalHorizon-<version>.zip, xodus-source-<version>.tar.gz, SHA256SUMS(.sig).
 # XODUS_CLI / XODUS_SERVICE: the xodus binaries to bundle, and XODUS_CLI_SRC / XODUS_SERVICE_SRC the source trees
 # they were built from (both GPL-3.0: the release carries that source). Defaults: the working setup's.
+# UPDATE_KEY: an Ed25519 private key (PEM). The app then accepts only updates whose SHA256SUMS.sig it verifies.
+# OPENSSL: an OpenSSL 3 (macOS's LibreSSL has no Ed25519). Default: Homebrew's.
 # Nothing from Apple or CrossOver goes into the app: the user picks D3DMetal from Apple's Game Porting Toolkit.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -17,6 +19,13 @@ XODUS_SERVICE="${XODUS_SERVICE:-$WORK/xodus-ferestre/target/release/xodus-servic
 XODUS_CLI_SRC="${XODUS_CLI_SRC:-$WORK/xodus}"
 XODUS_SERVICE_SRC="${XODUS_SERVICE_SRC:-$WORK/xodus-ferestre}"   # see the header of patches/xodus-cli/0002
 for f in "$XODUS_CLI" "$XODUS_SERVICE"; do [ -x "$f" ] || { echo "STOP: $f not found"; exit 1; }; done
+UPDATE_KEY_PLIST=""
+OPENSSL="${OPENSSL:-/opt/homebrew/opt/openssl/bin/openssl}"
+if [ -n "${UPDATE_KEY:-}" ]; then
+    [ -x "$OPENSSL" ] || { echo "STOP: $OPENSSL not found (brew install openssl)"; exit 1; }
+    PUBLIC_KEY="$("$OPENSSL" pkey -in "$UPDATE_KEY" -pubout -outform DER | tail -c 32 | base64)"
+    UPDATE_KEY_PLIST="<key>MHUpdatePublicKey</key><string>$PUBLIC_KEY</string>"
+fi
 
 echo "== build"
 swift build -c release --arch arm64
@@ -62,6 +71,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>CFBundleIconFile</key><string>AppIcon</string>
+    $UPDATE_KEY_PLIST
 </dict>
 </plist>
 PLIST
@@ -114,4 +124,7 @@ rsync -a --exclude target --exclude .git --exclude '*.bak' --exclude '.DS_Store'
 tar -C "$DIST" -czf "$DIST/xodus-source-$VERSION.tar.gz" "xodus-source-$VERSION"
 rm -rf "$SRCSTAGE"
 ( cd "$DIST" && shasum -a 256 "MetalHorizon-$VERSION.zip" "xodus-source-$VERSION.tar.gz" | tee SHA256SUMS )
+if [ -n "${UPDATE_KEY:-}" ]; then
+    "$OPENSSL" pkeyutl -sign -inkey "$UPDATE_KEY" -rawin -in "$DIST/SHA256SUMS" | base64 > "$DIST/SHA256SUMS.sig"
+fi
 du -sh "$APP" "$DIST/MetalHorizon-$VERSION.zip" "$DIST/xodus-source-$VERSION.tar.gz"

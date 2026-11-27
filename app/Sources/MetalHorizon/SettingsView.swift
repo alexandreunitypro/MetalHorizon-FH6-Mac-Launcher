@@ -199,6 +199,8 @@ private struct ControllerSettings: View {
 
 private struct AdvancedSettings: View {
     @ObservedObject var model: LauncherModel
+    @AppStorage(UpdateKey.automatic, store: settingsStore()) private var automaticUpdates = true
+    @AppStorage(UpdateKey.preReleases, store: settingsStore()) private var preReleases = false
 
     var body: some View {
         Form {
@@ -208,6 +210,10 @@ private struct AdvancedSettings: View {
                 Text("Blackwell Engine Beta, beside the public one: the Blackwell Pacer against the freezes every ten seconds or so under Rosetta (it tunes itself to this Mac), and five of Highball's engine fixes. It plays on D3DMetal. Unfinished: turn it off and MetalHorizon removes it and plays the public engine again.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Engine channel") }
+            Section {
+                Toggle("Update automatically", isOn: $automaticUpdates)
+                Toggle("Pre-release versions", isOn: $preReleases)
+            } header: { Text("Updates") }
             Section {
                 Toggle("Relaunch the game by itself after a failed start", isOn: $model.autoRetry)
                 Toggle("Plain synchronization (instead of msync)", isOn: $model.plainSync)

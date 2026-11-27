@@ -1,16 +1,18 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 
 // MetalHorizon updates itself. Each time the app opens (never the MCP server, a snapshot, or a development build that
-// is not MetalHorizon.app), it reads the GitHub releases of the project, prereleases included. A newer version is
-// mandatory: once nothing runs (game, download, install, Steam), a sheet without Cancel downloads
-// MetalHorizon-<version>.zip, checks it against the release's SHA256SUMS, unzips it and checks the app inside (bundle
-// identifier, version, executable, signature). A small helper script, started in a session of its own, then waits for
-// the app to quit, puts the new MetalHorizon.app at the same path, relaunches it, and puts the previous one back if the
-// new one does not start. Only the app is replaced: the settings (UserDefaults), the logs and the engines in
-// Application Support stay as they are, and the new version installs the engines it needs by itself (components.json).
-// Everything is written to ~/Library/Logs/MetalHorizon/updater.log; a failed check is silent.
+// is not MetalHorizon.app), it reads the GitHub releases of the project, prereleases only when opted in. A newer
+// version installs by itself unless Update automatically is off (then Install Now or Later): once nothing runs (game,
+// download, install, Steam), a sheet without Cancel downloads MetalHorizon-<version>.zip, checks it against the
+// release's SHA256SUMS, unzips it and checks the app inside (bundle identifier, version, executable, signature). A
+// small helper script, started in a session of its own, then waits for the app to quit, puts the new MetalHorizon.app
+// at the same path, relaunches it, and puts the previous one back if the new one does not start. Only the app is
+// replaced: the settings (UserDefaults), the logs and the engines in Application Support stay as they are, and the new
+// version installs the engines it needs by itself (components.json). Everything is written to
+// ~/Library/Logs/MetalHorizon/updater.log; a failed check is silent.
 // MH_UPDATE_FEED=<URL or file> reads another feed in the same format as GitHub's (tests).
 
 /// A release version, "v0.4.1" or "0.4.1": compared number by number (0.10.0 is newer than 0.9.0), and a pre-release
@@ -71,15 +73,17 @@ struct FeedRelease: Decodable {
     }
     var tag: String
     var draft: Bool
+    var prerelease: Bool
     var page: String?
     var assets: [Asset]
 
-    enum CodingKeys: String, CodingKey { case tag = "tag_name", draft, page = "html_url", assets }
+    enum CodingKeys: String, CodingKey { case tag = "tag_name", draft, prerelease, page = "html_url", assets }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         tag = try c.decode(String.self, forKey: .tag)
         draft = try c.decodeIfPresent(Bool.self, forKey: .draft) ?? false
+        prerelease = try c.decodeIfPresent(Bool.self, forKey: .prerelease) ?? false
         page = try c.decodeIfPresent(String.self, forKey: .page)
         assets = try c.decodeIfPresent([Asset].self, forKey: .assets) ?? []
     }
@@ -92,16 +96,18 @@ struct AvailableUpdate: Equatable {
     var archiveSize: Int64?
     var checksums: URL
     var page: URL
+    var signature: URL?
     var archiveName: String { "MetalHorizon-\(version).zip" }
 }
 
 enum UpdateError: Error, CustomStringConvertible {
-    case server(String), noChecksum(String), badChecksum(String), badApp(String), tool(String)
+    case server(String), noChecksum(String), badChecksum(String), badSignature, badApp(String), tool(String)
     var description: String {
         switch self {
         case .server(let m): return m
         case .noChecksum(let n): return "The release's SHA256SUMS has no line for \(n)."
         case .badChecksum(let n): return "\(n) does not match its SHA-256 in the release's SHA256SUMS: it was not installed."
+        case .badSignature: return "SHA256SUMS is not signed with MetalHorizon's update key: nothing was installed."
         case .badApp(let m): return "The downloaded app was refused: \(m)."
         case .tool(let m): return m
         }
@@ -147,17 +153,19 @@ enum UpdateFeed {
 
     /// The highest version above `current` whose release is published (not a draft) and carries both
     /// MetalHorizon-<version>.zip and SHA256SUMS. Tags that are not versions are skipped.
-    static func newest(in releases: [FeedRelease], above current: String) -> AvailableUpdate? {
+    static func newest(in releases: [FeedRelease], above current: String, includePrereleases: Bool = false) -> AvailableUpdate? {
         guard let running = AppVersion(current) else { return nil }
         var best: (version: AppVersion, update: AvailableUpdate)?
         for release in releases where !release.draft {
             guard let version = AppVersion(release.tag), version > running else { continue }
+            if !includePrereleases && (release.prerelease || !version.suffix.isEmpty) { continue }
             if let best, best.version >= version { continue }
             guard let zip = release.assets.first(where: { $0.name == "MetalHorizon-\(version).zip" }),
                   let sums = release.assets.first(where: { $0.name == "SHA256SUMS" }) else { continue }
             let page = release.page.flatMap(URL.init(string:)) ?? releasesPage.appendingPathComponent("tag/\(release.tag)")
+            let signature = release.assets.first { $0.name == "SHA256SUMS.sig" }.map { location($0.url) }
             best = (version, AvailableUpdate(version: version.description, archive: location(zip.url), archiveSize: zip.size,
-                                             checksums: location(sums.url), page: page))
+                                             checksums: location(sums.url), page: page, signature: signature))
         }
         return best?.update
     }
@@ -218,6 +226,8 @@ private final class UpdateDownload: NSObject, URLSessionDownloadDelegate {
 }
 
 enum UpdatePackage {
+    static let publicKeyInfoKey = "MHUpdatePublicKey"
+
     static func session(timeout: TimeInterval) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
@@ -240,6 +250,13 @@ enum UpdatePackage {
         return sums
     }
 
+    static func verifySignature(of sums: Data, signature: Data?, publicKey: String) throws {
+        guard let key = Data(base64Encoded: publicKey).flatMap({ try? Curve25519.Signing.PublicKey(rawRepresentation: $0) }),
+              let signature,
+              let raw = Data(base64Encoded: String(decoding: signature, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)),
+              key.isValidSignature(raw, for: sums) else { throw UpdateError.badSignature }
+    }
+
     static func verifyChecksum(of file: URL, named name: String, in sums: [String: String]) throws {
         guard let expected = sums[name] else { throw UpdateError.noChecksum(name) }
         guard try Installer.sha256(of: file) == expected else { throw UpdateError.badChecksum(name) }
@@ -247,7 +264,7 @@ enum UpdatePackage {
 
     /// The unzipped archive must hold exactly one MetalHorizon.app, with this app's bundle identifier, the release's
     /// version, its executable, and a signature that verifies (ad-hoc signatures do).
-    static func verifyApp(in folder: URL, bundleID: String, version: String) throws -> URL {
+    static func verifyApp(in folder: URL, bundleID: String, version: String, publicKey: String? = nil) throws -> URL {
         let items = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
             .filter { !$0.hasPrefix(".") && $0 != "__MACOSX" }
         guard items == ["MetalHorizon.app"] else {
@@ -262,6 +279,9 @@ enum UpdatePackage {
         guard id == bundleID else { throw UpdateError.badApp("its bundle identifier is \(id.isEmpty ? "missing" : id), not \(bundleID)") }
         let found = info["CFBundleShortVersionString"] as? String ?? ""
         guard found == version else { throw UpdateError.badApp("it is version \(found.isEmpty ? "?" : found), not \(version)") }
+        if let publicKey, info[publicKeyInfoKey] as? String != publicKey {
+            throw UpdateError.badApp("it does not carry this app's update key")
+        }
         guard let executable = info["CFBundleExecutable"] as? String, !executable.isEmpty, !executable.contains("/"),
               FileManager.default.isExecutableFile(atPath: app.path + "/Contents/MacOS/" + executable) else {
             throw UpdateError.badApp("its executable is missing")
@@ -276,18 +296,14 @@ enum UpdatePackage {
 
     /// Downloads the update into `work` (a folder on the app's volume), checks it and returns the new MetalHorizon.app
     /// inside `work`. Nothing outside `work` is touched.
-    static func prepare(_ update: AvailableUpdate, in work: URL, bundleID: String,
+    static func prepare(_ update: AvailableUpdate, in work: URL, bundleID: String, publicKey: String? = nil,
                         progress: @escaping @Sendable (Double?, String) -> Void) async throws -> URL {
         progress(nil, "Reading the release's checksums…")
-        let sumsData: Data
-        if update.checksums.isFileURL {
-            sumsData = try Data(contentsOf: update.checksums)
-        } else {
-            let (body, response) = try await session(timeout: 20).data(from: update.checksums)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                throw UpdateError.server("GitHub answered \((response as? HTTPURLResponse)?.statusCode ?? 0) for SHA256SUMS.")
-            }
-            sumsData = body
+        let sumsData = try await fetch(update.checksums)
+        if let publicKey {
+            var signature: Data?
+            if let url = update.signature { signature = try await fetch(url) }
+            try verifySignature(of: sumsData, signature: signature, publicKey: publicKey)
         }
         let sums = parseChecksums(String(decoding: sumsData, as: UTF8.self))
         let name = update.archiveName
@@ -309,7 +325,16 @@ enum UpdatePackage {
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
         try run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
         progress(nil, "Checking the new app's signature…")
-        return try verifyApp(in: unpacked, bundleID: bundleID, version: update.version)
+        return try verifyApp(in: unpacked, bundleID: bundleID, version: update.version, publicKey: publicKey)
+    }
+
+    private static func fetch(_ url: URL) async throws -> Data {
+        if url.isFileURL { return try Data(contentsOf: url) }
+        let (body, response) = try await session(timeout: 20).data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw UpdateError.server("GitHub answered \((response as? HTTPURLResponse)?.statusCode ?? 0) for \(url.lastPathComponent).")
+        }
+        return body
     }
 
     static func run(_ path: String, _ args: [String]) throws {
@@ -546,9 +571,11 @@ enum UpdateHelper {
 
 // MARK: - The app's side
 
-private enum UpdateKey {
+enum UpdateKey {
     static let lastRunVersion = "metalhorizon.lastRunVersion"
     static let failedVersion = "metalhorizon.updateFailedVersion"     // a version the helper had to put back
+    static let preReleases = "metalhorizon.updatePreReleases"
+    static let automatic = "metalhorizon.updateAutomatically"
 }
 
 /// What the update sheet shows.
@@ -558,6 +585,7 @@ enum UpdateState: Equatable {
     case updating(version: String, step: String, fraction: Double?)
     /// Something to read, with the release page when there is one and Try Again when it can be retried.
     case notice(title: String, text: String, page: URL?, retry: Bool)
+    case available(AvailableUpdate)
 }
 
 @MainActor
@@ -576,6 +604,9 @@ final class Updater: ObservableObject {
         !CommandLine.arguments.contains("--mcp") && ProcessInfo.processInfo.environment["MH_SNAPSHOT"] == nil
             && Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
     }
+
+    static var preReleases: Bool { settingsStore().bool(forKey: UpdateKey.preReleases) }
+    static var automatic: Bool { settingsStore().object(forKey: UpdateKey.automatic) as? Bool ?? true }
 
     var isForced: Bool { if case .updating = state { return true } else { return false } }
 
@@ -610,6 +641,11 @@ final class Updater: ObservableObject {
         settingsStore().removeObject(forKey: UpdateKey.failedVersion)
         state = .none
         Task { await check(userInitiated: true) }
+    }
+
+    func installNow(_ update: AvailableUpdate) {
+        state = .none
+        Task { await install(update, userInitiated: true) }
     }
 
     func dismiss() {
@@ -648,7 +684,7 @@ final class Updater: ObservableObject {
         let update: AvailableUpdate?
         do {
             let releases = try await UpdateFeed.releases(from: UpdateFeed.url)
-            update = UpdateFeed.newest(in: releases, above: current)
+            update = UpdateFeed.newest(in: releases, above: current, includePrereleases: Self.preReleases)
         } catch {
             // offline, rate limit, GitHub down: the app works as before, the next launch checks again
             Self.log("could not check for updates: \(error)")
@@ -665,6 +701,10 @@ final class Updater: ObservableObject {
             return
         }
         Self.log("MetalHorizon \(update.version) is available (this is \(current))")
+        if !userInitiated && !Self.automatic {
+            await show(.available(update))
+            return
+        }
         await install(update, userInitiated: userInitiated)
     }
 
@@ -696,7 +736,9 @@ final class Updater: ObservableObject {
             work = folder
             fm.createFile(atPath: folder.appendingPathComponent(UpdateHelper.workMarker).path, contents: nil)
             Self.log("downloading \(update.archive.absoluteString) into \(folder.path)")
-            let newApp = try await UpdatePackage.prepare(update, in: folder, bundleID: Bundle.main.bundleIdentifier ?? appBundleID) { [weak self] fraction, step in
+            let publicKey = Bundle.main.object(forInfoDictionaryKey: UpdatePackage.publicKeyInfoKey) as? String
+            let newApp = try await UpdatePackage.prepare(update, in: folder, bundleID: Bundle.main.bundleIdentifier ?? appBundleID,
+                                                         publicKey: publicKey) { [weak self] fraction, step in
                 Task { @MainActor in self?.progress(update.version, step, fraction) }
             }
             Self.log("MetalHorizon \(update.version) downloaded and verified (SHA-256, bundle, signature)")
@@ -851,6 +893,18 @@ struct UpdateSheet: View {
                         Button("Try Again") { updater.retry() }
                     }
                     Button(page == nil && !retry ? tr("OK") : tr("Continue")) { updater.dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
+            case let .available(update):
+                Text("MetalHorizon \(update.version) is available")
+                    .font(.headline)
+                Text("You are using \(Updater.currentVersion).")
+                HStack {
+                    Button("Open the Release Page") { NSWorkspace.shared.open(update.page) }
+                    Spacer()
+                    Button("Later") { updater.dismiss() }
+                    Button("Install Now") { updater.installNow(update) }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
                 }
