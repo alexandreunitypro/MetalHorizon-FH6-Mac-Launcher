@@ -149,12 +149,9 @@ private struct GraphicsSettings: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("Frame cap", selection: $model.maxFPS) {
-                    Text("None").tag(0)
+                    Text(model.routeDecision.route.noFrameCapTitle).tag(0)
                     ForEach([30, 40, 45, 60], id: \.self) { Text("\($0) fps").tag($0) }
                 }
-                Text("On the native engine, None means its steady 30.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             FrameGenerationSection()
         }

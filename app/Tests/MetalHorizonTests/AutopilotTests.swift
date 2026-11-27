@@ -23,6 +23,11 @@ final class AutopilotTests: XCTestCase {
         XCTAssertTrue(forced.reason.contains("macOS 27"))
     }
 
+    func testTheNativeEngineNamesItsDefaultFrameCap() {
+        XCTAssertEqual(ResolvedRoute.native.noFrameCapTitle, "Automatic · 30 fps")
+        XCTAssertEqual(ResolvedRoute.d3dmetal.noFrameCapTitle, "None")
+    }
+
     func testABenchedNativeEngineIsLeftOutUntilItsTimeIsUp() {
         var health = RouteHealth()
         let now = Date()
