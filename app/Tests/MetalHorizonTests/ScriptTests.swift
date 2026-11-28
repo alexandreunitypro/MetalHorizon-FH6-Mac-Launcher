@@ -144,6 +144,35 @@ final class ScriptTests: XCTestCase {
     }
 
     /// Open with MH_STEAM_URL hands Steam its own install link for the game; anything but a steam:// link is dropped.
+    /// Issue #27: on Steam, a game process that hands over to another and a Neural Engine line that reaches the log
+    /// only after the game is gone still get the relaunch; the budget stops at MH_RETRIES.
+    func testSteamNeuralEngineRelaunchSurvivesAHandoverAndALateLine() throws {
+        let steam = resources.appendingPathComponent("metalhorizon-steam.sh").path
+        let common = resources.appendingPathComponent("metalhorizon-common.sh").path
+        let log = root.appendingPathComponent("game.log").path
+        let script = """
+        source '\(common)' >/dev/null 2>&1
+        eval "$(awk '/^ANE_RELAUNCHES=0/{f=1} f{print} f&&/^}$/{exit}' '\(steam)')"
+        GAME_LOG='\(log)'; : > "$GAME_LOG"; T0=$(date +%s)
+        game_pids() { local t=$(( $(date +%s) - T0 )); { [ $t -lt 3 ] || { [ $t -ge 5 ] && [ $t -lt 7 ]; }; } && echo 123; }
+        ( sleep 9; echo 'Error Domain=com.apple.appleneuralengine Code=26 "doCompileModel:csIdentity"' >> "$GAME_LOG" ) &
+        MH_RETRIES=2 game_finished 0 0 2; echo "first $?"
+        ANE_RELAUNCHES=2; echo 'Error Domain=com.apple.appleneuralengine Code=26' >> "$GAME_LOG"
+        game_pids() { :; }; MH_RETRIES=2 game_finished 0 0 3; echo "past the budget $?"
+        """
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        task.arguments = ["-c", script]
+        task.environment = ["PATH": "/usr/bin:/bin:/usr/sbin"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        try task.run()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        task.waitUntilExit()
+        XCTAssertTrue(out.contains("first 3"), "handover and late line: relaunched\n\(out)")
+        XCTAssertTrue(out.contains("past the budget 0"), "no third relaunch\n\(out)")
+    }
+
     func testSteamOpensOnTheGamesInstallWindow() throws {
         var env = try fakeComponents(i386: true)
         env["MH_PREFIX"] = root.appendingPathComponent("Steam prefix").path

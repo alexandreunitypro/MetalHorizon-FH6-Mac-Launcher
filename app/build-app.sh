@@ -9,7 +9,7 @@
 # Nothing from Apple or CrossOver goes into the app: the user picks D3DMetal from Apple's Game Porting Toolkit.
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION="${1:-2.2.3}"
+VERSION="${1:-2.2.4}"
 WORK="${WORK:-/Users/alexandre/Documents/Codex/2026-10-19/goal-reprend-son-travail-on-invente/work}"
 XODUS_CLI="${XODUS_CLI:-$WORK/xodus/target/release/xodus-cli}"
 # The service is built from the Ferestre tree (its source below), with patches/xodus-cli/0003 (compact JWE tickets as

@@ -310,16 +310,29 @@ wait_for_game() {
     return 0
 }
 
-# run_and_watch <offset> <start>: the game's run, the Neural Engine relaunch decision. 0 done, 3 relaunch.
+# game_finished <offset> <start> <attempt>: the game's run, the Neural Engine relaunch decision. 0 done, 3 relaunch.
+# Called as the game appears. Issue #27 (Steam, M1 Pro, macOS 27.3): the run ended after 23 s with D3DMetal's Neural
+# Engine failure in the log and no relaunch: the decision was taken the instant no game process was left, before the
+# game's last lines reached the log through Steam's output (or a second game process took over), its 30 s counted
+# Steam's own start, and Steam's notice restart had used one of the two relaunches.
+ANE_RELAUNCHES=0
 game_finished() {
-    local offset="$1" start="$2" attempt="$3" elapsed
-    while [ -n "$(game_pids)" ]; do sleep 2; done
-    elapsed=$(( $(date +%s) - start ))
+    local offset="$1" start attempt="$3" elapsed quiet=0
+    start=$(date +%s)   # from the game itself, not from Steam's start
+    while :; do
+        while [ -n "$(game_pids)" ]; do sleep 2; done
+        # a game process handing over to another (or started again by Steam) shows up within seconds
+        quiet=0
+        while [ "$quiet" -lt 10 ] && [ -z "$(game_pids)" ]; do sleep 2; quiet=$((quiet + 2)); done
+        [ -n "$(game_pids)" ] || break
+    done
+    elapsed=$(( $(date +%s) - start - quiet ))
     echo "== game closed after ${elapsed}s"
     # D3DMetal's Neural Engine abort happens in the first seconds; past 30 s its line is only the harmless message every
     # start prints, and the game closed for another reason (issues #11 and #12: relaunched for nothing at 117 s)
-    if [ "$attempt" -le "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 30 ] && mh_ane_failure "$GAME_LOG" "$offset"; then
-        echo "== D3DMetal stopped while preparing the Neural Engine (com.apple.appleneuralengine Code=26): relaunching"
+    if [ "$ANE_RELAUNCHES" -lt "${MH_RETRIES:-2}" ] && [ "$elapsed" -lt 30 ] && mh_ane_failure "$GAME_LOG" "$offset"; then
+        ANE_RELAUNCHES=$((ANE_RELAUNCHES + 1))
+        echo "== D3DMetal stopped while preparing the Neural Engine (com.apple.appleneuralengine Code=26): relaunching ($ANE_RELAUNCHES of ${MH_RETRIES:-2})"
         mh_mark_retried "$GAME_LOG"; sleep 3; return 3
     fi
     [ "$elapsed" -ge 30 ] && mh_ane_failure "$GAME_LOG" "$offset" && mh_mark_retried "$GAME_LOG" harmless
